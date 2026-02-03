@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import type { ItemEvent, AgentInfo } from '@agent-orch/shared';
+import type { ItemEvent, AgentInfo, ReviewFindingsExtractedEvent } from '@agent-orch/shared';
 import { useItem } from '../hooks/useItems';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { AgentCard } from '../components/AgentCard';
@@ -23,7 +23,8 @@ export function ItemDetailPage() {
       event.type === 'status_changed' ||
       event.type === 'approval_requested' ||
       event.type === 'approval_decision' ||
-      event.type === 'plan_created'
+      event.type === 'plan_created' ||
+      event.type === 'review_findings_extracted'
     ) {
       refresh();
     }
@@ -137,6 +138,80 @@ export function ItemDetailPage() {
           </p>
         </div>
       )}
+
+      {/* Review Findings */}
+      {recentEvents
+        .filter((e): e is ReviewFindingsExtractedEvent =>
+          e.type === 'review_findings_extracted'
+        )
+        .slice(-1)
+        .map((reviewEvent) => (
+          reviewEvent.findings.length > 0 && (
+            <div
+              key={reviewEvent.id}
+              className="bg-gray-800 rounded-lg border border-yellow-500/50 p-4"
+            >
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-lg font-medium text-yellow-400">
+                  Review Findings
+                </h3>
+                <div className="flex gap-3 text-sm">
+                  {reviewEvent.criticalCount > 0 && (
+                    <span className="text-red-400">
+                      Critical: {reviewEvent.criticalCount}
+                    </span>
+                  )}
+                  {reviewEvent.majorCount > 0 && (
+                    <span className="text-orange-400">
+                      Major: {reviewEvent.majorCount}
+                    </span>
+                  )}
+                  {reviewEvent.minorCount > 0 && (
+                    <span className="text-yellow-400">
+                      Minor: {reviewEvent.minorCount}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <p className="text-gray-300 mb-3">{reviewEvent.summary}</p>
+
+              <div className="space-y-2">
+                {reviewEvent.findings
+                  .filter(f => f.severity === 'critical' || f.severity === 'major')
+                  .map((finding, idx) => (
+                    <div
+                      key={idx}
+                      className="bg-gray-900 rounded p-3 border border-gray-700"
+                    >
+                      <div className="flex items-start justify-between mb-2">
+                        <span className={`text-xs font-semibold px-2 py-0.5 rounded ${
+                          finding.severity === 'critical'
+                            ? 'bg-red-500/20 text-red-400'
+                            : 'bg-orange-500/20 text-orange-400'
+                        }`}>
+                          {finding.severity.toUpperCase()}
+                        </span>
+                        <span className="text-xs text-gray-500">
+                          {finding.targetAgent}
+                        </span>
+                      </div>
+                      <p className="text-sm text-gray-400 mb-1">
+                        {finding.file}:{finding.line}
+                      </p>
+                      <p className="text-sm text-white mb-2">
+                        {finding.description}
+                      </p>
+                      <p className="text-xs text-gray-500">
+                        Fix: {finding.suggestedFix}
+                      </p>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          )
+        ))
+      }
 
       {/* Agents Grid */}
       <div>

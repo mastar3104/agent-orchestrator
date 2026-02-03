@@ -63,6 +63,9 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
 
       if (repoSource === 'saved' && selectedRepoId) {
         requestData.repositoryId = selectedRepoId;
+        if (branch) {
+          requestData.branch = branch;
+        }
         if (workBranch) {
           requestData.workBranch = workBranch;
         }
@@ -209,20 +212,37 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                   loading={reposLoading}
                 />
                 {selectedRepoId && (
-                  <div className="mt-3">
-                    <label className="block text-sm font-medium text-gray-300 mb-1">
-                      Work Branch (optional)
-                    </label>
-                    <input
-                      type="text"
-                      value={workBranch}
-                      onChange={(e) => setWorkBranch(e.target.value)}
-                      className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
-                      placeholder="feature/my-feature"
-                    />
-                    <p className="text-xs text-gray-500 mt-1">
-                      Branch for agent work (auto-created)
-                    </p>
+                  <div className="mt-3 grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-1">
+                        Clone Branch (optional)
+                      </label>
+                      <input
+                        type="text"
+                        value={branch}
+                        onChange={(e) => setBranch(e.target.value)}
+                        className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
+                        placeholder={repositories.find(r => r.id === selectedRepoId)?.branch || 'main'}
+                      />
+                      <p className="text-xs text-gray-500 mt-1">
+                        Override saved branch
+                      </p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-1">
+                        Work Branch (optional)
+                      </label>
+                      <input
+                        type="text"
+                        value={workBranch}
+                        onChange={(e) => setWorkBranch(e.target.value)}
+                        className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
+                        placeholder="feature/my-feature"
+                      />
+                      <p className="text-xs text-gray-500 mt-1">
+                        Branch for agent work (auto-created)
+                      </p>
+                    </div>
                   </div>
                 )}
               </>

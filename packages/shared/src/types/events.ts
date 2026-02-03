@@ -16,7 +16,8 @@ export type EventType =
   | 'workspace_setup_started'
   | 'workspace_setup_completed'
   | 'error'
-  | 'pr_created';
+  | 'pr_created'
+  | 'review_findings_extracted';
 
 export interface BaseEvent {
   id: string;
@@ -156,6 +157,26 @@ export interface PrCreatedEvent extends BaseEvent {
   commitHash: string;
 }
 
+export interface ReviewFinding {
+  severity: 'critical' | 'major' | 'minor';
+  file: string;
+  line?: number;
+  description: string;
+  suggestedFix: string;
+  targetAgent: 'front' | 'back';
+}
+
+export interface ReviewFindingsExtractedEvent extends BaseEvent {
+  type: 'review_findings_extracted';
+  agentId: string;
+  findings: ReviewFinding[];
+  overallAssessment: 'pass' | 'needs_fixes';
+  summary: string;
+  criticalCount: number;
+  majorCount: number;
+  minorCount: number;
+}
+
 export type AgentEvent =
   | AgentStartedEvent
   | AgentExitedEvent
@@ -178,4 +199,5 @@ export type ItemEvent =
   | StatusChangedEvent
   | ErrorEvent
   | PrCreatedEvent
+  | ReviewFindingsExtractedEvent
   | AgentEvent;

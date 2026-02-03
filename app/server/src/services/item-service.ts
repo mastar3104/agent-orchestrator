@@ -51,7 +51,7 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
       type: savedRepo.type,
       url: savedRepo.url,
       localPath: savedRepo.localPath,
-      branch: savedRepo.branch,
+      branch: request.branch || savedRepo.branch,
       workBranch: request.workBranch,
       submodules: savedRepo.submodules,
       linkMode: savedRepo.linkMode,

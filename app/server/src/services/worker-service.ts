@@ -9,8 +9,11 @@ import {
   stopAllGitSnapshots,
 } from './git-snapshot-service';
 import { createDraftPr } from './git-pr-service';
-import { getWorkspaceDir } from '../lib/paths';
+import { getWorkspaceDir, getItemEventsPath } from '../lib/paths';
 import { ptyManager } from '../lib/pty-manager';
+import { eventBus } from './event-bus';
+import { appendJsonl } from '../lib/jsonl';
+import { createReviewFindingsExtractedEvent } from '../lib/events';
 
 const WORKER_PROMPT_TEMPLATE = `You are a {{role}} development agent working on implementing specific tasks from a development plan.
 
@@ -251,11 +254,31 @@ export async function startWorkers(itemId: string): Promise<void> {
       // 2c. Extract and analyze findings
       const findings = await extractReviewFindings(itemId);
 
-      // 2d. Exit review agent
+      // 2c-2. Publish review findings event
+      if (findings) {
+        const agents = await getAgentsByItem(itemId);
+        const reviewAgent = agents.find(a => a.role === 'review');
+        if (reviewAgent) {
+          const event = createReviewFindingsExtractedEvent(
+            itemId,
+            reviewAgent.id,
+            findings.findings,
+            findings.overallAssessment,
+            findings.summary
+          );
+          // Log to JSONL
+          await appendJsonl(getItemEventsPath(itemId), event);
+          // Broadcast via EventBus
+          eventBus.publish(itemId, event);
+        }
+      }
+
+      // 2d. Exit review agent and wait for completion
       const agents = await getAgentsByItem(itemId);
       const reviewAgent = agents.find(a => a.role === 'review');
       if (reviewAgent) {
         await signalAgentToExit(reviewAgent.id);
+        await waitForAgentsToComplete(itemId, ['review']);
       }
 
       // 2e. Check if review passed
@@ -487,10 +510,18 @@ async function signalAgentToExit(agentId: string): Promise<boolean> {
 // Helper: Signal all agents to exit
 async function signalAllAgentsToExit(itemId: string): Promise<void> {
   const agents = await getAgentsByItem(itemId);
+  const rolesToWaitFor: AgentRole[] = [];
+
   for (const agent of agents) {
     if (agent.status === 'running' || agent.status === 'waiting_orchestrator') {
       await signalAgentToExit(agent.id);
+      rolesToWaitFor.push(agent.role);
     }
+  }
+
+  // シグナルを送った全エージェントの完了を待機
+  if (rolesToWaitFor.length > 0) {
+    await waitForAgentsToComplete(itemId, rolesToWaitFor);
   }
 }
 
@@ -603,6 +634,7 @@ export async function runIterativeReview(itemId: string): Promise<void> {
     // Review agent を終了
     if (reviewAgent) {
       await signalAgentToExit(reviewAgent.id);
+      await waitForAgentsToComplete(itemId, ['review']);
     }
   }
 

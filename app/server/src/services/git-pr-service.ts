@@ -198,9 +198,10 @@ Automated implementation by agent-orch.
 
   let prInfo: { number: number; url: string };
   try {
-    // PR作成（--json はサポートされていないため使用しない）
+    // PR作成
+    const baseBranch = config.repository.branch || 'main';
     await execGh(
-      ['pr', 'create', '--draft', '--title', prTitle, '--body', prBody],
+      ['pr', 'create', '--draft', '--base', baseBranch, '--title', prTitle, '--body', prBody],
       workspaceDir
     );
 

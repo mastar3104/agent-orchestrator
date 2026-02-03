@@ -20,6 +20,8 @@ import type {
   ErrorEvent,
   PrCreatedEvent,
   AgentRole,
+  ReviewFinding,
+  ReviewFindingsExtractedEvent,
 } from '@agent-orch/shared';
 
 function createEventId(): string {
@@ -317,5 +319,31 @@ export function createPrCreatedEvent(
     prNumber,
     branch,
     commitHash,
+  };
+}
+
+export function createReviewFindingsExtractedEvent(
+  itemId: string,
+  agentId: string,
+  findings: ReviewFinding[],
+  overallAssessment: 'pass' | 'needs_fixes',
+  summary: string
+): ReviewFindingsExtractedEvent {
+  const criticalCount = findings.filter(f => f.severity === 'critical').length;
+  const majorCount = findings.filter(f => f.severity === 'major').length;
+  const minorCount = findings.filter(f => f.severity === 'minor').length;
+
+  return {
+    id: createEventId(),
+    type: 'review_findings_extracted',
+    timestamp: timestamp(),
+    itemId,
+    agentId,
+    findings,
+    overallAssessment,
+    summary,
+    criticalCount,
+    majorCount,
+    minorCount,
   };
 }

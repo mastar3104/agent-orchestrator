@@ -19,6 +19,7 @@ export interface CreateItemRequest {
   description: string;
   repositoryId?: string;     // 登録済みリポジトリID（新規追加）
   repository?: RepositoryConfig;  // 直接入力（従来通り）
+  branch?: string;           // Clone branch override for saved repo
   workBranch?: string;       // Item固有の作業ブランチ（repositoryId使用時）
   saveRepository?: boolean;  // 手入力時にリポジトリを保存するか
   repositoryName?: string;   // 保存時のリポジトリ名
