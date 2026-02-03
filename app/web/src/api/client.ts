@@ -10,6 +10,8 @@ import type {
   ApprovalRequestEvent,
   Plan,
   ItemConfig,
+  UpdatePlanRequest,
+  UpdatePlanResponse,
 } from '@agent-orch/shared';
 
 const API_BASE = '/api';
@@ -92,6 +94,22 @@ export async function startPlanner(itemId: string): Promise<{ started: boolean }
 
 export async function getPlan(itemId: string): Promise<{ plan: Plan | null }> {
   return request<{ plan: Plan | null }>(`/items/${itemId}/plan`);
+}
+
+export async function getPlanContent(
+  itemId: string
+): Promise<{ content: string | null }> {
+  return request<{ content: string | null }>(`/items/${itemId}/plan/content`);
+}
+
+export async function updatePlan(
+  itemId: string,
+  data: UpdatePlanRequest
+): Promise<UpdatePlanResponse> {
+  return request<UpdatePlanResponse>(`/items/${itemId}/plan`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  });
 }
 
 // Workers

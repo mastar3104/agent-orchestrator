@@ -6,6 +6,7 @@ import { useWebSocket } from '../hooks/useWebSocket';
 import { AgentCard } from '../components/AgentCard';
 import { AgentTerminal } from '../components/AgentTerminal';
 import { ApprovalQueue } from '../components/ApprovalQueue';
+import * as api from '../api/client';
 
 export function ItemDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -13,6 +14,13 @@ export function ItemDetailPage() {
     useItem(id);
   const [selectedAgent, setSelectedAgent] = useState<AgentInfo | null>(null);
   const [recentEvents, setRecentEvents] = useState<ItemEvent[]>([]);
+  const [planEditorOpen, setPlanEditorOpen] = useState(false);
+  const [planContent, setPlanContent] = useState('');
+  const [planOriginal, setPlanOriginal] = useState('');
+  const [planLoaded, setPlanLoaded] = useState(false);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planSaving, setPlanSaving] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
 
   const handleEvent = useCallback((event: ItemEvent) => {
     setRecentEvents((prev) => [...prev.slice(-100), event]);
@@ -34,6 +42,48 @@ export function ItemDetailPage() {
     itemId: id,
     onEvent: handleEvent,
   });
+
+  const loadPlanContent = useCallback(async () => {
+    if (!id) return;
+    setPlanLoading(true);
+    setPlanError(null);
+    try {
+      const result = await api.getPlanContent(id);
+      const content = result.content ?? '';
+      setPlanContent(content);
+      setPlanOriginal(content);
+      setPlanLoaded(true);
+    } catch (err) {
+      setPlanError(err instanceof Error ? err.message : 'Failed to load plan');
+    } finally {
+      setPlanLoading(false);
+    }
+  }, [id]);
+
+  const handleOpenPlanEditor = useCallback(async () => {
+    setPlanEditorOpen(true);
+    if (!planLoaded) {
+      await loadPlanContent();
+    }
+  }, [loadPlanContent, planLoaded]);
+
+  const handleSavePlan = useCallback(async () => {
+    if (!id) return;
+    setPlanSaving(true);
+    setPlanError(null);
+    try {
+      const result = await api.updatePlan(id, { content: planContent });
+      setPlanContent(result.content);
+      setPlanOriginal(result.content);
+      await refresh();
+    } catch (err) {
+      setPlanError(err instanceof Error ? err.message : 'Failed to save plan');
+    } finally {
+      setPlanSaving(false);
+    }
+  }, [id, planContent, refresh]);
+
+  const planDirty = planContent !== planOriginal;
 
   if (loading) {
     return (
@@ -131,11 +181,67 @@ export function ItemDetailPage() {
       {/* Plan Summary */}
       {item.plan && (
         <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
-          <h3 className="text-sm font-medium text-gray-400 mb-2">Plan</h3>
-          <p className="text-white mb-2">{item.plan.summary}</p>
-          <p className="text-sm text-gray-400">
-            {item.plan.tasks.length} tasks
-          </p>
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h3 className="text-sm font-medium text-gray-400 mb-2">Plan</h3>
+              <p className="text-white mb-2">{item.plan.summary}</p>
+              <p className="text-sm text-gray-400">
+                {item.plan.tasks.length} tasks
+              </p>
+            </div>
+            <button
+              onClick={handleOpenPlanEditor}
+              className="px-3 py-1.5 bg-gray-700 text-white rounded hover:bg-gray-600 text-sm"
+            >
+              Edit plan.yaml
+            </button>
+          </div>
+          {planEditorOpen && (
+            <div className="mt-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-medium text-gray-300">plan.yaml</h4>
+                <div className="flex gap-2">
+                  <button
+                    onClick={loadPlanContent}
+                    disabled={planLoading}
+                    className="px-2.5 py-1 bg-gray-700 text-gray-200 rounded hover:bg-gray-600 text-xs disabled:opacity-50"
+                  >
+                    Reload
+                  </button>
+                  <button
+                    onClick={() => {
+                      setPlanContent(planOriginal);
+                      setPlanError(null);
+                    }}
+                    disabled={!planDirty || planSaving}
+                    className="px-2.5 py-1 bg-gray-700 text-gray-200 rounded hover:bg-gray-600 text-xs disabled:opacity-50"
+                  >
+                    Revert
+                  </button>
+                  <button
+                    onClick={handleSavePlan}
+                    disabled={!planDirty || planSaving}
+                    className="px-2.5 py-1 bg-green-600 text-white rounded hover:bg-green-500 text-xs disabled:opacity-50"
+                  >
+                    {planSaving ? 'Saving...' : 'Save'}
+                  </button>
+                </div>
+              </div>
+              {planLoading ? (
+                <div className="text-xs text-gray-400">Loading plan...</div>
+              ) : (
+                <textarea
+                  value={planContent}
+                  onChange={(event) => setPlanContent(event.target.value)}
+                  className="w-full min-h-[220px] bg-gray-900 text-gray-100 border border-gray-700 rounded p-3 font-mono text-xs"
+                  spellCheck={false}
+                />
+              )}
+              {planError && (
+                <div className="text-xs text-red-400">{planError}</div>
+              )}
+            </div>
+          )}
         </div>
       )}
 

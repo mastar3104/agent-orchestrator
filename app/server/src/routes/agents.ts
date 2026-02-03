@@ -16,7 +16,7 @@ import {
   getOutputBuffer,
   resizeTerminal,
 } from '../services/agent-service';
-import { startPlanner, getPlan } from '../services/planner-service';
+import { startPlanner, getPlan, getPlanContent, updatePlanContent } from '../services/planner-service';
 import { startWorkers, startWorkerForRole, getWorkerStatus } from '../services/worker-service';
 import { getWorkspaceDir } from '../lib/paths';
 
@@ -55,6 +55,48 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
       return reply.status(500).send({
+        success: false,
+        error: message,
+      });
+    }
+  });
+
+  // Get plan content for an item
+  fastify.get<{
+    Params: { id: string };
+    Reply: ApiResponse<{ content: string | null }>;
+  }>('/items/:id/plan/content', async (request, reply) => {
+    try {
+      const content = await getPlanContent(request.params.id);
+      return reply.send({
+        success: true,
+        data: { content },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return reply.status(500).send({
+        success: false,
+        error: message,
+      });
+    }
+  });
+
+  // Update plan for an item
+  fastify.put<{
+    Params: { id: string };
+    Body: { content: string };
+    Reply: ApiResponse<{ plan: import('@agent-orch/shared').Plan; content: string }>;
+  }>('/items/:id/plan', async (request, reply) => {
+    try {
+      const { content } = request.body;
+      const updated = await updatePlanContent(request.params.id, content);
+      return reply.send({
+        success: true,
+        data: updated,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return reply.status(400).send({
         success: false,
         error: message,
       });

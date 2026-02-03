@@ -1,4 +1,5 @@
 import type { ItemConfig, ItemSummary, ItemDetail } from './item';
+import type { Plan } from './plan';
 import type { AgentInfo, AgentRole } from './agent';
 import type { ItemEvent } from './events';
 
@@ -40,6 +41,10 @@ export interface ApprovalDecisionRequest {
   reason?: string;
 }
 
+export interface UpdatePlanRequest {
+  content: string;
+}
+
 // Response types
 export interface ApiResponse<T> {
   success: boolean;
@@ -65,6 +70,11 @@ export interface StartAgentResponse {
 
 export interface AgentStatusResponse {
   agent: AgentInfo;
+}
+
+export interface UpdatePlanResponse {
+  plan: Plan;
+  content: string;
 }
 
 // WebSocket message types

@@ -1,10 +1,10 @@
-import { watch } from 'fs';
-import { readFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { watch, existsSync } from 'fs';
+import { readFile, writeFile, mkdir } from 'fs/promises';
+import { dirname } from 'path';
 import type { ItemConfig, Plan } from '@agent-orch/shared';
 import { startAgent, sendInput, getAgentsByItem } from './agent-service';
 import { getItemConfig } from './item-service';
-import { readYamlSafe, parseYaml } from '../lib/yaml';
+import { readYamlSafe, parseYaml, stringifyYaml } from '../lib/yaml';
 import { appendJsonl } from '../lib/jsonl';
 import { createPlanCreatedEvent, createStatusChangedEvent } from '../lib/events';
 import {
@@ -178,6 +178,55 @@ export async function getPlan(itemId: string): Promise<Plan | null> {
     plan = await readYamlSafe<Plan>(`${getWorkspaceDir(itemId)}/plan.yaml`);
   }
   return plan;
+}
+
+export async function getPlanContent(itemId: string): Promise<string | null> {
+  const itemPlanPath = getItemPlanPath(itemId);
+  if (existsSync(itemPlanPath)) {
+    return readFile(itemPlanPath, 'utf-8');
+  }
+
+  const workspacePlanPath = `${getWorkspaceDir(itemId)}/plan.yaml`;
+  if (existsSync(workspacePlanPath)) {
+    return readFile(workspacePlanPath, 'utf-8');
+  }
+
+  return null;
+}
+
+export async function updatePlanContent(
+  itemId: string,
+  content: string
+): Promise<{ plan: Plan; content: string }> {
+  let plan: Plan;
+  try {
+    plan = parseYaml<Plan>(content);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Invalid YAML';
+    throw new Error(`Invalid YAML: ${message}`);
+  }
+
+  const errors = await validatePlan(plan);
+  if (plan.itemId && plan.itemId !== itemId) {
+    errors.push(`itemId does not match (${plan.itemId} !== ${itemId})`);
+  }
+
+  if (errors.length > 0) {
+    throw new Error(`Plan validation failed: ${errors.join('; ')}`);
+  }
+
+  const normalized = stringifyYaml(plan);
+  const itemPlanPath = getItemPlanPath(itemId);
+  const workspacePlanPath = `${getWorkspaceDir(itemId)}/plan.yaml`;
+
+  await mkdir(dirname(itemPlanPath), { recursive: true });
+  await writeFile(itemPlanPath, normalized, 'utf-8');
+
+  if (existsSync(getWorkspaceDir(itemId))) {
+    await writeFile(workspacePlanPath, normalized, 'utf-8');
+  }
+
+  return { plan, content: normalized };
 }
 
 export async function validatePlan(plan: Plan): Promise<string[]> {
