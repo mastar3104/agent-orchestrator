@@ -16,6 +16,9 @@ export function AgentTerminal({ itemId, agentId, events }: AgentTerminalProps) {
   const terminalInstance = useRef<Terminal | null>(null);
   const fitAddon = useRef<FitAddon | null>(null);
   const initializedRef = useRef(false);
+  const seenEventIdsRef = useRef<Set<string>>(new Set());
+  const bufferRequestedAtRef = useRef<string | null>(null);
+  const bufferLoadedRef = useRef(false);
 
   const initTerminal = useCallback(() => {
     if (!terminalRef.current || terminalInstance.current) return;
@@ -60,9 +63,16 @@ export function AgentTerminal({ itemId, agentId, events }: AgentTerminalProps) {
       initializedRef.current = true;
 
       // Load initial output
+      bufferRequestedAtRef.current = new Date().toISOString();
       api.getAgentOutput(itemId, agentId).then(({ output }) => {
         if (terminalInstance.current && output) {
           terminalInstance.current.write(output);
+        }
+        bufferLoadedRef.current = true;
+        if (events) {
+          for (const event of events) {
+            seenEventIdsRef.current.add(event.id);
+          }
         }
       }).catch(console.error);
     }
@@ -73,6 +83,9 @@ export function AgentTerminal({ itemId, agentId, events }: AgentTerminalProps) {
         terminalInstance.current = null;
         initializedRef.current = false;
       }
+      seenEventIdsRef.current = new Set();
+      bufferRequestedAtRef.current = null;
+      bufferLoadedRef.current = false;
     };
   }, [itemId, agentId, initTerminal]);
 
@@ -97,8 +110,19 @@ export function AgentTerminal({ itemId, agentId, events }: AgentTerminalProps) {
         (event.type === 'stdout' || event.type === 'stderr') &&
         event.agentId === agentId
       ) {
+        if (seenEventIdsRef.current.has(event.id)) {
+          continue;
+        }
+        if (!bufferLoadedRef.current) {
+          continue;
+        }
+        if (bufferRequestedAtRef.current && event.timestamp <= bufferRequestedAtRef.current) {
+          seenEventIdsRef.current.add(event.id);
+          continue;
+        }
         const outputEvent = event as OutputEvent;
         terminalInstance.current.write(outputEvent.data);
+        seenEventIdsRef.current.add(event.id);
       }
     }
   }, [events, agentId]);

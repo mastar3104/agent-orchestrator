@@ -176,7 +176,7 @@ export class PtyManager extends EventEmitter {
         instance.approvalRetried = true;
         // menuの場合は'1'でフォールバック、それ以外はEnterのみ
         const fallbackResponse = instance.pendingUiKind === 'menu' ? '1' : '';
-        this.sendInput(instance.id, fallbackResponse);
+        this.sendLine(instance.id, fallbackResponse);
       }
       return; // 送信済み状態では新しい検出をスキップ
     }
@@ -241,7 +241,7 @@ export class PtyManager extends EventEmitter {
   }
 
   private sendInputAndMarkSent(instance: PtyInstance, input: string): void {
-    this.sendInput(instance.id, input);
+    this.sendLine(instance.id, input);
     instance.approvalState = 'sent';
     instance.approvalSentAt = Date.now();
     instance.approvalRetried = false;
@@ -256,6 +256,16 @@ export class PtyManager extends EventEmitter {
   }
 
   sendInput(instanceId: string, input: string): boolean {
+    const instance = this.instances.get(instanceId);
+    if (!instance) {
+      return false;
+    }
+
+    instance.pty.write(input);
+    return true;
+  }
+
+  sendLine(instanceId: string, input: string): boolean {
     const instance = this.instances.get(instanceId);
     if (!instance) {
       return false;
