@@ -385,7 +385,11 @@ function buildWorkerPrompt(
 ): string {
   // Use special review prompt for review role
   if (role === 'review') {
-    return REVIEW_PROMPT_TEMPLATE;
+    // plan.yaml の review task description も含める
+    const taskDescriptions = tasks
+      .map((task) => `### Task: ${task.id} - ${task.title}\n${task.description}`)
+      .join('\n\n');
+    return REVIEW_PROMPT_TEMPLATE + '\n\n## Task-Specific Review Instructions\n\n' + taskDescriptions;
   }
 
   // Build task list
