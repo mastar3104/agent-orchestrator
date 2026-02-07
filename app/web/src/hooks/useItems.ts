@@ -49,6 +49,7 @@ export function useItem(id: string | undefined) {
   const [item, setItem] = useState<ItemDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [reviewReceiveError, setReviewReceiveError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!id) return;
@@ -87,6 +88,19 @@ export function useItem(id: string | undefined) {
     await refresh();
   };
 
+  const startReviewReceive = async () => {
+    if (!id) return;
+    setReviewReceiveError(null);
+    try {
+      await api.startReviewReceive(id);
+      await refresh();
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to start review receive';
+      setReviewReceiveError(message);
+    }
+  };
+
   return {
     item,
     loading,
@@ -95,5 +109,7 @@ export function useItem(id: string | undefined) {
     startPlanner,
     startWorkers,
     stopAgent,
+    startReviewReceive,
+    reviewReceiveError,
   };
 }

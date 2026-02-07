@@ -221,3 +221,15 @@ export async function batchProcessApprovals(
     body: JSON.stringify({ decision, reason }),
   });
 }
+
+// Review Receive
+export async function startReviewReceive(
+  itemId: string
+): Promise<{ started: boolean; prNumber: number }> {
+  return request<{ started: boolean; prNumber: number }>(
+    `/items/${itemId}/review-receive/start`,
+    {
+      method: 'POST',
+    }
+  );
+}

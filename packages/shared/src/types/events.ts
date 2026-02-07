@@ -17,7 +17,8 @@ export type EventType =
   | 'workspace_setup_completed'
   | 'error'
   | 'pr_created'
-  | 'review_findings_extracted';
+  | 'review_findings_extracted'
+  | 'review_receive_started';
 
 export interface BaseEvent {
   id: string;
@@ -177,6 +178,13 @@ export interface ReviewFindingsExtractedEvent extends BaseEvent {
   minorCount: number;
 }
 
+export interface ReviewReceiveStartedEvent extends BaseEvent {
+  type: 'review_receive_started';
+  agentId: string;  // 起動するagentのIDを含める（状態判定の紐づけ用）
+  prNumber: number;
+  prUrl: string;
+}
+
 export type AgentEvent =
   | AgentStartedEvent
   | AgentExitedEvent
@@ -200,4 +208,5 @@ export type ItemEvent =
   | ErrorEvent
   | PrCreatedEvent
   | ReviewFindingsExtractedEvent
+  | ReviewReceiveStartedEvent
   | AgentEvent;

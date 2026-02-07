@@ -14,6 +14,7 @@ const STATUS_COLORS: Record<ItemStatus, string> = {
   running: 'bg-yellow-500',
   waiting_approval: 'bg-orange-500',
   completed: 'bg-green-600',
+  review_receiving: 'bg-cyan-500',
   error: 'bg-red-500',
 };
 
@@ -25,6 +26,7 @@ const STATUS_LABELS: Record<ItemStatus, string> = {
   running: 'Running',
   waiting_approval: 'Waiting Approval',
   completed: 'Completed',
+  review_receiving: 'Review Receiving',
   error: 'Error',
 };
 

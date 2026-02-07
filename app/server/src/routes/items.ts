@@ -15,6 +15,10 @@ import {
   deleteItem,
 } from '../services/item-service';
 import { createDraftPr } from '../services/git-pr-service';
+import {
+  startReviewReceive,
+  ReviewReceiveValidationError,
+} from '../services/review-receive-service';
 
 export const itemRoutes: FastifyPluginAsync = async (fastify) => {
   // Create a new item
@@ -181,6 +185,40 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
       fastify.log.error({ itemId: request.params.id, error }, 'PR creation failed');
+      return reply.status(500).send({
+        success: false,
+        error: message,
+      });
+    }
+  });
+
+  // Review Receive - fetch PR comments and create plan
+  fastify.post<{
+    Params: { id: string };
+    Reply: ApiResponse<{ started: boolean; prNumber: number }>;
+  }>('/items/:id/review-receive/start', async (request, reply) => {
+    try {
+      const result = await startReviewReceive(request.params.id);
+      return reply.send({
+        success: true,
+        data: result,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+
+      // バリデーションエラーは 400、その他は 500
+      if (error instanceof ReviewReceiveValidationError) {
+        return reply.status(400).send({
+          success: false,
+          error: message,
+        });
+      }
+
+      // Agent起動失敗などの内部エラーは 500
+      fastify.log.error(
+        { itemId: request.params.id, error },
+        'Review receive failed'
+      );
       return reply.status(500).send({
         success: false,
         error: message,

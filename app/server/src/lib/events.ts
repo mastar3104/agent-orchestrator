@@ -22,6 +22,7 @@ import type {
   AgentRole,
   ReviewFinding,
   ReviewFindingsExtractedEvent,
+  ReviewReceiveStartedEvent,
 } from '@agent-orch/shared';
 
 function createEventId(): string {
@@ -345,5 +346,22 @@ export function createReviewFindingsExtractedEvent(
     criticalCount,
     majorCount,
     minorCount,
+  };
+}
+
+export function createReviewReceiveStartedEvent(
+  itemId: string,
+  agentId: string,
+  prNumber: number,
+  prUrl: string
+): ReviewReceiveStartedEvent {
+  return {
+    id: createEventId(),
+    type: 'review_receive_started',
+    timestamp: timestamp(),
+    itemId,
+    agentId,
+    prNumber,
+    prUrl,
   };
 }

@@ -32,6 +32,7 @@ export type ItemStatus =
   | 'running'
   | 'waiting_approval'
   | 'completed'
+  | 'review_receiving'
   | 'error';
 
 export interface ItemSummary {
@@ -48,4 +49,6 @@ export interface ItemDetail extends ItemConfig {
   plan?: import('./plan').Plan;
   agents: import('./agent').AgentInfo[];
   pendingApprovals: import('./events').ApprovalRequestEvent[];
+  prUrl?: string;
+  prNumber?: number;
 }

@@ -10,6 +10,7 @@ import type {
   CreateItemRequest,
   Plan,
   RepositoryConfig,
+  PrCreatedEvent,
 } from '@agent-orch/shared';
 import { getRepository, createRepository } from './repository-service';
 import { readYaml, writeYaml, readYamlSafe } from '../lib/yaml';
@@ -33,6 +34,7 @@ import {
 import { deriveItemStatus, getPendingApprovals } from './state-service';
 import { getAgentsByItem, stopAgent } from './agent-service';
 import { stopAllGitSnapshots } from './git-snapshot-service';
+import { startPlanner } from './planner-service';
 
 export async function createItem(request: CreateItemRequest): Promise<ItemConfig> {
   const id = `ITEM-${nanoid(8)}`;
@@ -52,13 +54,16 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
       url: savedRepo.url,
       localPath: savedRepo.localPath,
       branch: request.branch || savedRepo.branch,
-      workBranch: request.workBranch,
+      workBranch: request.workBranch || `work/${id}`,
       submodules: savedRepo.submodules,
       linkMode: savedRepo.linkMode,
     };
   } else if (request.repository) {
     // Use directly provided repository config
-    repositoryConfig = request.repository;
+    repositoryConfig = {
+      ...request.repository,
+      workBranch: request.repository.workBranch || `work/${id}`,
+    };
 
     // Optionally save the repository for reuse
     if (request.saveRepository && request.repositoryName) {
@@ -165,6 +170,15 @@ async function setupLocalWorkspace(
 
     // Log workspace setup completed
     await appendJsonl(eventsPath, createWorkspaceSetupCompletedEvent(itemId, true));
+
+    // Auto-start planner after successful workspace setup
+    try {
+      await startPlanner(itemId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      console.error(`[${itemId}] Failed to auto-start planner: ${message}`);
+      await appendJsonl(eventsPath, createErrorEvent(itemId, 'planner_autostart_failed', message));
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     await appendJsonl(eventsPath, createWorkspaceSetupCompletedEvent(itemId, false, message));
@@ -248,6 +262,15 @@ async function cloneRemoteRepo(
 
     // Log clone completed
     await appendJsonl(eventsPath, createCloneCompletedEvent(itemId, true));
+
+    // Auto-start planner after successful clone
+    try {
+      await startPlanner(itemId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      console.error(`[${itemId}] Failed to auto-start planner: ${message}`);
+      await appendJsonl(eventsPath, createErrorEvent(itemId, 'planner_autostart_failed', message));
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     await appendJsonl(eventsPath, createCloneCompletedEvent(itemId, false, message));
@@ -313,12 +336,19 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
   const agents = await getAgentsByItem(itemId);
   const pendingApprovals = await getPendingApprovals(itemId);
 
+  // Get PR info from events
+  const events = await readJsonl<PrCreatedEvent>(getItemEventsPath(itemId));
+  const prEvents = events.filter((e): e is PrCreatedEvent => e.type === 'pr_created');
+  const latestPrEvent = prEvents.length > 0 ? prEvents[prEvents.length - 1] : null;
+
   return {
     ...config,
     status,
     plan: plan || undefined,
     agents,
     pendingApprovals,
+    prUrl: latestPrEvent?.prUrl,
+    prNumber: latestPrEvent?.prNumber,
   };
 }
 

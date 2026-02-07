@@ -71,6 +71,18 @@ Your ONLY job is to:
 IMPORTANT: After creating plan.yaml, you MUST output "TASKS_COMPLETED" on its own line, then STOP working immediately. The orchestrator will automatically terminate this session. Do NOT continue with any implementation, testing, or other actions.`;
 
 export async function startPlanner(itemId: string): Promise<void> {
+  // Check for existing planner (allow restart from error/stopped)
+  const agents = await getAgentsByItem(itemId);
+  const existingPlanner = agents.find(a => a.role === 'planner');
+  if (existingPlanner) {
+    // error/stopped are restartable, others should be skipped
+    if (existingPlanner.status !== 'error' && existingPlanner.status !== 'stopped') {
+      console.log(`[${itemId}] Planner already exists (status: ${existingPlanner.status}), skipping`);
+      return;
+    }
+    console.log(`[${itemId}] Restarting planner (previous status: ${existingPlanner.status})`);
+  }
+
   const config = await getItemConfig(itemId);
   if (!config) {
     throw new Error(`Item ${itemId} not found`);
@@ -99,7 +111,16 @@ function buildPlannerPrompt(config: ItemConfig): string {
     .replace('{{itemId}}', config.id);
 }
 
-function watchForPlan(itemId: string): void {
+/**
+ * Watch for plan.yaml creation and emit plan_created event
+ * @param itemId - The item ID to watch
+ * @param targetRole - The agent role that creates the plan (default: 'planner')
+ *                     Used to update the correct agent's status when plan is detected
+ */
+export function watchForPlan(
+  itemId: string,
+  targetRole: 'planner' | 'review-receiver' = 'planner'
+): void {
   const planPath = getItemPlanPath(itemId);
   const workspaceDir = getWorkspaceDir(itemId);
 
@@ -107,47 +128,53 @@ function watchForPlan(itemId: string): void {
   const workspacePlanPath = `${workspaceDir}/plan.yaml`;
 
   let detected = false;
+  let pendingCheck: Promise<void> = Promise.resolve();
 
-  const checkAndEmit = async (path: string) => {
-    if (detected) return;
+  const checkAndEmit = (path: string) => {
+    pendingCheck = pendingCheck.then(async () => {
+      if (detected) return;
 
-    try {
-      const content = await readFile(path, 'utf-8');
-      const plan = parseYaml<Plan>(content);
+      try {
+        const content = await readFile(path, 'utf-8');
+        const plan = parseYaml<Plan>(content);
 
-      if (plan && plan.tasks && plan.tasks.length > 0) {
-        detected = true;
+        if (plan && plan.tasks) {
+          detected = true;
 
-        // Log plan created event
-        const event = createPlanCreatedEvent(itemId, path);
-        await appendJsonl(getItemEventsPath(itemId), event);
-        eventBus.emit('event', { itemId, event });
+          // Log plan created event
+          const event = createPlanCreatedEvent(itemId, path);
+          await appendJsonl(getItemEventsPath(itemId), event);
+          eventBus.emit('event', { itemId, event });
 
-        // Update planner agent status to completed
-        const agents = await getAgentsByItem(itemId);
-        const plannerAgent = agents.find(a => a.role === 'planner');
-        if (plannerAgent) {
-          // Record status_changed event
-          const statusEvent = createStatusChangedEvent(
-            itemId,
-            plannerAgent.status,
-            'completed',
-            plannerAgent.id
-          );
-          await appendJsonl(getItemEventsPath(itemId), statusEvent);
-          eventBus.emit('event', { itemId, event: statusEvent });
+          // Update target agent status to completed
+          // When planner is restarted, multiple agents with the same role exist.
+          // Prefer the currently running one to avoid marking the wrong agent.
+          const agents = await getAgentsByItem(itemId);
+          const targetAgent = agents.find(a => a.role === targetRole && a.status === 'running')
+            ?? [...agents].reverse().find(a => a.role === targetRole);
+          if (targetAgent) {
+            // Record status_changed event
+            const statusEvent = createStatusChangedEvent(
+              itemId,
+              targetAgent.status,
+              'completed',
+              targetAgent.id
+            );
+            await appendJsonl(getItemEventsPath(itemId), statusEvent);
+            eventBus.emit('event', { itemId, event: statusEvent });
 
-          // Update agent state
-          plannerAgent.status = 'completed';
-          plannerAgent.stoppedAt = new Date().toISOString();
+            // Update agent state
+            targetAgent.status = 'completed';
+            targetAgent.stoppedAt = new Date().toISOString();
 
-          // Signal planner agent to exit
-          await sendInput(plannerAgent.id, '/exit');
+            // Signal target agent to exit
+            await sendInput(targetAgent.id, '/exit');
+          }
         }
+      } catch {
+        // File doesn't exist or isn't valid yaml yet
       }
-    } catch {
-      // File doesn't exist or isn't valid yaml yet
-    }
+    });
   };
 
   // Check if plan already exists
@@ -155,20 +182,32 @@ function watchForPlan(itemId: string): void {
   checkAndEmit(workspacePlanPath);
 
   // Watch item directory for plan.yaml
+  let watcher: ReturnType<typeof watch> | null = null;
   if (existsSync(workspaceDir)) {
-    const watcher = watch(workspaceDir, (eventType, filename) => {
+    watcher = watch(workspaceDir, (eventType, filename) => {
       // 'rename' = file created/deleted, 'change' = file modified
       // Both events should trigger plan detection
       if (filename === 'plan.yaml') {
         checkAndEmit(workspacePlanPath);
       }
     });
-
-    // Auto-close watcher after 30 minutes
-    setTimeout(() => {
-      watcher.close();
-    }, 30 * 60 * 1000);
   }
+
+  // Polling fallback: fs.watch can be unreliable on macOS + symlink environments
+  const pollInterval = setInterval(() => {
+    if (detected) {
+      clearInterval(pollInterval);
+      return;
+    }
+    checkAndEmit(planPath);
+    checkAndEmit(workspacePlanPath);
+  }, 3000);
+
+  // Auto-close watcher and polling after 30 minutes
+  setTimeout(() => {
+    watcher?.close();
+    clearInterval(pollInterval);
+  }, 30 * 60 * 1000);
 }
 
 export async function getPlan(itemId: string): Promise<Plan | null> {

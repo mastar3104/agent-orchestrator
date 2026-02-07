@@ -4,6 +4,7 @@ import type {
   ItemEvent,
   ApprovalRequestEvent,
   ApprovalDecisionEvent,
+  ReviewReceiveStartedEvent,
 } from '@agent-orch/shared';
 import { readJsonl } from '../lib/jsonl';
 import { getItemEventsPath, getAgentEventsPath } from '../lib/paths';
@@ -86,6 +87,15 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
     return agentId.includes('-planner-');
   };
 
+  // Helper: check if agentId is review-receiver (with fallback to string matching)
+  const isReviewReceiverAgent = (agentId: string): boolean => {
+    const role = agentRoles.get(agentId);
+    if (role !== undefined) {
+      return role === 'review-receiver';
+    }
+    return agentId.includes('-review-receiver-');
+  };
+
   // Check for running agents
   const agentStates = new Map<string, AgentStatus>();
 
@@ -97,7 +107,10 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
           break;
         case 'agent_exited': {
           const e = event as import('@agent-orch/shared').AgentExitedEvent;
-          agentStates.set(event.agentId, e.exitCode === 0 ? 'completed' : 'error');
+          const currentStatusExited = agentStates.get(event.agentId);
+          if (currentStatusExited !== 'stopped') {
+            agentStates.set(event.agentId, e.exitCode === 0 ? 'completed' : 'error');
+          }
           break;
         }
         case 'approval_requested':
@@ -112,7 +125,10 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
           break;
         case 'status_changed': {
           const e = event as import('@agent-orch/shared').StatusChangedEvent;
-          agentStates.set(event.agentId, e.newStatus as AgentStatus);
+          const currentStatusChanged = agentStates.get(event.agentId);
+          if (currentStatusChanged !== 'stopped') {
+            agentStates.set(event.agentId, e.newStatus as AgentStatus);
+          }
           break;
         }
       }
@@ -124,6 +140,49 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
   // Check for pending approvals first (for any agent including planner)
   if (statuses.includes('waiting_approval')) {
     return 'waiting_approval';
+  }
+
+  // Check for review receive in progress
+  // NOTE: events は itemId のイベントのみを含むため、別itemのagentは含まれない
+  const reviewReceiveStartedEvents = events.filter(
+    (e): e is ReviewReceiveStartedEvent => e.type === 'review_receive_started'
+  );
+
+  if (reviewReceiveStartedEvents.length > 0) {
+    // 最後の review_receive_started イベントを取得
+    const lastReviewReceiveEvent =
+      reviewReceiveStartedEvents[reviewReceiveStartedEvents.length - 1];
+    const lastReviewReceiveIdx = events.indexOf(lastReviewReceiveEvent);
+
+    // 過去データ互換性: agentId がないイベントはスキップ
+    // （この機能導入前のデータには agentId がない可能性がある）
+    if (lastReviewReceiveEvent.agentId) {
+      const targetAgentId = lastReviewReceiveEvent.agentId;
+
+      // 最後の review_receive_started 以降に plan_created があるかチェック
+      const planCreatedAfterLastReviewReceive = events.some(
+        (e, idx) => e.type === 'plan_created' && idx > lastReviewReceiveIdx
+      );
+
+      // plan が作られていない場合のみ review_receiving 判定を行う
+      if (!planCreatedAfterLastReviewReceive) {
+        // 該当する review-receiver agent の状態を確認
+        const reviewReceiverStatus = agentStates.get(targetAgentId);
+
+        // agent_started がまだ来ていない場合（agentStatesにエントリがない）も
+        // review_receiving として扱う（review_receive_started → agent_started の間）
+        if (reviewReceiverStatus === undefined || reviewReceiverStatus === 'running') {
+          return 'review_receiving';
+        }
+
+        // 該当 Agent が error で終了していればエラー状態
+        if (reviewReceiverStatus === 'error') {
+          return 'error';
+        }
+      }
+    }
+    // agentId がない古いイベントの場合は、このチェックをスキップして
+    // 後続のロジック（hasPlan等）に委ねる
   }
 
   // Check if planner is running (using role map with fallback)
@@ -140,8 +199,10 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
     return 'running';
   }
 
-  // Check if any worker (non-planner) agents exist (using role map with fallback)
-  const workerAgentIds = Array.from(agentStates.keys()).filter((id) => !isPlannerAgent(id));
+  // Check if any worker (non-planner, non-review-receiver) agents exist
+  const workerAgentIds = Array.from(agentStates.keys()).filter(
+    (id) => !isPlannerAgent(id) && !isReviewReceiverAgent(id)
+  );
   const hasWorkers = workerAgentIds.length > 0;
 
   // Check for completed state: all workers have tasks_completed and PR is created
@@ -151,12 +212,28 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
       events
         .filter((e) => e.type === 'tasks_completed' && e.agentId)
         .map((e) => e.agentId!)
-        .filter((id) => !isPlannerAgent(id))
+        .filter((id) => !isPlannerAgent(id) && !isReviewReceiverAgent(id))
     );
     const hasPrCreated = events.some((e) => e.type === 'pr_created');
 
     if (completedWorkerAgentIds.size >= workerAgentIds.length && hasPrCreated) {
-      return 'completed';
+      // ReviewReceive後に新しいplanが作成されている場合は新サイクルなので
+      // completed ではなく ready として扱う
+      const lastPrIdx = events.reduce(
+        (maxIdx, e, idx) => (e.type === 'pr_created' ? idx : maxIdx),
+        -1
+      );
+      const hasPlanAfterLastPr = events.some(
+        (e, idx) => e.type === 'plan_created' && idx > lastPrIdx
+      );
+      const hasReviewReceiveAfterLastPr = events.some(
+        (e, idx) => e.type === 'review_receive_started' && idx > lastPrIdx
+      );
+
+      if (!hasPlanAfterLastPr && !hasReviewReceiveAfterLastPr) {
+        return 'completed';
+      }
+      // 新サイクルが開始されている → fall through to 'ready'
     }
   }
 
@@ -187,7 +264,9 @@ export async function deriveAgentStatus(
         break;
       case 'agent_exited': {
         const e = event as import('@agent-orch/shared').AgentExitedEvent;
-        status = e.exitCode === 0 ? 'completed' : 'error';
+        if (status !== 'stopped') {
+          status = e.exitCode === 0 ? 'completed' : 'error';
+        }
         break;
       }
       case 'approval_requested':
@@ -200,7 +279,9 @@ export async function deriveAgentStatus(
         break;
       case 'status_changed': {
         const e = event as import('@agent-orch/shared').StatusChangedEvent;
-        status = e.newStatus as AgentStatus;
+        if (status !== 'stopped') {
+          status = e.newStatus as AgentStatus;
+        }
         break;
       }
     }

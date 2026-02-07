@@ -46,6 +46,12 @@ export interface ApprovalRequest {
   timestamp: string;
 }
 
+// ANSIエスケープシーケンスを除去する（色、カーソル移動など全て）
+function stripAnsi(str: string): string {
+  // eslint-disable-next-line no-control-regex
+  return str.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+}
+
 export class PtyManager extends EventEmitter {
   private instances: Map<string, PtyInstance> = new Map();
   private outputBufferLimit = 16384; // Keep last 16KB of output
@@ -148,9 +154,10 @@ export class PtyManager extends EventEmitter {
     });
 
     // タスク完了検出（行単位完全一致で誤爆防止）
+    // ANSIエスケープシーケンスを除去してから判定（Claude CLIが色付けする場合がある）
     const lines = data.split('\n');
     for (const line of lines) {
-      if (line.trim() === 'TASKS_COMPLETED') {
+      if (stripAnsi(line).trim() === 'TASKS_COMPLETED') {
         this.emit('tasks_completed', {
           instanceId: instance.id,
           timestamp: new Date().toISOString(),

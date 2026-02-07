@@ -1,4 +1,4 @@
-export type AgentRole = 'planner' | 'front' | 'back' | 'review';
+export type AgentRole = 'planner' | 'front' | 'back' | 'review' | 'review-receiver';
 
 export type AgentStatus =
   | 'idle'

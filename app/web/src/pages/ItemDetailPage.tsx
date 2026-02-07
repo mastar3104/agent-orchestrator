@@ -10,8 +10,17 @@ import * as api from '../api/client';
 
 export function ItemDetailPage() {
   const { id } = useParams<{ id: string }>();
-  const { item, loading, error, refresh, startPlanner, startWorkers, stopAgent } =
-    useItem(id);
+  const {
+    item,
+    loading,
+    error,
+    refresh,
+    startPlanner,
+    startWorkers,
+    stopAgent,
+    startReviewReceive,
+    reviewReceiveError,
+  } = useItem(id);
   const [selectedAgent, setSelectedAgent] = useState<AgentInfo | null>(null);
   const [recentEvents, setRecentEvents] = useState<ItemEvent[]>([]);
   const [planEditorOpen, setPlanEditorOpen] = useState(false);
@@ -113,6 +122,11 @@ export function ItemDetailPage() {
     item.status === 'ready' ||
     (item.status === 'error' && !!item.plan);
 
+  // Review Receive can be started when completed or error
+  // NOTE: UI側は status のみで表示制御、PRがない場合はサーバからエラーメッセージが返る
+  const canStartReviewReceive =
+    item.status === 'completed' || item.status === 'error';
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -131,11 +145,23 @@ export function ItemDetailPage() {
                   ? 'bg-yellow-500'
                   : item.status === 'completed'
                   ? 'bg-green-600'
+                  : item.status === 'review_receiving'
+                  ? 'bg-cyan-500'
                   : 'bg-gray-500'
               }`}
             >
               {item.status}
             </span>
+            {item.prUrl && (
+              <a
+                href={item.prUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="px-2 py-0.5 text-xs rounded-full bg-purple-600 text-white hover:bg-purple-500"
+              >
+                PR #{item.prNumber}
+              </a>
+            )}
             {!isConnected && (
               <span className="text-xs text-red-400">Disconnected</span>
             )}
@@ -159,6 +185,19 @@ export function ItemDetailPage() {
             >
               Start Workers
             </button>
+          )}
+          {canStartReviewReceive && (
+            <div className="flex flex-col gap-1">
+              <button
+                onClick={startReviewReceive}
+                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-500"
+              >
+                Review Receive
+              </button>
+              {reviewReceiveError && (
+                <span className="text-xs text-red-400">{reviewReceiveError}</span>
+              )}
+            </div>
           )}
         </div>
       </div>

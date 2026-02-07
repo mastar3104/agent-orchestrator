@@ -4,9 +4,18 @@ import type {
   AgentInfo,
   AgentRole,
   AgentStatus,
-  AgentStartOptions,
   ItemEvent,
 } from '@agent-orch/shared';
+
+// Extended options that support external agentId
+interface AgentStartOptionsExtended {
+  itemId: string;
+  role: AgentRole;
+  prompt: string;
+  workingDir: string;
+  env?: Record<string, string>;
+  agentId?: string; // 外部から指定された場合はこれを使用
+}
 import { ptyManager } from '../lib/pty-manager';
 import { appendJsonl, readJsonl } from '../lib/jsonl';
 import {
@@ -30,8 +39,17 @@ import { eventBus } from './event-bus';
 // In-memory state for running agents
 const agentState = new Map<string, AgentInfo>();
 
-export async function startAgent(options: AgentStartOptions): Promise<AgentInfo> {
-  const agentId = `agent-${options.role}-${nanoid(6)}`;
+/**
+ * Generate a unique agent ID
+ * Exported for pre-generating IDs before event recording
+ */
+export function generateAgentId(_itemId: string, role: AgentRole): string {
+  return `agent-${role}-${nanoid(6)}`;
+}
+
+export async function startAgent(options: AgentStartOptionsExtended): Promise<AgentInfo> {
+  // 外部からagentIdが渡された場合はそれを使用、なければ生成
+  const agentId = options.agentId ?? generateAgentId(options.itemId, options.role);
 
   // Create agent directory
   await mkdir(getAgentDir(options.itemId, agentId), { recursive: true });
@@ -106,7 +124,10 @@ function setupAgentEventHandlers(agentId: string, itemId: string): void {
 
     const agent = agentState.get(agentId);
     if (agent) {
-      agent.status = event.exitCode === 0 ? 'completed' : 'error';
+      // stopped は意図的停止なので status を維持
+      if (agent.status !== 'stopped') {
+        agent.status = event.exitCode === 0 ? 'completed' : 'error';
+      }
       agent.stoppedAt = new Date().toISOString();
       agent.exitCode = event.exitCode;
     }
@@ -261,12 +282,13 @@ export async function stopAgent(agentId: string): Promise<boolean> {
   const killed = ptyManager.kill(agentId);
 
   if (killed) {
+    const previousStatus = agent.status;
     agent.status = 'stopped';
     agent.stoppedAt = new Date().toISOString();
 
     const statusEvent = createStatusChangedEvent(
       agent.itemId,
-      'running',
+      previousStatus,
       'stopped',
       agentId
     );
@@ -375,7 +397,9 @@ export async function reconstructAgentState(itemId: string): Promise<void> {
       const e = event as import('@agent-orch/shared').AgentExitedEvent;
       const agent = agents.get(e.agentId);
       if (agent) {
-        agent.status = e.exitCode === 0 ? 'completed' : 'error';
+        if (agent.status !== 'stopped') {
+          agent.status = e.exitCode === 0 ? 'completed' : 'error';
+        }
         agent.stoppedAt = e.timestamp;
         agent.exitCode = e.exitCode;
       }
@@ -383,7 +407,9 @@ export async function reconstructAgentState(itemId: string): Promise<void> {
       const e = event as import('@agent-orch/shared').StatusChangedEvent;
       const agent = agents.get(event.agentId);
       if (agent) {
-        agent.status = e.newStatus as AgentStatus;
+        if (agent.status !== 'stopped') {
+          agent.status = e.newStatus as AgentStatus;
+        }
       }
     }
   }
@@ -428,7 +454,9 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
       const existing = agents.get(event.agentId);
       const newStatus = e.exitCode === 0 ? 'completed' : 'error';
       if (existing) {
-        existing.status = newStatus;
+        if (existing.status !== 'stopped') {
+          existing.status = newStatus;
+        }
       } else {
         // Create entry even without agent_started
         agents.set(event.agentId, {
@@ -440,7 +468,9 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
       const e = event as import('@agent-orch/shared').StatusChangedEvent;
       const existing = agents.get(event.agentId);
       if (existing) {
-        existing.status = e.newStatus as AgentStatus;
+        if (existing.status !== 'stopped') {
+          existing.status = e.newStatus as AgentStatus;
+        }
       } else {
         // Create entry even without agent_started (handles missing events)
         agents.set(event.agentId, {
@@ -514,6 +544,7 @@ function tryExtractRoleFromAgentId(agentId: string): AgentRole | null {
   if (agentId.includes('-planner-')) return 'planner';
   if (agentId.includes('-front-')) return 'front';
   if (agentId.includes('-back-')) return 'back';
+  if (agentId.includes('-review-receiver-')) return 'review-receiver';
   if (agentId.includes('-review-')) return 'review';
 
   // Unknown role pattern - return null to let caller decide

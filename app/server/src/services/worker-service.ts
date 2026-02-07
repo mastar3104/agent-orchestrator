@@ -1,7 +1,7 @@
 import { join, resolve } from 'path';
 import { readFile, unlink } from 'fs/promises';
 import type { Plan, PlanTask, AgentRole, AgentInfo, AgentStatus } from '@agent-orch/shared';
-import { startAgent, getAgentsByItem, waitForAgentsToComplete, sendInput } from './agent-service';
+import { startAgent, getAgentsByItem, waitForAgentsToComplete, sendInput, stopAgent } from './agent-service';
 import { getPlan } from './planner-service';
 import { getItemConfig } from './item-service';
 import {
@@ -13,7 +13,7 @@ import { getWorkspaceDir, getItemEventsPath } from '../lib/paths';
 import { ptyManager } from '../lib/pty-manager';
 import { eventBus } from './event-bus';
 import { appendJsonl } from '../lib/jsonl';
-import { createReviewFindingsExtractedEvent } from '../lib/events';
+import { createReviewFindingsExtractedEvent, createStatusChangedEvent } from '../lib/events';
 
 const WORKER_PROMPT_TEMPLATE = `You are a {{role}} development agent working on implementing specific tasks from a development plan.
 
@@ -78,6 +78,7 @@ const ROLE_DESCRIPTIONS: Record<AgentRole, string> = {
   front: 'Frontend development - UI components, styling, client-side logic, React/Vue/Angular components, CSS, state management',
   back: 'Backend development - APIs, database operations, server-side logic, authentication, data processing',
   review: 'Code review, testing, documentation, integration - ensuring code quality, writing tests, creating documentation, integrating components',
+  'review-receiver': 'Receiving and processing PR review comments',
 };
 
 const REVIEW_PROMPT_TEMPLATE = `You are a code review agent. Your task is to review the code changes made by the development agents and provide actionable feedback.
@@ -245,8 +246,8 @@ export async function startWorkers(itemId: string): Promise<void> {
         // File doesn't exist, which is fine
       }
 
-      // 2b. Start review agent
-      await startWorkerAgentWithSnapshot(
+      // 2b. Start review agent (capture reference to avoid find() picking old agents)
+      const currentReviewAgent = await startWorkerAgentWithSnapshot(
         itemId, 'review', reviewTasks, plan, reviewAgentWorkdir, workspaceDir
       );
       await waitForAgentsToComplete(itemId, ['review']);
@@ -254,32 +255,23 @@ export async function startWorkers(itemId: string): Promise<void> {
       // 2c. Extract and analyze findings
       const findings = await extractReviewFindings(itemId);
 
-      // 2c-2. Publish review findings event
+      // 2c-2. Publish review findings event (use currentReviewAgent, not agents.find())
       if (findings) {
-        const agents = await getAgentsByItem(itemId);
-        const reviewAgent = agents.find(a => a.role === 'review');
-        if (reviewAgent) {
-          const event = createReviewFindingsExtractedEvent(
-            itemId,
-            reviewAgent.id,
-            findings.findings,
-            findings.overallAssessment,
-            findings.summary
-          );
-          // Log to JSONL
-          await appendJsonl(getItemEventsPath(itemId), event);
-          // Broadcast via EventBus
-          eventBus.publish(itemId, event);
-        }
+        const event = createReviewFindingsExtractedEvent(
+          itemId,
+          currentReviewAgent.id,
+          findings.findings,
+          findings.overallAssessment,
+          findings.summary
+        );
+        // Log to JSONL
+        await appendJsonl(getItemEventsPath(itemId), event);
+        // Broadcast via EventBus
+        eventBus.publish(itemId, event);
       }
 
-      // 2d. Exit review agent and wait for completion
-      const agents = await getAgentsByItem(itemId);
-      const reviewAgent = agents.find(a => a.role === 'review');
-      if (reviewAgent) {
-        await signalAgentToExit(reviewAgent.id);
-        await waitForAgentsToComplete(itemId, ['review']);
-      }
+      // 2d. Exit current review agent
+      await stopAgent(currentReviewAgent.id);
 
       // 2e. Check if review passed
       if (!findings || findings.overallAssessment === 'pass') {
@@ -304,13 +296,27 @@ export async function startWorkers(itemId: string): Promise<void> {
         findingsByTarget.set(target, existing);
       }
 
-      // 2g. Send feedback to dev agents
+      // 2g. Send feedback to dev agents and reset their status to 'running'
+      // so that waitForAgentsToComplete properly waits for the next TASKS_COMPLETED
       const activeDevRoles: AgentRole[] = [];
       for (const [targetRole, roleFindings] of findingsByTarget.entries()) {
         const devAgent = await getRunningAgentByRole(itemId, targetRole);
         if (devAgent) {
           const feedbackPrompt = buildFeedbackPrompt(roleFindings);
           await sendCommandToAgent(devAgent.id, feedbackPrompt);
+
+          // Reset agent status from waiting_orchestrator to running
+          const previousStatus = devAgent.status;
+          devAgent.status = 'running';
+          const statusEvent = createStatusChangedEvent(
+            itemId,
+            previousStatus,
+            'running',
+            devAgent.id
+          );
+          await appendJsonl(getItemEventsPath(itemId), statusEvent);
+          eventBus.emit('event', { itemId, event: statusEvent });
+
           activeDevRoles.push(targetRole);
           console.log(`[${itemId}] Sent ${roleFindings.length} findings to ${targetRole} agent`);
         } else {
@@ -325,8 +331,8 @@ export async function startWorkers(itemId: string): Promise<void> {
     }
   }
 
-  // Phase 3: Signal all agents to exit and create Draft PR
-  await signalAllAgentsToExit(itemId);
+  // Phase 3: Kill all remaining agents and create Draft PR
+  await killAllRemainingAgents(itemId);
   await createDraftPr(itemId);
 }
 
@@ -509,6 +515,18 @@ async function sendCommandToAgent(agentId: string, command: string): Promise<boo
 // Helper: Signal agent to exit
 async function signalAgentToExit(agentId: string): Promise<boolean> {
   return sendInput(agentId, '/exit');
+}
+
+// Helper: Kill all remaining agents (for Phase 3 cleanup before PR creation)
+// Uses stopAgent (SIGKILL) to ensure agents are terminated before git operations
+async function killAllRemainingAgents(itemId: string): Promise<void> {
+  const agents = await getAgentsByItem(itemId);
+
+  for (const agent of agents) {
+    if (agent.status === 'running' || agent.status === 'waiting_orchestrator') {
+      await stopAgent(agent.id);
+    }
+  }
 }
 
 // Helper: Signal all agents to exit

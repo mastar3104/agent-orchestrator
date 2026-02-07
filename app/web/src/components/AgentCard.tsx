@@ -34,6 +34,7 @@ const ROLE_LABELS: Record<AgentRole, string> = {
   front: 'Frontend',
   back: 'Backend',
   review: 'Review',
+  'review-receiver': 'Review Receiver',
 };
 
 const ROLE_COLORS: Record<AgentRole, string> = {
@@ -41,6 +42,7 @@ const ROLE_COLORS: Record<AgentRole, string> = {
   front: 'text-blue-400',
   back: 'text-green-400',
   review: 'text-yellow-400',
+  'review-receiver': 'text-cyan-400',
 };
 
 export function AgentCard({ agent, onStop, onSelect, isSelected }: AgentCardProps) {
