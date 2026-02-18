@@ -198,7 +198,7 @@ export async function createDraftPrForRepo(
   }
 
   // Draft PR作成
-  const prTitle = `[Draft] ${itemName} - ${repo.name}`;
+  const prTitle = `[Draft] ${itemName}`;
   const prBody = `## Summary
 
 Automated implementation by agent-orch.
