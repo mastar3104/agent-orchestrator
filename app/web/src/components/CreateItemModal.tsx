@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import type { CreateItemRequest } from '@agent-orch/shared';
+import type { CreateItemRequest, CreateItemRepositoryInput } from '@agent-orch/shared';
 import { useRepositoryList } from '../hooks/useRepositories';
 import { RepositorySelector } from './RepositorySelector';
 
@@ -13,21 +13,48 @@ type RepoType = 'remote' | 'local';
 type LinkMode = 'symlink' | 'copy';
 type RepoSource = 'saved' | 'manual';
 
+interface RepoEntry {
+  key: number;
+  name: string;
+  role: string;
+  repoSource: RepoSource;
+  selectedRepoId?: string;
+  repoType: RepoType;
+  repoUrl: string;
+  localPath: string;
+  linkMode: LinkMode;
+  branch: string;
+  workBranch: string;
+  submodules: boolean;
+  saveRepository: boolean;
+  repositoryName: string;
+}
+
+let nextKey = 0;
+function createEmptyRepoEntry(): RepoEntry {
+  return {
+    key: nextKey++,
+    name: '',
+    role: '',
+    repoSource: 'saved',
+    selectedRepoId: undefined,
+    repoType: 'remote',
+    repoUrl: '',
+    localPath: '',
+    linkMode: 'symlink',
+    branch: '',
+    workBranch: '',
+    submodules: false,
+    saveRepository: false,
+    repositoryName: '',
+  };
+}
+
 export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalProps) {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
-  const [repoSource, setRepoSource] = useState<RepoSource>('saved');
-  const [selectedRepoId, setSelectedRepoId] = useState<string | undefined>();
-  const [repoType, setRepoType] = useState<RepoType>('remote');
-  const [repoUrl, setRepoUrl] = useState('');
-  const [localPath, setLocalPath] = useState('');
-  const [linkMode, setLinkMode] = useState<LinkMode>('symlink');
-  const [branch, setBranch] = useState('');
-  const [workBranch, setWorkBranch] = useState('');
-  const [submodules, setSubmodules] = useState(false);
+  const [repos, setRepos] = useState<RepoEntry[]>([createEmptyRepoEntry()]);
   const [designDoc, setDesignDoc] = useState('');
-  const [saveRepository, setSaveRepository] = useState(false);
-  const [repositoryName, setRepositoryName] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -43,11 +70,27 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
   // Auto-select manual if no saved repositories
   useEffect(() => {
     if (!reposLoading && repositories.length === 0) {
-      setRepoSource('manual');
+      setRepos((prev) =>
+        prev.map((r) => (r.repoSource === 'saved' ? { ...r, repoSource: 'manual' } : r))
+      );
     }
   }, [reposLoading, repositories.length]);
 
   if (!isOpen) return null;
+
+  const updateRepo = (key: number, updates: Partial<RepoEntry>) => {
+    setRepos((prev) =>
+      prev.map((r) => (r.key === key ? { ...r, ...updates } : r))
+    );
+  };
+
+  const addRepo = () => {
+    setRepos((prev) => [...prev, createEmptyRepoEntry()]);
+  };
+
+  const removeRepo = (key: number) => {
+    setRepos((prev) => prev.filter((r) => r.key !== key));
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -55,45 +98,48 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
     setError(null);
 
     try {
-      const requestData: CreateItemRequest = {
+      const repoInputs: CreateItemRepositoryInput[] = repos.map((repo) => {
+        const input: CreateItemRepositoryInput = {
+          name: repo.name,
+          role: repo.role,
+        };
+
+        if (repo.repoSource === 'saved' && repo.selectedRepoId) {
+          input.repositoryId = repo.selectedRepoId;
+          if (repo.branch) input.branch = repo.branch;
+          if (repo.workBranch) input.workBranch = repo.workBranch;
+        } else {
+          input.repository =
+            repo.repoType === 'remote'
+              ? {
+                  type: 'remote',
+                  url: repo.repoUrl,
+                  branch: repo.branch || undefined,
+                  workBranch: repo.workBranch || undefined,
+                  submodules: repo.submodules,
+                }
+              : {
+                  type: 'local',
+                  localPath: repo.localPath,
+                  linkMode: repo.linkMode,
+                };
+
+          if (repo.saveRepository && repo.repositoryName) {
+            input.saveRepository = true;
+            input.repositoryName = repo.repositoryName;
+          }
+        }
+
+        return input;
+      });
+
+      await onCreate({
         name,
         description,
+        repositories: repoInputs,
         designDoc: designDoc || undefined,
-      };
-
-      if (repoSource === 'saved' && selectedRepoId) {
-        requestData.repositoryId = selectedRepoId;
-        if (branch) {
-          requestData.branch = branch;
-        }
-        if (workBranch) {
-          requestData.workBranch = workBranch;
-        }
-      } else {
-        // Manual entry
-        requestData.repository = repoType === 'remote'
-          ? {
-              type: 'remote',
-              url: repoUrl,
-              branch: branch || undefined,
-              workBranch: workBranch || undefined,
-              submodules,
-            }
-          : {
-              type: 'local',
-              localPath,
-              linkMode,
-            };
-
-        if (saveRepository && repositoryName) {
-          requestData.saveRepository = true;
-          requestData.repositoryName = repositoryName;
-        }
-      }
-
-      await onCreate(requestData);
+      });
       onClose();
-      // Reset form
       resetForm();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create item');
@@ -105,36 +151,29 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
   const resetForm = () => {
     setName('');
     setDescription('');
-    setRepoSource('saved');
-    setSelectedRepoId(undefined);
-    setRepoType('remote');
-    setRepoUrl('');
-    setLocalPath('');
-    setLinkMode('symlink');
-    setBranch('');
-    setWorkBranch('');
-    setSubmodules(false);
+    setRepos([createEmptyRepoEntry()]);
     setDesignDoc('');
-    setSaveRepository(false);
-    setRepositoryName('');
+  };
+
+  const isRepoValid = (repo: RepoEntry) => {
+    if (!repo.name || !repo.role) return false;
+    if (repo.repoSource === 'saved') {
+      return !!repo.selectedRepoId;
+    } else {
+      if (repo.repoType === 'remote') return !!repo.repoUrl;
+      return !!repo.localPath;
+    }
   };
 
   const isFormValid = () => {
     if (!name || !description) return false;
-    if (repoSource === 'saved') {
-      return !!selectedRepoId;
-    } else {
-      if (repoType === 'remote') {
-        return !!repoUrl;
-      } else {
-        return !!localPath;
-      }
-    }
+    if (repos.length === 0) return false;
+    return repos.every(isRepoValid);
   };
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-gray-800 rounded-lg p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto">
+      <div className="bg-gray-800 rounded-lg p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto">
         <h2 className="text-xl font-bold text-white mb-4">Create New Item</h2>
 
         {error && (
@@ -172,258 +211,296 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
             />
           </div>
 
-          {/* Repository Source Selection */}
+          {/* Repositories */}
           <div>
-            <label className="block text-sm font-medium text-gray-300 mb-2">
-              Repository Source *
-            </label>
-            <div className="flex gap-4 mb-3">
-              <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-                <input
-                  type="radio"
-                  name="repoSource"
-                  value="saved"
-                  checked={repoSource === 'saved'}
-                  onChange={() => setRepoSource('saved')}
-                  className="text-blue-500"
-                  disabled={repositories.length === 0 && !reposLoading}
-                />
-                Select from saved
+            <div className="flex items-center justify-between mb-2">
+              <label className="block text-sm font-medium text-gray-300">
+                Repositories *
               </label>
-              <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-                <input
-                  type="radio"
-                  name="repoSource"
-                  value="manual"
-                  checked={repoSource === 'manual'}
-                  onChange={() => setRepoSource('manual')}
-                  className="text-blue-500"
-                />
-                Enter manually
-              </label>
+              <button
+                type="button"
+                onClick={addRepo}
+                className="px-2 py-1 text-xs bg-gray-700 text-gray-300 rounded hover:bg-gray-600"
+              >
+                + Add Repository
+              </button>
             </div>
 
-            {repoSource === 'saved' ? (
-              <>
-                <RepositorySelector
-                  repositories={repositories}
-                  selectedId={selectedRepoId}
-                  onSelect={setSelectedRepoId}
-                  loading={reposLoading}
-                />
-                {selectedRepoId && (
-                  <div className="mt-3 grid grid-cols-2 gap-4">
+            <div className="space-y-4">
+              {repos.map((repo, index) => (
+                <div
+                  key={repo.key}
+                  className="bg-gray-750 border border-gray-600 rounded-lg p-4 space-y-3"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-gray-300">
+                      Repository {index + 1}
+                    </span>
+                    {repos.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => removeRepo(repo.key)}
+                        className="text-xs text-red-400 hover:text-red-300"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Name and Role */}
+                  <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <label className="block text-sm font-medium text-gray-300 mb-1">
-                        Clone Branch (optional)
+                      <label className="block text-xs font-medium text-gray-400 mb-1">
+                        Directory Name *
                       </label>
                       <input
                         type="text"
-                        value={branch}
-                        onChange={(e) => setBranch(e.target.value)}
-                        className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
-                        placeholder={repositories.find(r => r.id === selectedRepoId)?.branch || 'main'}
+                        value={repo.name}
+                        onChange={(e) => updateRepo(repo.key, { name: e.target.value })}
+                        className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                        placeholder="frontend"
                       />
-                      <p className="text-xs text-gray-500 mt-1">
-                        Override saved branch
-                      </p>
                     </div>
                     <div>
-                      <label className="block text-sm font-medium text-gray-300 mb-1">
-                        Work Branch (optional)
+                      <label className="block text-xs font-medium text-gray-400 mb-1">
+                        Role *
                       </label>
                       <input
                         type="text"
-                        value={workBranch}
-                        onChange={(e) => setWorkBranch(e.target.value)}
-                        className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
-                        placeholder="feature/my-feature"
+                        value={repo.role}
+                        onChange={(e) => updateRepo(repo.key, { role: e.target.value })}
+                        className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                        placeholder="front"
                       />
-                      <p className="text-xs text-gray-500 mt-1">
-                        Branch for agent work (auto-created)
+                      <p className="text-xs text-gray-500 mt-0.5">
+                        Dev agent role (e.g. front, back, docs)
                       </p>
                     </div>
                   </div>
-                )}
-              </>
-            ) : (
-              <>
-                {/* Repository Type */}
-                <div className="mb-3">
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Repository Type *
-                  </label>
+
+                  {/* Repository Source Selection */}
                   <div className="flex gap-4">
-                    <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                    <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
                       <input
                         type="radio"
-                        name="repoType"
-                        value="remote"
-                        checked={repoType === 'remote'}
-                        onChange={() => setRepoType('remote')}
+                        name={`repoSource-${repo.key}`}
+                        value="saved"
+                        checked={repo.repoSource === 'saved'}
+                        onChange={() => updateRepo(repo.key, { repoSource: 'saved' })}
                         className="text-blue-500"
+                        disabled={repositories.length === 0 && !reposLoading}
                       />
-                      Remote (Clone from URL)
+                      Saved
                     </label>
-                    <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                    <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
                       <input
                         type="radio"
-                        name="repoType"
-                        value="local"
-                        checked={repoType === 'local'}
-                        onChange={() => setRepoType('local')}
+                        name={`repoSource-${repo.key}`}
+                        value="manual"
+                        checked={repo.repoSource === 'manual'}
+                        onChange={() => updateRepo(repo.key, { repoSource: 'manual' })}
                         className="text-blue-500"
                       />
-                      Local (Existing repository)
+                      Manual
                     </label>
                   </div>
-                </div>
 
-                {repoType === 'remote' ? (
-                  <>
-                    <div>
-                      <label className="block text-sm font-medium text-gray-300 mb-1">
-                        Repository URL *
-                      </label>
-                      <input
-                        type="text"
-                        value={repoUrl}
-                        onChange={(e) => setRepoUrl(e.target.value)}
-                        required={repoSource === 'manual' && repoType === 'remote'}
-                        className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
-                        placeholder="https://github.com/user/repo.git or git@github.com:user/repo.git"
+                  {repo.repoSource === 'saved' ? (
+                    <>
+                      <RepositorySelector
+                        repositories={repositories}
+                        selectedId={repo.selectedRepoId}
+                        onSelect={(id) => {
+                          const updates: Partial<RepoEntry> = { selectedRepoId: id };
+                          if (id) {
+                            const selectedRepo = repositories.find(r => r.id === id);
+                            if (selectedRepo) {
+                              if (selectedRepo.directoryName) {
+                                updates.name = selectedRepo.directoryName;
+                              }
+                              if (selectedRepo.role) {
+                                updates.role = selectedRepo.role;
+                              }
+                            }
+                          }
+                          updateRepo(repo.key, updates);
+                        }}
+                        loading={reposLoading}
                       />
-                      <p className="text-xs text-gray-500 mt-1">
-                        Supports HTTPS and SSH formats
-                      </p>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-sm font-medium text-gray-300 mb-1">
-                          Clone Branch
-                        </label>
-                        <input
-                          type="text"
-                          value={branch}
-                          onChange={(e) => setBranch(e.target.value)}
-                          className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
-                          placeholder="main"
-                        />
-                        <p className="text-xs text-gray-500 mt-1">
-                          Branch to clone from
-                        </p>
-                      </div>
-                      <div>
-                        <label className="block text-sm font-medium text-gray-300 mb-1">
-                          Work Branch
-                        </label>
-                        <input
-                          type="text"
-                          value={workBranch}
-                          onChange={(e) => setWorkBranch(e.target.value)}
-                          className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
-                          placeholder="feature/my-feature"
-                        />
-                        <p className="text-xs text-gray-500 mt-1">
-                          Branch for agent work (auto-created)
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center">
-                      <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={submodules}
-                          onChange={(e) => setSubmodules(e.target.checked)}
-                          className="rounded bg-gray-700 border-gray-600"
-                        />
-                        Include submodules
-                      </label>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <div>
-                      <label className="block text-sm font-medium text-gray-300 mb-1">
-                        Local Path *
-                      </label>
-                      <input
-                        type="text"
-                        value={localPath}
-                        onChange={(e) => setLocalPath(e.target.value)}
-                        required={repoSource === 'manual' && repoType === 'local'}
-                        className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500 font-mono text-sm"
-                        placeholder="/path/to/existing/repo"
-                      />
-                      <p className="text-xs text-gray-500 mt-1">
-                        Absolute path to an existing local repository
-                      </p>
-                    </div>
-
-                    <div>
-                      <label className="block text-sm font-medium text-gray-300 mb-2">
-                        Link Mode
-                      </label>
+                      {repo.selectedRepoId && (
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-xs font-medium text-gray-400 mb-1">
+                              Clone Branch
+                            </label>
+                            <input
+                              type="text"
+                              value={repo.branch}
+                              onChange={(e) => updateRepo(repo.key, { branch: e.target.value })}
+                              className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                              placeholder={repositories.find(r => r.id === repo.selectedRepoId)?.branch || 'main'}
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-xs font-medium text-gray-400 mb-1">
+                              Work Branch
+                            </label>
+                            <input
+                              type="text"
+                              value={repo.workBranch}
+                              onChange={(e) => updateRepo(repo.key, { workBranch: e.target.value })}
+                              className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                              placeholder="auto-generated"
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      {/* Repo Type */}
                       <div className="flex gap-4">
-                        <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                        <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
                           <input
                             type="radio"
-                            name="linkMode"
-                            value="symlink"
-                            checked={linkMode === 'symlink'}
-                            onChange={() => setLinkMode('symlink')}
+                            name={`repoType-${repo.key}`}
+                            value="remote"
+                            checked={repo.repoType === 'remote'}
+                            onChange={() => updateRepo(repo.key, { repoType: 'remote' })}
                             className="text-blue-500"
                           />
-                          Symlink
+                          Remote (Clone)
                         </label>
-                        <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                        <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
                           <input
                             type="radio"
-                            name="linkMode"
-                            value="copy"
-                            checked={linkMode === 'copy'}
-                            onChange={() => setLinkMode('copy')}
+                            name={`repoType-${repo.key}`}
+                            value="local"
+                            checked={repo.repoType === 'local'}
+                            onChange={() => updateRepo(repo.key, { repoType: 'local' })}
                             className="text-blue-500"
                           />
-                          Copy
+                          Local
                         </label>
                       </div>
-                      <p className="text-xs text-gray-500 mt-1">
-                        {linkMode === 'symlink'
-                          ? 'Changes will be reflected in the original repository'
-                          : 'Creates an independent copy of the repository'}
-                      </p>
-                    </div>
-                  </>
-                )}
 
-                {/* Save Repository Option */}
-                <div className="mt-3 p-3 bg-gray-700/50 rounded">
-                  <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={saveRepository}
-                      onChange={(e) => setSaveRepository(e.target.checked)}
-                      className="rounded bg-gray-700 border-gray-600"
-                    />
-                    Save this repository for reuse
-                  </label>
-                  {saveRepository && (
-                    <div className="mt-2">
-                      <input
-                        type="text"
-                        value={repositoryName}
-                        onChange={(e) => setRepositoryName(e.target.value)}
-                        placeholder="Repository display name"
-                        className="w-full bg-gray-600 border border-gray-500 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500 text-sm"
-                      />
-                    </div>
+                      {repo.repoType === 'remote' ? (
+                        <>
+                          <div>
+                            <label className="block text-xs font-medium text-gray-400 mb-1">
+                              Repository URL *
+                            </label>
+                            <input
+                              type="text"
+                              value={repo.repoUrl}
+                              onChange={(e) => updateRepo(repo.key, { repoUrl: e.target.value })}
+                              className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                              placeholder="https://github.com/user/repo.git"
+                            />
+                          </div>
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <label className="block text-xs font-medium text-gray-400 mb-1">
+                                Clone Branch
+                              </label>
+                              <input
+                                type="text"
+                                value={repo.branch}
+                                onChange={(e) => updateRepo(repo.key, { branch: e.target.value })}
+                                className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                                placeholder="main"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium text-gray-400 mb-1">
+                                Work Branch
+                              </label>
+                              <input
+                                type="text"
+                                value={repo.workBranch}
+                                onChange={(e) => updateRepo(repo.key, { workBranch: e.target.value })}
+                                className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                                placeholder="auto-generated"
+                              />
+                            </div>
+                          </div>
+                          <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={repo.submodules}
+                              onChange={(e) => updateRepo(repo.key, { submodules: e.target.checked })}
+                              className="rounded bg-gray-700 border-gray-600"
+                            />
+                            Include submodules
+                          </label>
+                        </>
+                      ) : (
+                        <>
+                          <div>
+                            <label className="block text-xs font-medium text-gray-400 mb-1">
+                              Local Path *
+                            </label>
+                            <input
+                              type="text"
+                              value={repo.localPath}
+                              onChange={(e) => updateRepo(repo.key, { localPath: e.target.value })}
+                              className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white font-mono text-xs focus:outline-none focus:border-blue-500"
+                              placeholder="/path/to/existing/repo"
+                            />
+                          </div>
+                          <div className="flex gap-4">
+                            <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+                              <input
+                                type="radio"
+                                name={`linkMode-${repo.key}`}
+                                value="symlink"
+                                checked={repo.linkMode === 'symlink'}
+                                onChange={() => updateRepo(repo.key, { linkMode: 'symlink' })}
+                                className="text-blue-500"
+                              />
+                              Symlink
+                            </label>
+                            <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+                              <input
+                                type="radio"
+                                name={`linkMode-${repo.key}`}
+                                value="copy"
+                                checked={repo.linkMode === 'copy'}
+                                onChange={() => updateRepo(repo.key, { linkMode: 'copy' })}
+                                className="text-blue-500"
+                              />
+                              Copy
+                            </label>
+                          </div>
+                        </>
+                      )}
+
+                      {/* Save Repository Option */}
+                      <div className="p-2 bg-gray-700/50 rounded">
+                        <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={repo.saveRepository}
+                            onChange={(e) => updateRepo(repo.key, { saveRepository: e.target.checked })}
+                            className="rounded bg-gray-700 border-gray-600"
+                          />
+                          Save for reuse
+                        </label>
+                        {repo.saveRepository && (
+                          <input
+                            type="text"
+                            value={repo.repositoryName}
+                            onChange={(e) => updateRepo(repo.key, { repositoryName: e.target.value })}
+                            placeholder="Repository display name"
+                            className="mt-2 w-full bg-gray-600 border border-gray-500 rounded px-3 py-1.5 text-white text-xs focus:outline-none focus:border-blue-500"
+                          />
+                        )}
+                      </div>
+                    </>
                   )}
                 </div>
-              </>
-            )}
+              ))}
+            </div>
           </div>
 
           <div>

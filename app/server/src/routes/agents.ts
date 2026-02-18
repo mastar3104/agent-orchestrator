@@ -7,6 +7,7 @@ import type {
   AgentInfo,
   AgentRole,
 } from '@agent-orch/shared';
+import { isSystemRole } from '@agent-orch/shared';
 import {
   startAgent,
   stopAgent,
@@ -18,7 +19,7 @@ import {
 } from '../services/agent-service';
 import { startPlanner, getPlan, getPlanContent, updatePlanContent } from '../services/planner-service';
 import { startWorkers, startWorkerForRole, getWorkerStatus } from '../services/worker-service';
-import { getWorkspaceDir } from '../lib/paths';
+import { getWorkspaceRoot } from '../lib/paths';
 
 export const agentRoutes: FastifyPluginAsync = async (fastify) => {
   // Start planner for an item
@@ -172,8 +173,8 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
     try {
       const { role, prompt } = request.body;
 
-      // If role is a worker role, start via worker service
-      if (['front', 'back', 'review'].includes(role)) {
+      // If role is a dev role or review, start via worker service
+      if (!isSystemRole(role) || role === 'review') {
         await startWorkerForRole(request.params.id, role as AgentRole);
         const agents = await getAgentsByItem(request.params.id);
         const agent = agents.find((a) => a.role === role);
@@ -190,7 +191,7 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
         itemId: request.params.id,
         role,
         prompt: prompt || 'Start working on the assigned tasks.',
-        workingDir: getWorkspaceDir(request.params.id),
+        workingDir: getWorkspaceRoot(request.params.id),
       });
 
       return reply.status(201).send({

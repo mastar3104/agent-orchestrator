@@ -1,17 +1,26 @@
 import { spawn } from 'child_process';
+import { existsSync } from 'fs';
 import { unlink } from 'fs/promises';
 import { join } from 'path';
+import type { ItemConfig, ItemRepositoryConfig } from '@agent-orch/shared';
 import { getItemConfig } from './item-service';
-import { getWorkspaceDir, getItemEventsPath } from '../lib/paths';
 import { appendJsonl } from '../lib/jsonl';
-import { createPrCreatedEvent, createErrorEvent } from '../lib/events';
+import {
+  getItemEventsPath,
+  getRepoWorkspaceDir,
+} from '../lib/paths';
+import {
+  createPrCreatedEvent,
+  createRepoNoChangesEvent,
+  createErrorEvent,
+} from '../lib/events';
 import { eventBus } from './event-bus';
 
 // 禁止ブランチリスト（よく使われる保護ブランチ）
 const PROTECTED_BRANCHES = ['main', 'master'];
 
 // 一時ファイルリスト（ワークフロー終了時に削除）
-const TEMP_FILES = ['review_findings.json', 'plan.yaml'];
+const TEMP_FILES = ['review_findings.json'];
 
 // ヘルパー: コマンド実行
 async function execGit(args: string[], cwd: string): Promise<string> {
@@ -44,7 +53,7 @@ async function execGh(args: string[], cwd: string): Promise<string> {
   });
 }
 
-// ghユーザー名を取得（workspaceDirで実行して認証コンテキストを一致させる）
+// ghユーザー名を取得
 async function getGhUsername(cwd: string): Promise<string> {
   const result = await execGh(['api', 'user', '-q', '.login'], cwd);
   return result;
@@ -77,7 +86,6 @@ async function safeLogErrorEvent(
     eventBus.emit('event', { itemId, event: errorEvent });
   } catch (logError) {
     console.error(`[${itemId}] Failed to log error event:`, logError);
-    // イベント記録失敗は握り潰す
   }
 }
 
@@ -88,7 +96,6 @@ async function getCurrentBranch(cwd: string): Promise<string> {
 
 // デフォルトブランチを取得（複数の方法を試行）
 async function getDefaultBranch(cwd: string): Promise<string | null> {
-  // 1. origin/HEAD から取得を試みる
   try {
     const result = await execGit(
       ['symbolic-ref', 'refs/remotes/origin/HEAD', '--short'],
@@ -99,7 +106,6 @@ async function getDefaultBranch(cwd: string): Promise<string | null> {
     // origin/HEAD が未設定
   }
 
-  // 2. gh api でリポジトリのデフォルトブランチを取得
   try {
     const result = await execGh(
       ['repo', 'view', '--json', 'defaultBranchRef', '-q', '.defaultBranchRef.name'],
@@ -110,84 +116,95 @@ async function getDefaultBranch(cwd: string): Promise<string | null> {
     // gh コマンド失敗
   }
 
-  // 3. 取得できない場合はnullを返す（呼び出し側で判断）
   return null;
 }
 
-export async function createDraftPr(itemId: string): Promise<{ prUrl: string; prNumber: number }> {
-  const config = await getItemConfig(itemId);
-  if (!config) {
-    throw new Error(`Item ${itemId} not found`);
-  }
-
-  const workspaceDir = getWorkspaceDir(itemId);
+/**
+ * 単一リポジトリのDraft PRを作成する
+ */
+export async function createDraftPrForRepo(
+  itemId: string,
+  repo: ItemRepositoryConfig,
+  itemName: string
+): Promise<{ prUrl: string; prNumber: number } | null> {
+  const repoDir = getRepoWorkspaceDir(itemId, repo.name);
   const eventsPath = getItemEventsPath(itemId);
 
-  const currentBranch = await getCurrentBranch(workspaceDir);
-  const defaultBranch = await getDefaultBranch(workspaceDir);
+  const currentBranch = await getCurrentBranch(repoDir);
+  const defaultBranch = await getDefaultBranch(repoDir);
 
   // 安全チェック: 保護ブランチへのpushを禁止
   if (PROTECTED_BRANCHES.includes(currentBranch)) {
-    const error = `Cannot push to protected branch: ${currentBranch}`;
+    const error = `Cannot push to protected branch: ${currentBranch} (repo: ${repo.name})`;
     await appendJsonl(eventsPath, createErrorEvent(itemId, error));
     throw new Error(error);
   }
 
-  // デフォルトブランチが取得できた場合、それもチェック
   if (defaultBranch && currentBranch === defaultBranch) {
-    const error = `Cannot push to default branch: ${currentBranch}`;
+    const error = `Cannot push to default branch: ${currentBranch} (repo: ${repo.name})`;
     await appendJsonl(eventsPath, createErrorEvent(itemId, error));
     throw new Error(error);
   }
 
-  // 1. 一時ファイル削除
+  // 一時ファイル削除
   for (const file of TEMP_FILES) {
     try {
-      await unlink(join(workspaceDir, file));
+      await unlink(join(repoDir, file));
     } catch {
       // ファイルが存在しない場合は無視
     }
   }
 
-  // 2. dirty check（コミットはしないが、未コミット変更があれば警告ログ出力）
-  //    NOTE: 警告のみで続行する設計。PRとローカルに差分が生じる可能性があるが、
-  //    エージェントが適切にコミットしていれば問題ない。
-  //    未コミット変更がある場合は、エージェントのコミット漏れか一時ファイルの削除漏れ。
-  const status = await execGit(['status', '--porcelain'], workspaceDir);
+  // dirty check
+  const status = await execGit(['status', '--porcelain'], repoDir);
   if (status) {
-    console.warn('Warning: Uncommitted changes detected (will not be included in PR):');
-    console.warn(status);
-    // 警告のみ、処理は続行（PRには含まれない）
+    console.warn(`[${itemId}/${repo.name}] Warning: Uncommitted changes detected`);
   }
 
-  // 3. コミットハッシュ取得
-  const commitHash = await execGit(['rev-parse', 'HEAD'], workspaceDir);
-
-  // 4. git push - エラーハンドリング追加
+  // 変更がないかチェック（コミット差分）
   try {
-    await execGit(['push', '-u', 'origin', currentBranch], workspaceDir);
+    const baseBranch = repo.branch || 'main';
+    const ahead = await execGit(['rev-list', '--count', `origin/${baseBranch}..HEAD`], repoDir);
+    if (parseInt(ahead, 10) === 0 && !status) {
+      // 変更なし - repo_no_changes イベント発行
+      const noChangesEvent = createRepoNoChangesEvent(itemId, repo.name);
+      await appendJsonl(eventsPath, noChangesEvent);
+      eventBus.emit('event', { itemId, event: noChangesEvent });
+      console.log(`[${itemId}/${repo.name}] No changes detected, skipping PR creation`);
+      return null;
+    }
+  } catch {
+    // rev-list 失敗はスキップ（ブランチ比較不可の場合は続行）
+  }
+
+  // コミットハッシュ取得
+  const commitHash = await execGit(['rev-parse', 'HEAD'], repoDir);
+
+  // git push
+  try {
+    await execGit(['push', '-u', 'origin', currentBranch], repoDir);
   } catch (error) {
-    await safeLogErrorEvent(eventsPath, itemId, `Git push failed: ${getErrorMessage(error)}`);
+    await safeLogErrorEvent(eventsPath, itemId, `Git push failed for ${repo.name}: ${getErrorMessage(error)}`);
     throw error;
   }
 
-  // 5. ghユーザー名取得 - エラーハンドリング追加
+  // ghユーザー名取得
   let ghUsername: string;
   try {
-    ghUsername = await getGhUsername(workspaceDir);
+    ghUsername = await getGhUsername(repoDir);
   } catch (error) {
-    await safeLogErrorEvent(eventsPath, itemId, `Failed to get GitHub username: ${getErrorMessage(error)}`);
+    await safeLogErrorEvent(eventsPath, itemId, `Failed to get GitHub username for ${repo.name}: ${getErrorMessage(error)}`);
     throw error;
   }
 
-  // 6. Draft PR作成 - エラーハンドリング追加
-  const prTitle = `[Draft] ${config.name}`;
+  // Draft PR作成
+  const prTitle = `[Draft] ${itemName} - ${repo.name}`;
   const prBody = `## Summary
 
 Automated implementation by agent-orch.
 
 **Item:** ${itemId}
-**Description:** ${config.description}
+**Repository:** ${repo.name} (${repo.role})
 
 ---
 
@@ -196,37 +213,73 @@ Automated implementation by agent-orch.
 ---
 *This PR was automatically created by agent-orch*`;
 
+  const baseBranch = repo.branch || 'main';
   let prInfo: { number: number; url: string };
   try {
-    // PR作成
-    const baseBranch = config.repository.branch || 'main';
     await execGh(
       ['pr', 'create', '--draft', '--base', baseBranch, '--title', prTitle, '--body', prBody],
-      workspaceDir
+      repoDir
     );
 
-    // 作成したPRの情報を取得（gh pr view はカレントブランチのPR情報を取得）
     const prJsonOutput = await execGh(
       ['pr', 'view', '--json', 'number,url'],
-      workspaceDir
+      repoDir
     );
     prInfo = JSON.parse(prJsonOutput);
   } catch (error) {
-    await safeLogErrorEvent(eventsPath, itemId, `PR creation failed: ${getErrorMessage(error)}`);
+    await safeLogErrorEvent(eventsPath, itemId, `PR creation failed for ${repo.name}: ${getErrorMessage(error)}`);
     throw error;
   }
 
-  // 7. イベント記録（失敗してもログのみ）
+  // イベント記録
   try {
-    const event = createPrCreatedEvent(itemId, prInfo.url, prInfo.number, currentBranch, commitHash);
+    const event = createPrCreatedEvent(
+      itemId,
+      repo.name,
+      prInfo.url,
+      prInfo.number,
+      currentBranch,
+      commitHash
+    );
     await appendJsonl(eventsPath, event);
     eventBus.emit('event', { itemId, event });
   } catch (logError) {
-    console.error(`[${itemId}] Failed to log pr_created event:`, logError);
+    console.error(`[${itemId}] Failed to log pr_created event for ${repo.name}:`, logError);
   }
 
-  console.log(`Draft PR created: ${prInfo.url}`);
+  console.log(`[${itemId}/${repo.name}] Draft PR created: ${prInfo.url}`);
 
-  // 8. PR情報を返す（イベント記録の成功に依存しない）
   return { prUrl: prInfo.url, prNumber: prInfo.number };
 }
+
+/**
+ * 全リポジトリのDraft PRを作成する
+ */
+export async function createDraftPrsForAllRepos(
+  itemId: string
+): Promise<{ results: Array<{ repoName: string; prUrl?: string; prNumber?: number; noChanges: boolean }> }> {
+  const config = await getItemConfig(itemId);
+  if (!config) {
+    throw new Error(`Item ${itemId} not found`);
+  }
+
+  const results: Array<{ repoName: string; prUrl?: string; prNumber?: number; noChanges: boolean }> = [];
+
+  for (const repo of config.repositories) {
+    try {
+      const result = await createDraftPrForRepo(itemId, repo, config.name);
+      if (result) {
+        results.push({ repoName: repo.name, prUrl: result.prUrl, prNumber: result.prNumber, noChanges: false });
+      } else {
+        results.push({ repoName: repo.name, noChanges: true });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      console.error(`[${itemId}] PR creation failed for ${repo.name}: ${message}`);
+      results.push({ repoName: repo.name, noChanges: false });
+    }
+  }
+
+  return { results };
+}
+

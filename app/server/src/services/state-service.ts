@@ -5,7 +5,10 @@ import type {
   ApprovalRequestEvent,
   ApprovalDecisionEvent,
   ReviewReceiveStartedEvent,
+  CloneCompletedEvent,
+  WorkspaceSetupCompletedEvent,
 } from '@agent-orch/shared';
+import { isSystemRole } from '@agent-orch/shared';
 import { readJsonl } from '../lib/jsonl';
 import { getItemEventsPath, getAgentEventsPath } from '../lib/paths';
 
@@ -19,57 +22,69 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
   // Check for errors
   const hasError = events.some((e) => e.type === 'error');
   if (hasError) {
-    // PR作成が完了していない状態でエラーがあれば error
     const hasPrCreated = events.some((e) => e.type === 'pr_created');
-    if (!hasPrCreated) {
+    const hasNoChanges = events.some((e) => e.type === 'repo_no_changes');
+    if (!hasPrCreated && !hasNoChanges) {
       return 'error';
     }
-    // PR作成後のエラーは最後のイベントがerrorの場合のみ
     const lastEvent = events[events.length - 1];
     if (lastEvent.type === 'error') {
       return 'error';
     }
   }
 
-  // Check for active clone operation (remote)
-  const cloneStarted = events.some((e) => e.type === 'clone_started');
-  const cloneCompleted = events.some(
-    (e) => e.type === 'clone_completed' && (e as { success: boolean }).success
-  );
-  const cloneFailed = events.some(
-    (e) => e.type === 'clone_completed' && !(e as { success: boolean }).success
-  );
+  // Check for active clone operation (remote) - any repo
+  const cloneStartedEvents = events.filter((e) => e.type === 'clone_started');
+  const cloneCompletedEvents = events.filter((e) => e.type === 'clone_completed') as CloneCompletedEvent[];
 
-  if (cloneStarted && !cloneCompleted && !cloneFailed) {
-    return 'cloning';
+  if (cloneStartedEvents.length > 0) {
+    // Check if any clone is still in progress or failed
+    const completedRepos = new Set(
+      cloneCompletedEvents.filter(e => e.success).map(e => e.repoName)
+    );
+    const failedRepos = cloneCompletedEvents.filter(e => !e.success);
+
+    if (failedRepos.length > 0) {
+      return 'error';
+    }
+
+    const startedRepos = new Set(
+      (events.filter(e => e.type === 'clone_started') as Array<{ repoName: string }>).map(e => e.repoName)
+    );
+    const allCloned = [...startedRepos].every(r => completedRepos.has(r));
+    if (!allCloned) {
+      return 'cloning';
+    }
   }
 
-  if (cloneFailed) {
-    return 'error';
-  }
+  // Check for workspace setup operation (local) - any repo
+  const setupStartedEvents = events.filter((e) => e.type === 'workspace_setup_started');
+  const setupCompletedEvents = events.filter((e) => e.type === 'workspace_setup_completed') as WorkspaceSetupCompletedEvent[];
 
-  // Check for workspace setup operation (local)
-  const setupStarted = events.some((e) => e.type === 'workspace_setup_started');
-  const setupCompleted = events.some(
-    (e) => e.type === 'workspace_setup_completed' && (e as { success: boolean }).success
-  );
-  const setupFailed = events.some(
-    (e) => e.type === 'workspace_setup_completed' && !(e as { success: boolean }).success
-  );
+  if (setupStartedEvents.length > 0) {
+    const completedRepos = new Set(
+      setupCompletedEvents.filter(e => e.success).map(e => e.repoName)
+    );
+    const failedRepos = setupCompletedEvents.filter(e => !e.success);
 
-  if (setupStarted && !setupCompleted && !setupFailed) {
-    return 'cloning'; // Use 'cloning' status for consistency (could be renamed to 'preparing' in future)
-  }
+    if (failedRepos.length > 0) {
+      return 'error';
+    }
 
-  if (setupFailed) {
-    return 'error';
+    const startedRepos = new Set(
+      (events.filter(e => e.type === 'workspace_setup_started') as Array<{ repoName: string }>).map(e => e.repoName)
+    );
+    const allSetup = [...startedRepos].every(r => completedRepos.has(r));
+    if (!allSetup) {
+      return 'cloning';
+    }
   }
 
   // Check for plan
   const hasPlan = events.some((e) => e.type === 'plan_created');
 
   // Build agent role map from agent_started events
-  const agentRoles = new Map<string, import('@agent-orch/shared').AgentRole>();
+  const agentRoles = new Map<string, string>();
   for (const event of events) {
     if (event.type === 'agent_started') {
       const e = event as import('@agent-orch/shared').AgentStartedEvent;
@@ -83,7 +98,6 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
     if (role !== undefined) {
       return role === 'planner';
     }
-    // Fallback: string matching (for missing agent_started events)
     return agentId.includes('-planner-');
   };
 
@@ -143,46 +157,38 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
   }
 
   // Check for review receive in progress
-  // NOTE: events は itemId のイベントのみを含むため、別itemのagentは含まれない
   const reviewReceiveStartedEvents = events.filter(
     (e): e is ReviewReceiveStartedEvent => e.type === 'review_receive_started'
   );
 
   if (reviewReceiveStartedEvents.length > 0) {
-    // 最後の review_receive_started イベントを取得
     const lastReviewReceiveEvent =
       reviewReceiveStartedEvents[reviewReceiveStartedEvents.length - 1];
     const lastReviewReceiveIdx = events.indexOf(lastReviewReceiveEvent);
 
-    // 過去データ互換性: agentId がないイベントはスキップ
-    // （この機能導入前のデータには agentId がない可能性がある）
     if (lastReviewReceiveEvent.agentId) {
       const targetAgentId = lastReviewReceiveEvent.agentId;
 
-      // 最後の review_receive_started 以降に plan_created があるかチェック
       const planCreatedAfterLastReviewReceive = events.some(
         (e, idx) => e.type === 'plan_created' && idx > lastReviewReceiveIdx
       );
 
-      // plan が作られていない場合のみ review_receiving 判定を行う
       if (!planCreatedAfterLastReviewReceive) {
-        // 該当する review-receiver agent の状態を確認
         const reviewReceiverStatus = agentStates.get(targetAgentId);
 
-        // agent_started がまだ来ていない場合（agentStatesにエントリがない）も
-        // review_receiving として扱う（review_receive_started → agent_started の間）
-        if (reviewReceiverStatus === undefined || reviewReceiverStatus === 'running') {
+        // Still in progress: not started, running, or waiting for plan detection after TASKS_COMPLETED
+        if (
+          reviewReceiverStatus === undefined ||
+          reviewReceiverStatus === 'running' ||
+          reviewReceiverStatus === 'waiting_orchestrator'
+        ) {
           return 'review_receiving';
         }
 
-        // 該当 Agent が error で終了していればエラー状態
-        if (reviewReceiverStatus === 'error') {
-          return 'error';
-        }
+        // All other terminal states (completed, error, stopped) without plan = error
+        return 'error';
       }
     }
-    // agentId がない古いイベントの場合は、このチェックをスキップして
-    // 後続のロジック（hasPlan等）に委ねる
   }
 
   // Check if planner is running (using role map with fallback)
@@ -205,22 +211,21 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
   );
   const hasWorkers = workerAgentIds.length > 0;
 
-  // Check for completed state: all workers have tasks_completed and PR is created
+  // Check for completed state: all repos have pr_created OR repo_no_changes
   if (hasWorkers) {
-    // Deduplicate tasks_completed by agentId
     const completedWorkerAgentIds = new Set(
       events
         .filter((e) => e.type === 'tasks_completed' && e.agentId)
         .map((e) => e.agentId!)
         .filter((id) => !isPlannerAgent(id) && !isReviewReceiverAgent(id))
     );
-    const hasPrCreated = events.some((e) => e.type === 'pr_created');
 
-    if (completedWorkerAgentIds.size >= workerAgentIds.length && hasPrCreated) {
-      // ReviewReceive後に新しいplanが作成されている場合は新サイクルなので
-      // completed ではなく ready として扱う
+    const hasPrCreated = events.some((e) => e.type === 'pr_created');
+    const hasRepoNoChanges = events.some((e) => e.type === 'repo_no_changes');
+
+    if (completedWorkerAgentIds.size >= workerAgentIds.length && (hasPrCreated || hasRepoNoChanges)) {
       const lastPrIdx = events.reduce(
-        (maxIdx, e, idx) => (e.type === 'pr_created' ? idx : maxIdx),
+        (maxIdx, e, idx) => (e.type === 'pr_created' || e.type === 'repo_no_changes' ? Math.max(maxIdx, idx) : maxIdx),
         -1
       );
       const hasPlanAfterLastPr = events.some(
@@ -233,7 +238,6 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
       if (!hasPlanAfterLastPr && !hasReviewReceiveAfterLastPr) {
         return 'completed';
       }
-      // 新サイクルが開始されている → fall through to 'ready'
     }
   }
 

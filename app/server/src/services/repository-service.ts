@@ -44,6 +44,8 @@ export async function createRepository(
     branch: request.branch,
     submodules: request.submodules,
     linkMode: request.linkMode,
+    directoryName: request.directoryName,
+    role: request.role,
     createdAt: now,
     updatedAt: now,
   };

@@ -1,4 +1,14 @@
-export type AgentRole = 'planner' | 'front' | 'back' | 'review' | 'review-receiver';
+export type AgentRole = string;
+
+const SYSTEM_ROLES = new Set(['planner', 'review', 'review-receiver']);
+
+export function isSystemRole(role: string): boolean {
+  return SYSTEM_ROLES.has(role);
+}
+
+export function isDevRole(role: string): boolean {
+  return !SYSTEM_ROLES.has(role);
+}
 
 export type AgentStatus =
   | 'idle'
@@ -14,6 +24,7 @@ export interface AgentInfo {
   id: string;
   itemId: string;
   role: AgentRole;
+  repoName?: string;
   status: AgentStatus;
   pid?: number;
   startedAt?: string;
@@ -25,6 +36,7 @@ export interface AgentInfo {
 export interface AgentStartOptions {
   itemId: string;
   role: AgentRole;
+  repoName?: string;
   prompt: string;
   workingDir: string;
   env?: Record<string, string>;

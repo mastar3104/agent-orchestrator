@@ -17,6 +17,7 @@ export type EventType =
   | 'workspace_setup_completed'
   | 'error'
   | 'pr_created'
+  | 'repo_no_changes'
   | 'review_findings_extracted'
   | 'review_receive_started';
 
@@ -32,6 +33,7 @@ export interface AgentStartedEvent extends BaseEvent {
   type: 'agent_started';
   agentId: string;
   role: import('./agent').AgentRole;
+  repoName?: string;  // planner のみ optional、それ以外は必須
   pid: number;
 }
 
@@ -123,23 +125,27 @@ export interface ItemCreatedEvent extends BaseEvent {
 
 export interface CloneStartedEvent extends BaseEvent {
   type: 'clone_started';
+  repoName: string;
   repositoryUrl: string;
 }
 
 export interface CloneCompletedEvent extends BaseEvent {
   type: 'clone_completed';
+  repoName: string;
   success: boolean;
   error?: string;
 }
 
 export interface WorkspaceSetupStartedEvent extends BaseEvent {
   type: 'workspace_setup_started';
+  repoName: string;
   localPath: string;
   linkMode: 'symlink' | 'copy';
 }
 
 export interface WorkspaceSetupCompletedEvent extends BaseEvent {
   type: 'workspace_setup_completed';
+  repoName: string;
   success: boolean;
   error?: string;
 }
@@ -152,10 +158,16 @@ export interface ErrorEvent extends BaseEvent {
 
 export interface PrCreatedEvent extends BaseEvent {
   type: 'pr_created';
+  repoName: string;
   prUrl: string;
   prNumber: number;
   branch: string;
   commitHash: string;
+}
+
+export interface RepoNoChangesEvent extends BaseEvent {
+  type: 'repo_no_changes';
+  repoName: string;
 }
 
 export interface ReviewFinding {
@@ -164,12 +176,13 @@ export interface ReviewFinding {
   line?: number;
   description: string;
   suggestedFix: string;
-  targetAgent: 'front' | 'back';
+  targetAgent: string;
 }
 
 export interface ReviewFindingsExtractedEvent extends BaseEvent {
   type: 'review_findings_extracted';
   agentId: string;
+  repoName: string;
   findings: ReviewFinding[];
   overallAssessment: 'pass' | 'needs_fixes';
   summary: string;
@@ -181,6 +194,7 @@ export interface ReviewFindingsExtractedEvent extends BaseEvent {
 export interface ReviewReceiveStartedEvent extends BaseEvent {
   type: 'review_receive_started';
   agentId: string;  // 起動するagentのIDを含める（状態判定の紐づけ用）
+  repoName: string;
   prNumber: number;
   prUrl: string;
 }
@@ -207,6 +221,7 @@ export type ItemEvent =
   | StatusChangedEvent
   | ErrorEvent
   | PrCreatedEvent
+  | RepoNoChangesEvent
   | ReviewFindingsExtractedEvent
   | ReviewReceiveStartedEvent
   | AgentEvent;

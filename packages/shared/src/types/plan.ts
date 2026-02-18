@@ -2,7 +2,8 @@ export interface PlanTask {
   id: string;
   title: string;
   description: string;
-  agent: 'front' | 'back' | 'review';
+  agent: string;
+  repository: string;       // どのリポジトリのタスクか
   dependencies?: string[];
   files?: string[];
 }

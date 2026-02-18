@@ -11,6 +11,7 @@ import type {
 interface AgentStartOptionsExtended {
   itemId: string;
   role: AgentRole;
+  repoName?: string;
   prompt: string;
   workingDir: string;
   env?: Record<string, string>;
@@ -22,7 +23,6 @@ import {
   getAgentDir,
   getAgentEventsPath,
   getItemEventsPath,
-  getWorkspaceDir,
 } from '../lib/paths';
 import {
   createAgentStartedEvent,
@@ -43,13 +43,21 @@ const agentState = new Map<string, AgentInfo>();
  * Generate a unique agent ID
  * Exported for pre-generating IDs before event recording
  */
-export function generateAgentId(_itemId: string, role: AgentRole): string {
-  return `agent-${role}-${nanoid(6)}`;
+export function generateAgentId(_itemId: string, role: AgentRole, repoName?: string): string {
+  if (repoName) {
+    return `agent-${role}--${repoName}--${nanoid(6)}`;
+  }
+  return `agent-${role}--${nanoid(6)}`;
 }
 
 export async function startAgent(options: AgentStartOptionsExtended): Promise<AgentInfo> {
+  // planner 以外は repoName 必須チェック
+  if (options.role !== 'planner' && !options.repoName) {
+    throw new Error(`repoName is required for role '${options.role}'`);
+  }
+
   // 外部からagentIdが渡された場合はそれを使用、なければ生成
-  const agentId = options.agentId ?? generateAgentId(options.itemId, options.role);
+  const agentId = options.agentId ?? generateAgentId(options.itemId, options.role, options.repoName);
 
   // Create agent directory
   await mkdir(getAgentDir(options.itemId, agentId), { recursive: true });
@@ -58,6 +66,7 @@ export async function startAgent(options: AgentStartOptionsExtended): Promise<Ag
     id: agentId,
     itemId: options.itemId,
     role: options.role,
+    repoName: options.repoName,
     status: 'starting',
     startedAt: new Date().toISOString(),
   };
@@ -70,7 +79,7 @@ export async function startAgent(options: AgentStartOptionsExtended): Promise<Ag
       id: agentId,
       itemId: options.itemId,
       role: options.role,
-      workingDir: options.workingDir || getWorkspaceDir(options.itemId),
+      workingDir: options.workingDir,
       prompt: options.prompt,
       env: options.env,
     });
@@ -83,7 +92,8 @@ export async function startAgent(options: AgentStartOptionsExtended): Promise<Ag
       options.itemId,
       agentId,
       options.role,
-      instance.pid
+      instance.pid,
+      options.repoName
     );
     await logEvent(options.itemId, agentId, startEvent);
 
@@ -242,6 +252,10 @@ export async function sendInput(agentId: string, input: string): Promise<boolean
   return ptyManager.sendInput(agentId, input);
 }
 
+export async function sendLine(agentId: string, input: string): Promise<boolean> {
+  return ptyManager.sendLine(agentId, input);
+}
+
 export async function processApproval(
   itemId: string,
   agentId: string,
@@ -314,23 +328,23 @@ export function resizeTerminal(agentId: string, cols: number, rows: number): boo
   return ptyManager.resize(agentId, cols, rows);
 }
 
-// Wait for specific agents to complete (by role)
+// Wait for specific agents to complete (by agent IDs)
 // Agents are considered complete when they:
 // - Exit (exit event)
 // - Output TASKS_COMPLETED (tasks_completed event, status becomes waiting_orchestrator)
 // - Already in terminal state (waiting_orchestrator, completed, error, stopped)
-export function waitForAgentsToComplete(
+export function waitForAgentsByIds(
   itemId: string,
-  roles: AgentRole[]
+  agentIds: string[]
 ): Promise<void> {
   return new Promise((resolve) => {
-    const targetAgentIds = new Set<string>();
+    const targetAgentIds = new Set<string>(agentIds);
     const completedAgentIds = new Set<string>();
 
-    // Find current agents matching the roles
-    for (const agent of agentState.values()) {
-      if (agent.itemId === itemId && roles.includes(agent.role)) {
-        targetAgentIds.add(agent.id);
+    // Check current agents matching the IDs
+    for (const id of targetAgentIds) {
+      const agent = agentState.get(id);
+      if (agent && agent.itemId === itemId) {
         // If already in terminal state, mark as completed
         if (
           agent.status === 'waiting_orchestrator' ||
@@ -338,7 +352,7 @@ export function waitForAgentsToComplete(
           agent.status === 'error' ||
           agent.status === 'stopped'
         ) {
-          completedAgentIds.add(agent.id);
+          completedAgentIds.add(id);
         }
       }
     }
@@ -389,6 +403,7 @@ export async function reconstructAgentState(itemId: string): Promise<void> {
         id: e.agentId,
         itemId: e.itemId,
         role: e.role,
+        repoName: e.repoName,
         status: 'running',
         pid: e.pid,
         startedAt: e.timestamp,
@@ -427,17 +442,11 @@ export async function reconstructAgentState(itemId: string): Promise<void> {
 export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<number> {
   const events = await readJsonl<ItemEvent>(getItemEventsPath(itemId));
 
-  // Build agent states from events
-  // Key design decisions:
-  // 1. agent_started initializes the agent, but doesn't override existing status
-  // 2. status_changed can create an agent entry even without agent_started (handles missing events)
-  // 3. Events are processed in order, so later events always take precedence
   const agents = new Map<string, { status: AgentStatus; agentId: string; role?: AgentRole }>();
 
   for (const event of events) {
     if (event.type === 'agent_started' && event.agentId) {
       const e = event as import('@agent-orch/shared').AgentStartedEvent;
-      // Only initialize if not exists (don't override later status_changed events)
       if (!agents.has(event.agentId)) {
         agents.set(event.agentId, {
           status: 'running',
@@ -445,7 +454,6 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
           role: e.role,
         });
       } else {
-        // Update role if we have it, but keep existing status
         const existing = agents.get(event.agentId)!;
         existing.role = e.role;
       }
@@ -458,7 +466,6 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
           existing.status = newStatus;
         }
       } else {
-        // Create entry even without agent_started
         agents.set(event.agentId, {
           status: newStatus,
           agentId: event.agentId,
@@ -472,7 +479,6 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
           existing.status = e.newStatus as AgentStatus;
         }
       } else {
-        // Create entry even without agent_started (handles missing events)
         agents.set(event.agentId, {
           status: e.newStatus as AgentStatus,
           agentId: event.agentId,
@@ -498,7 +504,6 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
         const role = agent.role ?? tryExtractRoleFromAgentId(agentId);
 
         if (!role) {
-          // Cannot determine role - skip entirely (no event write, no in-memory update)
           console.warn(`[${itemId}] Skipping orphaned agent cleanup: ${agentId} (unknown role, was ${agent.status})`);
           continue;
         }
@@ -516,7 +521,6 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
         try {
           await logEvent(itemId, agentId, statusEvent);
         } catch (error) {
-          // logEvent failed - do NOT update in-memory state to maintain consistency
           console.error(`[${itemId}] Failed to log status_changed for orphaned agent ${agentId}:`, error);
           continue;
         }
@@ -538,15 +542,25 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
   return cleanedCount;
 }
 
-// Helper to extract role from agent ID (e.g., "agent-review-kYB7V2" -> "review")
+// Helper to extract role from agent ID
+// New format: "agent-{role}--{repoName}--{nanoid}" or "agent-{role}--{nanoid}"
+// Legacy format: "agent-{role}-{repoName}-{nanoid}" or "agent-{role}-{nanoid}"
 // Returns null if pattern is unknown - caller must handle this case
 function tryExtractRoleFromAgentId(agentId: string): AgentRole | null {
+  // New format: split by '--' → ["agent-{role}", "{repoName}", "{nanoid}"] or ["agent-{role}", "{nanoid}"]
+  const parts = agentId.split('--');
+  if (parts.length >= 2 && parts[0].startsWith('agent-')) {
+    return parts[0].slice('agent-'.length) as AgentRole;
+  }
+
+  // Legacy fallback: known roles with hyphens
   if (agentId.includes('-planner-')) return 'planner';
-  if (agentId.includes('-front-')) return 'front';
-  if (agentId.includes('-back-')) return 'back';
   if (agentId.includes('-review-receiver-')) return 'review-receiver';
   if (agentId.includes('-review-')) return 'review';
 
-  // Unknown role pattern - return null to let caller decide
+  // Legacy fallback: agent-{role}-{repoName}-{nanoid}
+  const match = agentId.match(/^agent-([^-]+)-/);
+  if (match) return match[1];
+
   return null;
 }

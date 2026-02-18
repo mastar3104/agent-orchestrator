@@ -41,7 +41,9 @@ export function ItemDetailPage() {
       event.type === 'approval_requested' ||
       event.type === 'approval_decision' ||
       event.type === 'plan_created' ||
-      event.type === 'review_findings_extracted'
+      event.type === 'review_findings_extracted' ||
+      event.type === 'pr_created' ||
+      event.type === 'repo_no_changes'
     ) {
       refresh();
     }
@@ -152,16 +154,26 @@ export function ItemDetailPage() {
             >
               {item.status}
             </span>
-            {item.prUrl && (
-              <a
-                href={item.prUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="px-2 py-0.5 text-xs rounded-full bg-purple-600 text-white hover:bg-purple-500"
-              >
-                PR #{item.prNumber}
-              </a>
-            )}
+            {item.repos?.map((repo) => (
+              repo.prUrl ? (
+                <a
+                  key={repo.repoName}
+                  href={repo.prUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-2 py-0.5 text-xs rounded-full bg-purple-600 text-white hover:bg-purple-500"
+                >
+                  {repo.repoName} PR #{repo.prNumber}
+                </a>
+              ) : repo.noChanges ? (
+                <span
+                  key={repo.repoName}
+                  className="px-2 py-0.5 text-xs rounded-full bg-gray-600 text-gray-300"
+                >
+                  {repo.repoName}: no changes
+                </span>
+              ) : null
+            ))}
             {!isConnected && (
               <span className="text-xs text-red-400">Disconnected</span>
             )}
@@ -188,12 +200,25 @@ export function ItemDetailPage() {
           )}
           {canStartReviewReceive && (
             <div className="flex flex-col gap-1">
-              <button
-                onClick={startReviewReceive}
-                className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-500"
-              >
-                Review Receive
-              </button>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => startReviewReceive()}
+                  className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-500"
+                >
+                  Review Receive (All)
+                </button>
+                {item.repos?.map((repo) =>
+                  repo.prUrl ? (
+                    <button
+                      key={repo.repoName}
+                      onClick={() => startReviewReceive(repo.repoName)}
+                      className="px-3 py-2 bg-blue-700 text-white rounded hover:bg-blue-600 text-sm"
+                    >
+                      {repo.repoName}
+                    </button>
+                  ) : null
+                )}
+              </div>
               {reviewReceiveError && (
                 <span className="text-xs text-red-400">{reviewReceiveError}</span>
               )}
@@ -299,6 +324,11 @@ export function ItemDetailPage() {
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-lg font-medium text-yellow-400">
                   Review Findings
+                  {reviewEvent.repoName && (
+                    <span className="ml-2 text-sm text-yellow-500">
+                      ({reviewEvent.repoName})
+                    </span>
+                  )}
                 </h3>
                 <div className="flex gap-3 text-sm">
                   {reviewEvent.criticalCount > 0 && (

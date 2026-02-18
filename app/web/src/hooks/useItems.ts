@@ -88,11 +88,11 @@ export function useItem(id: string | undefined) {
     await refresh();
   };
 
-  const startReviewReceive = async () => {
+  const startReviewReceive = async (repoName?: string) => {
     if (!id) return;
     setReviewReceiveError(null);
     try {
-      await api.startReviewReceive(id);
+      await api.startReviewReceive(id, repoName);
       await refresh();
     } catch (err) {
       const message =

@@ -173,7 +173,7 @@ export class PtyManager extends EventEmitter {
 
       // 最新チャンク(data) OR バッファ末尾(tail) で承認UIの存在を確認
       const tail = instance.outputBuffer.slice(-2048);
-      const uiStillPresent = detectApprovalPrompt(data) || detectApprovalPrompt(tail);
+      const uiStillPresent = detectApprovalPrompt(stripAnsi(data)) || detectApprovalPrompt(stripAnsi(tail));
 
       if (!uiStillPresent) {
         // UI消失 → 正常完了
@@ -189,11 +189,12 @@ export class PtyManager extends EventEmitter {
     }
 
     // Check for approval prompts using accumulated buffer
-    const approvalContext = detectApprovalPrompt(instance.outputBuffer);
+    const cleanBuffer = stripAnsi(instance.outputBuffer);
+    const approvalContext = detectApprovalPrompt(cleanBuffer);
     if (approvalContext && instance.approvalState === 'none') {
-      const command = extractCommandFromPrompt(instance.outputBuffer) || approvalContext;
+      const command = extractCommandFromPrompt(cleanBuffer) || approvalContext;
       const classification = classifyCommand(command);
-      const uiKind = detectApprovalUiKind(instance.outputBuffer);
+      const uiKind = detectApprovalUiKind(cleanBuffer);
 
       instance.approvalState = 'waiting';
       instance.pendingCommand = command;
@@ -289,7 +290,7 @@ export class PtyManager extends EventEmitter {
     }
 
     // uiKindが指定されていない場合は保存されたものを使用
-    const actualUiKind = uiKind || instance.pendingUiKind || detectApprovalUiKind(instance.outputBuffer);
+    const actualUiKind = uiKind || instance.pendingUiKind || detectApprovalUiKind(stripAnsi(instance.outputBuffer));
 
     let response: string;
     if (actualUiKind === 'menu') {

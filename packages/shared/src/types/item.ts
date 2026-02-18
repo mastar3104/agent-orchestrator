@@ -1,25 +1,24 @@
-export type AgentConfigRole = 'front' | 'back' | 'review';
+// role を固定値ではなく string にし、将来の拡張 (docs, mobile 等) に対応
+export type DevAgentRole = string;  // "front", "back", "docs", "mobile" など自由
 
-export interface AgentConfig {
-  role: AgentConfigRole;
-  workdir: string;  // workspace root からの相対パス (例: "frontend", "backend")
+export interface ItemRepositoryConfig {
+  name: string;                    // ディレクトリ名 (例: "frontend")
+  role: DevAgentRole;              // 担当する開発エージェント (自由文字列)
+  type: 'remote' | 'local';
+  url?: string;
+  localPath?: string;
+  branch?: string;
+  workBranch?: string;
+  submodules?: boolean;
+  linkMode?: 'symlink' | 'copy';
 }
 
 export interface ItemConfig {
   id: string;
   name: string;
   description: string;
-  repository: {
-    type: 'remote' | 'local';
-    url?: string;              // remoteの場合
-    localPath?: string;        // localの場合
-    branch?: string;           // clone元ブランチ（デフォルト: main）
-    workBranch?: string;       // 作業用ブランチ名（指定時は自動作成）
-    submodules?: boolean;
-    linkMode?: 'symlink' | 'copy';  // localの場合のモード
-  };
+  repositories: ItemRepositoryConfig[];  // 変更: 配列
   designDoc?: string;
-  agentConfigs?: AgentConfig[];  // エージェント固有の設定（workdir等）
   createdAt: string;
   updatedAt: string;
 }
@@ -44,11 +43,18 @@ export interface ItemSummary {
   updatedAt: string;
 }
 
+export interface RepoSummary {
+  repoName: string;
+  role: DevAgentRole;
+  prUrl?: string;
+  prNumber?: number;
+  noChanges: boolean;  // repo_no_changes イベントから派生
+}
+
 export interface ItemDetail extends ItemConfig {
   status: ItemStatus;
   plan?: import('./plan').Plan;
   agents: import('./agent').AgentInfo[];
   pendingApprovals: import('./events').ApprovalRequestEvent[];
-  prUrl?: string;
-  prNumber?: number;
+  repos: RepoSummary[];  // 変更: prUrl/prNumber を置換
 }

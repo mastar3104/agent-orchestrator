@@ -39,7 +39,7 @@ export function RepositorySelector({
         <option value="">-- Select a saved repository --</option>
         {repositories.map((repo) => (
           <option key={repo.id} value={repo.id}>
-            {repo.name} ({repo.type === 'remote' ? repo.url : repo.localPath})
+            {repo.name}{repo.directoryName ? ` [${repo.directoryName}]` : ''} ({repo.type === 'remote' ? repo.url : repo.localPath})
           </option>
         ))}
       </select>
@@ -103,6 +103,18 @@ function RepositoryDetails({ repository }: RepositoryDetailsProps) {
               </div>
             )}
           </>
+        )}
+        {repository.directoryName && (
+          <div>
+            <span className="text-gray-400">Directory:</span>{' '}
+            <span className="text-gray-200">{repository.directoryName}</span>
+          </div>
+        )}
+        {repository.role && (
+          <div>
+            <span className="text-gray-400">Role:</span>{' '}
+            <span className="text-gray-200">{repository.role}</span>
+          </div>
         )}
       </div>
     </div>

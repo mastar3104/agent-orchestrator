@@ -224,12 +224,14 @@ export async function batchProcessApprovals(
 
 // Review Receive
 export async function startReviewReceive(
-  itemId: string
-): Promise<{ started: boolean; prNumber: number }> {
-  return request<{ started: boolean; prNumber: number }>(
+  itemId: string,
+  repoName?: string
+): Promise<{ started: boolean; prNumber: number; repoName: string }> {
+  return request<{ started: boolean; prNumber: number; repoName: string }>(
     `/items/${itemId}/review-receive/start`,
     {
       method: 'POST',
+      body: JSON.stringify({ repoName }),
     }
   );
 }

@@ -14,16 +14,22 @@ export interface RepositoryConfig {
   linkMode?: 'symlink' | 'copy';  // localの場合のモード
 }
 
+export interface CreateItemRepositoryInput {
+  repositoryId?: string;
+  repository?: RepositoryConfig;
+  name: string;              // ディレクトリ名
+  role: string;              // 開発エージェントの役割 (自由文字列: "front", "back", "docs" 等)
+  branch?: string;
+  workBranch?: string;
+  saveRepository?: boolean;
+  repositoryName?: string;
+}
+
 // Request types
 export interface CreateItemRequest {
   name: string;
   description: string;
-  repositoryId?: string;     // 登録済みリポジトリID（新規追加）
-  repository?: RepositoryConfig;  // 直接入力（従来通り）
-  branch?: string;           // Clone branch override for saved repo
-  workBranch?: string;       // Item固有の作業ブランチ（repositoryId使用時）
-  saveRepository?: boolean;  // 手入力時にリポジトリを保存するか
-  repositoryName?: string;   // 保存時のリポジトリ名
+  repositories: CreateItemRepositoryInput[];  // 変更: 配列
   designDoc?: string;
 }
 

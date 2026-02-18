@@ -1,4 +1,4 @@
-import type { AgentInfo, AgentStatus, AgentRole } from '@agent-orch/shared';
+import type { AgentInfo, AgentStatus } from '@agent-orch/shared';
 
 interface AgentCardProps {
   agent: AgentInfo;
@@ -29,25 +29,35 @@ const STATUS_LABELS: Record<AgentStatus, string> = {
   error: 'Error',
 };
 
-const ROLE_LABELS: Record<AgentRole, string> = {
+const KNOWN_ROLE_LABELS: Record<string, string> = {
   planner: 'Planner',
-  front: 'Frontend',
-  back: 'Backend',
   review: 'Review',
   'review-receiver': 'Review Receiver',
 };
 
-const ROLE_COLORS: Record<AgentRole, string> = {
+const KNOWN_ROLE_COLORS: Record<string, string> = {
   planner: 'text-purple-400',
-  front: 'text-blue-400',
-  back: 'text-green-400',
   review: 'text-yellow-400',
   'review-receiver': 'text-cyan-400',
 };
 
+function getRoleLabel(role: string): string {
+  if (KNOWN_ROLE_LABELS[role]) return KNOWN_ROLE_LABELS[role];
+  // Capitalize first letter of each word
+  return role.charAt(0).toUpperCase() + role.slice(1);
+}
+
+function getRoleColor(role: string): string {
+  if (KNOWN_ROLE_COLORS[role]) return KNOWN_ROLE_COLORS[role];
+  return 'text-gray-400';
+}
+
 export function AgentCard({ agent, onStop, onSelect, isSelected }: AgentCardProps) {
   const isRunning = agent.status === 'running' || agent.status === 'starting';
   const isWaiting = agent.status === 'waiting_approval';
+
+  const roleLabel = getRoleLabel(agent.role);
+  const repoSuffix = agent.repoName ? ` (${agent.repoName})` : '';
 
   return (
     <div
@@ -60,8 +70,8 @@ export function AgentCard({ agent, onStop, onSelect, isSelected }: AgentCardProp
     >
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
-          <span className={`font-medium ${ROLE_COLORS[agent.role]}`}>
-            {ROLE_LABELS[agent.role]}
+          <span className={`font-medium ${getRoleColor(agent.role)}`}>
+            {roleLabel}{repoSuffix}
           </span>
           <span className="text-xs text-gray-500">{agent.id}</span>
         </div>

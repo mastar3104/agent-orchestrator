@@ -19,6 +19,7 @@ import type {
   WorkspaceSetupCompletedEvent,
   ErrorEvent,
   PrCreatedEvent,
+  RepoNoChangesEvent,
   AgentRole,
   ReviewFinding,
   ReviewFindingsExtractedEvent,
@@ -44,6 +45,7 @@ export function createItemCreatedEvent(itemId: string): ItemCreatedEvent {
 
 export function createCloneStartedEvent(
   itemId: string,
+  repoName: string,
   repositoryUrl: string
 ): CloneStartedEvent {
   return {
@@ -51,12 +53,14 @@ export function createCloneStartedEvent(
     type: 'clone_started',
     timestamp: timestamp(),
     itemId,
+    repoName,
     repositoryUrl,
   };
 }
 
 export function createCloneCompletedEvent(
   itemId: string,
+  repoName: string,
   success: boolean,
   error?: string
 ): CloneCompletedEvent {
@@ -65,6 +69,7 @@ export function createCloneCompletedEvent(
     type: 'clone_completed',
     timestamp: timestamp(),
     itemId,
+    repoName,
     success,
     error,
   };
@@ -74,7 +79,8 @@ export function createAgentStartedEvent(
   itemId: string,
   agentId: string,
   role: AgentRole,
-  pid: number
+  pid: number,
+  repoName?: string
 ): AgentStartedEvent {
   return {
     id: createEventId(),
@@ -84,6 +90,7 @@ export function createAgentStartedEvent(
     agentId,
     role,
     pid,
+    repoName,
   };
 }
 
@@ -276,6 +283,7 @@ export function createErrorEvent(
 
 export function createWorkspaceSetupStartedEvent(
   itemId: string,
+  repoName: string,
   localPath: string,
   linkMode: 'symlink' | 'copy'
 ): WorkspaceSetupStartedEvent {
@@ -284,6 +292,7 @@ export function createWorkspaceSetupStartedEvent(
     type: 'workspace_setup_started',
     timestamp: timestamp(),
     itemId,
+    repoName,
     localPath,
     linkMode,
   };
@@ -291,6 +300,7 @@ export function createWorkspaceSetupStartedEvent(
 
 export function createWorkspaceSetupCompletedEvent(
   itemId: string,
+  repoName: string,
   success: boolean,
   error?: string
 ): WorkspaceSetupCompletedEvent {
@@ -299,6 +309,7 @@ export function createWorkspaceSetupCompletedEvent(
     type: 'workspace_setup_completed',
     timestamp: timestamp(),
     itemId,
+    repoName,
     success,
     error,
   };
@@ -306,6 +317,7 @@ export function createWorkspaceSetupCompletedEvent(
 
 export function createPrCreatedEvent(
   itemId: string,
+  repoName: string,
   prUrl: string,
   prNumber: number,
   branch: string,
@@ -316,6 +328,7 @@ export function createPrCreatedEvent(
     type: 'pr_created',
     timestamp: timestamp(),
     itemId,
+    repoName,
     prUrl,
     prNumber,
     branch,
@@ -323,9 +336,23 @@ export function createPrCreatedEvent(
   };
 }
 
+export function createRepoNoChangesEvent(
+  itemId: string,
+  repoName: string
+): RepoNoChangesEvent {
+  return {
+    id: createEventId(),
+    type: 'repo_no_changes',
+    timestamp: timestamp(),
+    itemId,
+    repoName,
+  };
+}
+
 export function createReviewFindingsExtractedEvent(
   itemId: string,
   agentId: string,
+  repoName: string,
   findings: ReviewFinding[],
   overallAssessment: 'pass' | 'needs_fixes',
   summary: string
@@ -340,6 +367,7 @@ export function createReviewFindingsExtractedEvent(
     timestamp: timestamp(),
     itemId,
     agentId,
+    repoName,
     findings,
     overallAssessment,
     summary,
@@ -352,6 +380,7 @@ export function createReviewFindingsExtractedEvent(
 export function createReviewReceiveStartedEvent(
   itemId: string,
   agentId: string,
+  repoName: string,
   prNumber: number,
   prUrl: string
 ): ReviewReceiveStartedEvent {
@@ -361,6 +390,7 @@ export function createReviewReceiveStartedEvent(
     timestamp: timestamp(),
     itemId,
     agentId,
+    repoName,
     prNumber,
     prUrl,
   };

@@ -2,15 +2,15 @@ import { watch, existsSync } from 'fs';
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { dirname } from 'path';
 import type { ItemConfig, Plan } from '@agent-orch/shared';
-import { startAgent, sendInput, getAgentsByItem } from './agent-service';
+import { startAgent, sendLine, getAgentsByItem } from './agent-service';
 import { getItemConfig } from './item-service';
 import { readYamlSafe, parseYaml, stringifyYaml } from '../lib/yaml';
 import { appendJsonl } from '../lib/jsonl';
-import { createPlanCreatedEvent, createStatusChangedEvent } from '../lib/events';
+import { createPlanCreatedEvent, createStatusChangedEvent, createErrorEvent } from '../lib/events';
 import {
   getItemPlanPath,
   getItemEventsPath,
-  getWorkspaceDir,
+  getWorkspaceRoot,
 } from '../lib/paths';
 import { eventBus } from './event-bus';
 
@@ -21,18 +21,23 @@ const PLANNER_PROMPT_TEMPLATE = `You are a development planner agent. Your task 
 **Project Name:** {{name}}
 **Description:** {{description}}
 
+**Repositories:**
+{{repositories}}
+
 **Design Document:**
 {{designDoc}}
 
 ## Instructions
 
 1. Analyze the design document and understand the requirements
-2. Examine the repository structure to understand existing code patterns
+2. Examine ALL repository directories in the workspace to understand existing code patterns
 3. Break down the implementation into discrete tasks
-4. Assign each task to one of three specialized agents:
-   - **front**: Frontend development tasks (UI components, styling, client-side logic)
-   - **back**: Backend development tasks (APIs, database, server-side logic)
-   - **review**: Code review, testing, documentation, integration tasks
+4. Assign each task to the appropriate repository with the \`repository\` field matching a repository name
+5. Assign each task to the appropriate agent role
+
+## Available Repositories and Roles
+
+{{repoRoleMapping}}
 
 ## Output
 
@@ -46,10 +51,13 @@ tasks:
   - id: "task-1"
     title: "Task title"
     description: "Detailed description of what needs to be done"
-    agent: "front|back|review"
+    agent: "<role>"          # One of the roles listed above
+    repository: "<repoName>" # One of the repository names listed above
     dependencies: []  # Optional: list of task IDs this depends on
     files: []  # Optional: list of files to create/modify
 \`\`\`
+
+IMPORTANT: Every task MUST have a \`repository\` field matching one of the repository names listed above.
 
 Focus on creating actionable, well-scoped tasks. Each task should be completable by a single agent in one session.
 
@@ -89,46 +97,63 @@ export async function startPlanner(itemId: string): Promise<void> {
   }
 
   const prompt = buildPlannerPrompt(config);
-  const workspaceDir = getWorkspaceDir(itemId);
+  const workspaceRoot = getWorkspaceRoot(itemId);
 
   // Start watching for plan.yaml creation before starting agent
   watchForPlan(itemId);
 
-  // Start the planner agent
+  // Start the planner agent (planner works from workspace root, no repoName needed)
   await startAgent({
     itemId,
     role: 'planner',
     prompt,
-    workingDir: workspaceDir,
+    workingDir: workspaceRoot,
   });
 }
 
 function buildPlannerPrompt(config: ItemConfig): string {
+  const repoList = config.repositories
+    .map(r => `- **${r.name}** (role: ${r.role}, type: ${r.type})`)
+    .join('\n');
+
+  const repoRoleMapping = config.repositories
+    .map(r => `- Repository: \`${r.name}\` → Agent role: \`${r.role}\``)
+    .join('\n');
+
   return PLANNER_PROMPT_TEMPLATE
     .replace('{{name}}', config.name)
     .replace('{{description}}', config.description)
     .replace('{{designDoc}}', config.designDoc || 'No design document provided.')
-    .replace('{{itemId}}', config.id);
+    .replace('{{itemId}}', config.id)
+    .replace('{{repositories}}', repoList)
+    .replace('{{repoRoleMapping}}', repoRoleMapping);
 }
 
 /**
  * Watch for plan.yaml creation and emit plan_created event
  * @param itemId - The item ID to watch
  * @param targetRole - The agent role that creates the plan (default: 'planner')
- *                     Used to update the correct agent's status when plan is detected
+ * @param agentId - Optional agent ID to monitor for exit without plan creation
  */
 export function watchForPlan(
   itemId: string,
-  targetRole: 'planner' | 'review-receiver' = 'planner'
+  targetRole: 'planner' | 'review-receiver' = 'planner',
+  agentId?: string
 ): void {
   const planPath = getItemPlanPath(itemId);
-  const workspaceDir = getWorkspaceDir(itemId);
-
-  // Also check workspace for plan.yaml
-  const workspacePlanPath = `${workspaceDir}/plan.yaml`;
+  const workspaceRoot = getWorkspaceRoot(itemId);
 
   let detected = false;
+  let cleaned = false;
   let pendingCheck: Promise<void> = Promise.resolve();
+
+  const cleanup = (watcher: ReturnType<typeof watch> | null, pollInterval: ReturnType<typeof setInterval>, unsubscribe?: () => void) => {
+    if (cleaned) return;
+    cleaned = true;
+    watcher?.close();
+    clearInterval(pollInterval);
+    unsubscribe?.();
+  };
 
   const checkAndEmit = (path: string) => {
     pendingCheck = pendingCheck.then(async () => {
@@ -147,8 +172,6 @@ export function watchForPlan(
           eventBus.emit('event', { itemId, event });
 
           // Update target agent status to completed
-          // When planner is restarted, multiple agents with the same role exist.
-          // Prefer the currently running one to avoid marking the wrong agent.
           const agents = await getAgentsByItem(itemId);
           const targetAgent = agents.find(a => a.role === targetRole && a.status === 'running')
             ?? [...agents].reverse().find(a => a.role === targetRole);
@@ -168,7 +191,7 @@ export function watchForPlan(
             targetAgent.stoppedAt = new Date().toISOString();
 
             // Signal target agent to exit
-            await sendInput(targetAgent.id, '/exit');
+            await sendLine(targetAgent.id, '/exit');
           }
         }
       } catch {
@@ -179,16 +202,13 @@ export function watchForPlan(
 
   // Check if plan already exists
   checkAndEmit(planPath);
-  checkAndEmit(workspacePlanPath);
 
-  // Watch item directory for plan.yaml
+  // Watch workspace root for plan.yaml
   let watcher: ReturnType<typeof watch> | null = null;
-  if (existsSync(workspaceDir)) {
-    watcher = watch(workspaceDir, (eventType, filename) => {
-      // 'rename' = file created/deleted, 'change' = file modified
-      // Both events should trigger plan detection
+  if (existsSync(workspaceRoot)) {
+    watcher = watch(workspaceRoot, (eventType, filename) => {
       if (filename === 'plan.yaml') {
-        checkAndEmit(workspacePlanPath);
+        checkAndEmit(planPath);
       }
     });
   }
@@ -200,36 +220,54 @@ export function watchForPlan(
       return;
     }
     checkAndEmit(planPath);
-    checkAndEmit(workspacePlanPath);
   }, 3000);
+
+  // Listen for agent exit to detect plan-less termination
+  let unsubscribe: (() => void) | undefined;
+  if (agentId) {
+    unsubscribe = eventBus.subscribeToItem(itemId, (event) => {
+      if (detected) return;
+      if (event.type === 'agent_exited' && event.agentId === agentId) {
+        // Agent exited without plan detection — give 5s grace period for pending file writes
+        setTimeout(async () => {
+          if (detected) return;
+
+          // Final check
+          checkAndEmit(planPath);
+          await pendingCheck;
+          if (detected) return;
+
+          // Plan was not created — emit error event
+          const errorEvent = createErrorEvent(
+            itemId,
+            `${targetRole} agent exited without creating plan.yaml`,
+            undefined,
+            agentId
+          );
+          await appendJsonl(getItemEventsPath(itemId), errorEvent);
+          eventBus.emit('event', { itemId, event: errorEvent });
+
+          cleanup(watcher, pollInterval, unsubscribe);
+        }, 5000);
+      }
+    });
+  }
 
   // Auto-close watcher and polling after 30 minutes
   setTimeout(() => {
-    watcher?.close();
-    clearInterval(pollInterval);
+    cleanup(watcher, pollInterval, unsubscribe);
   }, 30 * 60 * 1000);
 }
 
 export async function getPlan(itemId: string): Promise<Plan | null> {
-  // Check both locations
-  let plan = await readYamlSafe<Plan>(getItemPlanPath(itemId));
-  if (!plan) {
-    plan = await readYamlSafe<Plan>(`${getWorkspaceDir(itemId)}/plan.yaml`);
-  }
-  return plan;
+  return readYamlSafe<Plan>(getItemPlanPath(itemId));
 }
 
 export async function getPlanContent(itemId: string): Promise<string | null> {
-  const itemPlanPath = getItemPlanPath(itemId);
-  if (existsSync(itemPlanPath)) {
-    return readFile(itemPlanPath, 'utf-8');
+  const planPath = getItemPlanPath(itemId);
+  if (existsSync(planPath)) {
+    return readFile(planPath, 'utf-8');
   }
-
-  const workspacePlanPath = `${getWorkspaceDir(itemId)}/plan.yaml`;
-  if (existsSync(workspacePlanPath)) {
-    return readFile(workspacePlanPath, 'utf-8');
-  }
-
   return null;
 }
 
@@ -245,7 +283,8 @@ export async function updatePlanContent(
     throw new Error(`Invalid YAML: ${message}`);
   }
 
-  const errors = await validatePlan(plan);
+  const config = await getItemConfig(itemId);
+  const errors = await validatePlan(plan, config);
   if (plan.itemId && plan.itemId !== itemId) {
     errors.push(`itemId does not match (${plan.itemId} !== ${itemId})`);
   }
@@ -255,20 +294,15 @@ export async function updatePlanContent(
   }
 
   const normalized = stringifyYaml(plan);
-  const itemPlanPath = getItemPlanPath(itemId);
-  const workspacePlanPath = `${getWorkspaceDir(itemId)}/plan.yaml`;
+  const planPath = getItemPlanPath(itemId);
 
-  await mkdir(dirname(itemPlanPath), { recursive: true });
-  await writeFile(itemPlanPath, normalized, 'utf-8');
-
-  if (existsSync(getWorkspaceDir(itemId))) {
-    await writeFile(workspacePlanPath, normalized, 'utf-8');
-  }
+  await mkdir(dirname(planPath), { recursive: true });
+  await writeFile(planPath, normalized, 'utf-8');
 
   return { plan, content: normalized };
 }
 
-export async function validatePlan(plan: Plan): Promise<string[]> {
+export async function validatePlan(plan: Plan, itemConfig?: ItemConfig | null): Promise<string[]> {
   const errors: string[] = [];
 
   if (!plan.version) {
@@ -283,6 +317,14 @@ export async function validatePlan(plan: Plan): Promise<string[]> {
     errors.push('Missing or invalid tasks array');
     return errors;
   }
+
+  // Build valid repo names and roles from config
+  const validRepoNames = itemConfig
+    ? new Set(itemConfig.repositories.map(r => r.name))
+    : null;
+  const validRoles = itemConfig
+    ? new Set([...itemConfig.repositories.map(r => r.role), 'review'])
+    : null;
 
   const taskIds = new Set<string>();
 
@@ -299,8 +341,16 @@ export async function validatePlan(plan: Plan): Promise<string[]> {
       errors.push(`Task ${task.id || 'unknown'} missing title`);
     }
 
-    if (!task.agent || !['front', 'back', 'review'].includes(task.agent)) {
-      errors.push(`Task ${task.id || 'unknown'} has invalid agent: ${task.agent}`);
+    if (!task.agent) {
+      errors.push(`Task ${task.id || 'unknown'} missing agent field`);
+    } else if (validRoles && !validRoles.has(task.agent)) {
+      errors.push(`Task ${task.id || 'unknown'} has invalid agent: ${task.agent}. Valid: ${[...validRoles].join(', ')}`);
+    }
+
+    if (!task.repository) {
+      errors.push(`Task ${task.id || 'unknown'}: repository field missing`);
+    } else if (validRepoNames && !validRepoNames.has(task.repository)) {
+      errors.push(`Task ${task.id || 'unknown'}: unknown repository "${task.repository}". Valid: ${[...validRepoNames].join(', ')}`);
     }
 
     if (task.dependencies) {

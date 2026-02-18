@@ -14,7 +14,7 @@ import {
   updateItem,
   deleteItem,
 } from '../services/item-service';
-import { createDraftPr } from '../services/git-pr-service';
+import { createDraftPrsForAllRepos } from '../services/git-pr-service';
 import {
   startReviewReceive,
   ReviewReceiveValidationError,
@@ -85,6 +85,13 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
+      // Legacy item detection → 400
+      if (message.includes('Legacy item.yaml detected') || message.includes("missing 'repositories' field")) {
+        return reply.status(400).send({
+          success: false,
+          error: message,
+        });
+      }
       return reply.status(500).send({
         success: false,
         error: message,
@@ -151,7 +158,6 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
     Reply: ApiResponse<{ started: boolean }>;
   }>('/items/:id/clone', async (request, reply) => {
     try {
-      // Start workspace setup in background
       setupWorkspace(request.params.id).catch((error) => {
         fastify.log.error({ itemId: request.params.id, error }, 'Workspace setup failed');
       });
@@ -169,14 +175,13 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
     }
   });
 
-  // Create Draft PR
+  // Create Draft PRs for all repos
   fastify.post<{
     Params: { id: string };
-    Reply: ApiResponse<{ prUrl: string; prNumber: number }>;
+    Reply: ApiResponse<{ results: Array<{ repoName: string; prUrl?: string; prNumber?: number; noChanges: boolean }> }>;
   }>('/items/:id/create-pr', async (request, reply) => {
     try {
-      // PR作成を同期実行し、結果を返す
-      const result = await createDraftPr(request.params.id);
+      const result = await createDraftPrsForAllRepos(request.params.id);
 
       return reply.send({
         success: true,
@@ -195,10 +200,11 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
   // Review Receive - fetch PR comments and create plan
   fastify.post<{
     Params: { id: string };
-    Reply: ApiResponse<{ started: boolean; prNumber: number }>;
+    Body: { repoName?: string };
+    Reply: ApiResponse<{ started: boolean; prNumber: number; repoName: string }>;
   }>('/items/:id/review-receive/start', async (request, reply) => {
     try {
-      const result = await startReviewReceive(request.params.id);
+      const result = await startReviewReceive(request.params.id, request.body?.repoName);
       return reply.send({
         success: true,
         data: result,
@@ -206,7 +212,6 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
 
-      // バリデーションエラーは 400、その他は 500
       if (error instanceof ReviewReceiveValidationError) {
         return reply.status(400).send({
           success: false,
@@ -214,7 +219,6 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
         });
       }
 
-      // Agent起動失敗などの内部エラーは 500
       fastify.log.error(
         { itemId: request.params.id, error },
         'Review receive failed'

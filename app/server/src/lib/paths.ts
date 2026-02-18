@@ -19,7 +19,7 @@ export function getItemConfigPath(itemId: string): string {
 }
 
 export function getItemPlanPath(itemId: string): string {
-  return join(getItemDir(itemId), 'plan.yaml');
+  return join(getWorkspaceRoot(itemId), 'plan.yaml');
 }
 
 export function getItemEventsPath(itemId: string): string {
@@ -38,8 +38,14 @@ export function getAgentEventsPath(itemId: string, agentId: string): string {
   return join(getAgentDir(itemId, agentId), 'events.jsonl');
 }
 
-export function getWorkspaceDir(itemId: string): string {
-  return join(getItemDir(itemId), 'workspace', 'product');
+// workspace ルート: {itemDir}/workspace/
+export function getWorkspaceRoot(itemId: string): string {
+  return join(getItemDir(itemId), 'workspace');
+}
+
+// 特定リポジトリ: {itemDir}/workspace/{repoName}/
+export function getRepoWorkspaceDir(itemId: string, repoName: string): string {
+  return join(getItemDir(itemId), 'workspace', repoName);
 }
 
 export function getRepositoriesPath(): string {
