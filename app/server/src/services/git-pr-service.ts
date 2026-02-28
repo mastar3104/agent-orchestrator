@@ -125,7 +125,9 @@ async function getDefaultBranch(cwd: string): Promise<string | null> {
 export async function createDraftPrForRepo(
   itemId: string,
   repo: ItemRepositoryConfig,
-  itemName: string
+  itemName: string,
+  description: string,
+  designDoc?: string
 ): Promise<{ prUrl: string; prNumber: number } | null> {
   const repoDir = getRepoWorkspaceDir(itemId, repo.name);
   const eventsPath = getItemEventsPath(itemId);
@@ -198,20 +200,11 @@ export async function createDraftPrForRepo(
   }
 
   // Draft PR作成
-  const prTitle = `[Draft] ${itemName}`;
-  const prBody = `## Summary
-
-Automated implementation by agent-orch.
-
-**Item:** ${itemId}
-**Repository:** ${repo.name} (${repo.role})
-
----
-
-@${ghUsername} セルフレビューをお願いします。
-
----
-*This PR was automatically created by agent-orch*`;
+  const prTitle = `${itemName}`;
+  const designDocSection = designDoc
+    ? `\n\n## Design Doc\n\n${designDoc}\n`
+    : '';
+  const prBody = `## Description\n\n${description}\n${designDocSection}\n---\n*This PR was automatically created by agent-orch*`;
 
   const baseBranch = repo.branch || 'main';
   let prInfo: { number: number; url: string };
@@ -267,7 +260,7 @@ export async function createDraftPrsForAllRepos(
 
   for (const repo of config.repositories) {
     try {
-      const result = await createDraftPrForRepo(itemId, repo, config.name);
+      const result = await createDraftPrForRepo(itemId, repo, config.name, config.description, config.designDoc);
       if (result) {
         results.push({ repoName: repo.name, prUrl: result.prUrl, prNumber: result.prNumber, noChanges: false });
       } else {
