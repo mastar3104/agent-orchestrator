@@ -71,6 +71,7 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
         submodules: savedRepo.submodules,
         linkMode: savedRepo.linkMode,
         allowedTools: repoInput.allowedTools || savedRepo.allowedTools,
+        hooks: savedRepo.hooks,
       };
     } else if (repoInput.repository) {
       // Use directly provided repository config
@@ -84,6 +85,7 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
         submodules: repoInput.repository.submodules,
         linkMode: repoInput.repository.linkMode,
         allowedTools: repoInput.allowedTools || repoInput.repository.allowedTools,
+        hooks: repoInput.repository.hooks,
       };
 
       // Optionally save the repository for reuse
@@ -98,6 +100,7 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
           linkMode: repoInput.repository.linkMode,
           directoryName: repoInput.name,
           allowedTools: repoConfig.allowedTools,
+          hooks: repoConfig.hooks,
         });
       }
     } else {

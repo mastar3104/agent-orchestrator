@@ -1,7 +1,4 @@
 import { existsSync } from 'fs';
-import { rename } from 'fs/promises';
-import { join, dirname } from 'path';
-import { randomBytes } from 'crypto';
 import type {
   ItemEvent,
   PrCreatedEvent,
@@ -22,6 +19,7 @@ import type { Plan } from '@agent-orch/shared';
 import { readFile } from 'fs/promises';
 import { type ReviewReceiverResponse } from '../lib/claude-schemas';
 import { getRole } from '../lib/role-loader';
+import { archiveCurrentPlan } from './planner-service';
 
 /**
  * 指定されたItemのPR情報を取得する（repoName でフィルタ可能）
@@ -78,32 +76,6 @@ async function getCommentsCutoffAt(
   }
 
   return null;
-}
-
-/**
- * 現在のplan.yamlをアーカイブ
- */
-async function archiveCurrentPlan(itemId: string): Promise<string[]> {
-  const archivedPaths: string[] = [];
-
-  const now = new Date();
-  const timestamp = now
-    .toISOString()
-    .replace(/[-:]/g, '')
-    .replace('T', '_')
-    .replace(/\.\d{3}Z$/, `_${String(now.getMilliseconds()).padStart(3, '0')}`);
-
-  const randomSuffix = randomBytes(3).toString('hex');
-  const archiveFilename = `plan_${timestamp}_${randomSuffix}.yaml`;
-
-  const planPath = getItemPlanPath(itemId);
-  if (existsSync(planPath)) {
-    const archivePath = join(dirname(planPath), archiveFilename);
-    await rename(planPath, archivePath);
-    archivedPaths.push(archivePath);
-  }
-
-  return archivedPaths;
 }
 
 /**

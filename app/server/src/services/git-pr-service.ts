@@ -350,7 +350,8 @@ export async function fetchPrComments(
  * 全リポジトリのDraft PRを作成する
  */
 export async function createDraftPrsForAllRepos(
-  itemId: string
+  itemId: string,
+  successfulRepos?: Set<string>
 ): Promise<{ results: Array<{ repoName: string; prUrl?: string; prNumber?: number; noChanges: boolean }> }> {
   const config = await getItemConfig(itemId);
   if (!config) {
@@ -360,6 +361,10 @@ export async function createDraftPrsForAllRepos(
   const results: Array<{ repoName: string; prUrl?: string; prNumber?: number; noChanges: boolean }> = [];
 
   for (const repo of config.repositories) {
+    if (successfulRepos && !successfulRepos.has(repo.name)) {
+      console.log(`[${itemId}/${repo.name}] Skipping PR creation (hooks failed or not in successful repos)`);
+      continue;
+    }
     try {
       const result = await createDraftPrForRepo(itemId, repo, config.name, config.description, config.designDoc);
       if (result) {

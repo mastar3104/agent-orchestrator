@@ -16,6 +16,7 @@ interface RepoFormData {
   linkMode: LinkMode;
   directoryName: string;
   allowedTools: string;
+  hooks: string;
 }
 
 const emptyForm: RepoFormData = {
@@ -28,6 +29,7 @@ const emptyForm: RepoFormData = {
   linkMode: 'symlink',
   directoryName: '',
   allowedTools: '',
+  hooks: '',
 };
 
 function repoToForm(repo: GitRepository): RepoFormData {
@@ -41,6 +43,7 @@ function repoToForm(repo: GitRepository): RepoFormData {
     linkMode: repo.linkMode || 'symlink',
     directoryName: repo.directoryName || '',
     allowedTools: (repo.allowedTools || []).join(', '),
+    hooks: (repo.hooks || []).join('\n'),
   };
 }
 
@@ -62,6 +65,11 @@ export function RepositoriesPage() {
     return tools.length > 0 ? tools : undefined;
   };
 
+  const parseHooks = (raw: string): string[] | undefined => {
+    const hooks = raw.split('\n').map(h => h.trim()).filter(h => h.length > 0);
+    return hooks.length > 0 ? hooks : undefined;
+  };
+
   const handleCreate = async () => {
     setSaving(true);
     setFormError(null);
@@ -76,6 +84,7 @@ export function RepositoriesPage() {
         linkMode: form.type === 'local' ? form.linkMode : undefined,
         directoryName: form.directoryName || undefined,
         allowedTools: parseAllowedTools(form.allowedTools),
+        hooks: parseHooks(form.hooks),
       };
       await create(data);
       setShowCreate(false);
@@ -99,6 +108,7 @@ export function RepositoriesPage() {
         linkMode: form.linkMode,
         directoryName: form.directoryName || undefined,
         allowedTools: parseAllowedTools(form.allowedTools),
+        hooks: parseHooks(form.hooks),
       };
       await update(editingId, data);
       setEditingId(null);
@@ -258,6 +268,20 @@ export function RepositoriesPage() {
         </p>
       </div>
 
+      <div>
+        <label className="block text-xs font-medium text-gray-400 mb-1">Post-Engineer Hooks</label>
+        <textarea
+          value={form.hooks}
+          onChange={e => updateField('hooks', e.target.value)}
+          rows={3}
+          className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm font-mono focus:outline-none focus:border-blue-500"
+          placeholder={"npm run lint\nnpm test"}
+        />
+        <p className="text-xs text-gray-500 mt-0.5">
+          1行1コマンド。Engineer完了後に順次実行し、失敗時は自動修正を試みます。全リトライ失敗時はエラーで停止します。
+        </p>
+      </div>
+
       <div className="flex justify-end gap-2 pt-2">
         <button
           type="button"
@@ -345,6 +369,11 @@ export function RepositoriesPage() {
                         }`}>
                           {repo.type}
                         </span>
+                        {repo.hooks && repo.hooks.length > 0 && (
+                          <span className="px-2 py-0.5 rounded text-xs bg-purple-900/50 text-purple-300">
+                            {repo.hooks.length} hook{repo.hooks.length > 1 ? 's' : ''}
+                          </span>
+                        )}
                       </div>
                       <div className="text-xs text-gray-400 space-y-1">
                         {repo.type === 'remote' && repo.url && (

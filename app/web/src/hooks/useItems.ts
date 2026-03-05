@@ -50,6 +50,8 @@ export function useItem(id: string | undefined) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reviewReceiveError, setReviewReceiveError] = useState<string | null>(null);
+  const [planFeedbackSubmitting, setPlanFeedbackSubmitting] = useState(false);
+  const [planFeedbackError, setPlanFeedbackError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!id) return;
@@ -88,6 +90,22 @@ export function useItem(id: string | undefined) {
     await refresh();
   };
 
+  const submitPlanFeedback = async (feedbacks: { taskId: string; feedback: string }[]) => {
+    if (!id) return;
+    setPlanFeedbackSubmitting(true);
+    setPlanFeedbackError(null);
+    try {
+      await api.submitPlanFeedback(id, feedbacks);
+      await refresh();
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to submit plan feedback';
+      setPlanFeedbackError(message);
+    } finally {
+      setPlanFeedbackSubmitting(false);
+    }
+  };
+
   const startReviewReceive = async (repoName?: string) => {
     if (!id) return;
     setReviewReceiveError(null);
@@ -111,5 +129,8 @@ export function useItem(id: string | undefined) {
     stopAgent,
     startReviewReceive,
     reviewReceiveError,
+    submitPlanFeedback,
+    planFeedbackSubmitting,
+    planFeedbackError,
   };
 }

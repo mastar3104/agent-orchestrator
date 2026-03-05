@@ -173,6 +173,20 @@ export async function updateRolesYaml(content: string): Promise<{ content: strin
   });
 }
 
+// Plan Feedback
+export async function submitPlanFeedback(
+  itemId: string,
+  feedbacks: { taskId: string; feedback: string }[]
+): Promise<{ started: boolean }> {
+  return request<{ started: boolean }>(
+    `/items/${itemId}/plan/feedback`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ feedbacks }),
+    }
+  );
+}
+
 // Review Receive
 export async function startReviewReceive(
   itemId: string,

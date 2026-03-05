@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import type { ItemEvent, ReviewFindingsExtractedEvent } from '@agent-orch/shared';
 import { useItem } from '../hooks/useItems';
@@ -19,6 +19,9 @@ export function ItemDetailPage() {
     stopAgent,
     startReviewReceive,
     reviewReceiveError,
+    submitPlanFeedback,
+    planFeedbackSubmitting,
+    planFeedbackError,
   } = useItem(id);
   const [recentEvents, setRecentEvents] = useState<ItemEvent[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
@@ -29,6 +32,36 @@ export function ItemDetailPage() {
   const [planLoading, setPlanLoading] = useState(false);
   const [planSaving, setPlanSaving] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
+  const [feedbackRows, setFeedbackRows] = useState<{ taskId: string; feedback: string }[]>([{ taskId: '', feedback: '' }]);
+  const [feedbackLocalError, setFeedbackLocalError] = useState<string | null>(null);
+  const [planUpdatedBanner, setPlanUpdatedBanner] = useState(false);
+
+  const loadPlanContent = useCallback(async () => {
+    if (!id) return;
+    setPlanLoading(true);
+    setPlanError(null);
+    try {
+      const result = await api.getPlanContent(id);
+      const content = result.content ?? '';
+      setPlanContent(content);
+      setPlanOriginal(content);
+      setPlanLoaded(true);
+    } catch (err) {
+      setPlanError(err instanceof Error ? err.message : 'Failed to load plan');
+    } finally {
+      setPlanLoading(false);
+    }
+  }, [id]);
+
+  const planDirty = planContent !== planOriginal;
+
+  // Use refs so handleEvent always sees current values without re-creating
+  const planEditorOpenRef = useRef(planEditorOpen);
+  const planDirtyRef = useRef(planDirty);
+  const loadPlanContentRef = useRef(loadPlanContent);
+  useEffect(() => { planEditorOpenRef.current = planEditorOpen; }, [planEditorOpen]);
+  useEffect(() => { planDirtyRef.current = planDirty; }, [planDirty]);
+  useEffect(() => { loadPlanContentRef.current = loadPlanContent; }, [loadPlanContent]);
 
   const handleEvent = useCallback((event: ItemEvent) => {
     setRecentEvents((prev) => [...prev.slice(-100), event]);
@@ -48,29 +81,20 @@ export function ItemDetailPage() {
     ) {
       refresh();
     }
+    // Auto-reload plan editor on plan_created
+    if (event.type === 'plan_created' && planEditorOpenRef.current) {
+      if (!planDirtyRef.current) {
+        loadPlanContentRef.current();
+      } else {
+        setPlanUpdatedBanner(true);
+      }
+    }
   }, [refresh]);
 
   const { isConnected } = useWebSocket({
     itemId: id,
     onEvent: handleEvent,
   });
-
-  const loadPlanContent = useCallback(async () => {
-    if (!id) return;
-    setPlanLoading(true);
-    setPlanError(null);
-    try {
-      const result = await api.getPlanContent(id);
-      const content = result.content ?? '';
-      setPlanContent(content);
-      setPlanOriginal(content);
-      setPlanLoaded(true);
-    } catch (err) {
-      setPlanError(err instanceof Error ? err.message : 'Failed to load plan');
-    } finally {
-      setPlanLoading(false);
-    }
-  }, [id]);
 
   const handleOpenPlanEditor = useCallback(async () => {
     setPlanEditorOpen(true);
@@ -94,8 +118,6 @@ export function ItemDetailPage() {
       setPlanSaving(false);
     }
   }, [id, planContent, refresh]);
-
-  const planDirty = planContent !== planOriginal;
 
   if (loading) {
     return (
@@ -295,6 +317,97 @@ export function ItemDetailPage() {
               )}
               {planError && (
                 <div className="text-xs text-red-400">{planError}</div>
+              )}
+              {planUpdatedBanner && (
+                <div className="flex items-center gap-3 bg-blue-900/50 border border-blue-500/50 rounded px-3 py-2 text-sm text-blue-300">
+                  <span>Plan has been updated. Reload?</span>
+                  <button
+                    onClick={() => {
+                      loadPlanContent();
+                      setPlanUpdatedBanner(false);
+                    }}
+                    className="px-2 py-0.5 bg-blue-600 text-white rounded text-xs hover:bg-blue-500"
+                  >
+                    Reload
+                  </button>
+                  <button
+                    onClick={() => setPlanUpdatedBanner(false)}
+                    className="px-2 py-0.5 bg-gray-700 text-gray-300 rounded text-xs hover:bg-gray-600"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+              {/* Plan Feedback Form */}
+              {item.plan && item.plan.tasks.length > 0 && (
+                <div className="border border-gray-700 rounded p-3 space-y-2">
+                  <h5 className="text-xs font-medium text-gray-400">Plan Feedback</h5>
+                  {feedbackRows.map((row, idx) => (
+                    <div key={idx} className="flex gap-2 items-start">
+                      <select
+                        value={row.taskId}
+                        onChange={(e) => {
+                          const updated = [...feedbackRows];
+                          updated[idx] = { ...updated[idx], taskId: e.target.value };
+                          setFeedbackRows(updated);
+                        }}
+                        className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 min-w-[140px]"
+                      >
+                        <option value="">Select task...</option>
+                        {item.plan!.tasks.map(t => (
+                          <option key={t.id} value={t.id}>{t.id}</option>
+                        ))}
+                      </select>
+                      <textarea
+                        value={row.feedback}
+                        onChange={(e) => {
+                          const updated = [...feedbackRows];
+                          updated[idx] = { ...updated[idx], feedback: e.target.value };
+                          setFeedbackRows(updated);
+                        }}
+                        placeholder="Feedback..."
+                        className="flex-1 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 min-h-[32px]"
+                        rows={1}
+                      />
+                      <button
+                        onClick={() => {
+                          const updated = feedbackRows.filter((_, i) => i !== idx);
+                          setFeedbackRows(updated.length === 0 ? [{ taskId: '', feedback: '' }] : updated);
+                        }}
+                        className="text-gray-500 hover:text-red-400 text-xs px-1"
+                      >
+                        x
+                      </button>
+                    </div>
+                  ))}
+                  <div className="flex gap-2 items-center">
+                    <button
+                      onClick={() => setFeedbackRows([...feedbackRows, { taskId: '', feedback: '' }])}
+                      className="px-2 py-0.5 bg-gray-700 text-gray-300 rounded text-xs hover:bg-gray-600"
+                    >
+                      + Add Row
+                    </button>
+                    <button
+                      onClick={async () => {
+                        setFeedbackLocalError(null);
+                        const valid = feedbackRows.filter(r => r.taskId && r.feedback.trim());
+                        if (valid.length === 0) {
+                          setFeedbackLocalError('No valid feedback provided');
+                          return;
+                        }
+                        await submitPlanFeedback(valid);
+                        setFeedbackRows([{ taskId: '', feedback: '' }]);
+                      }}
+                      disabled={planFeedbackSubmitting || feedbackRows.every(r => !r.taskId || !r.feedback.trim())}
+                      className="px-2 py-0.5 bg-purple-600 text-white rounded text-xs hover:bg-purple-500 disabled:opacity-50"
+                    >
+                      {planFeedbackSubmitting ? 'Submitting...' : 'Submit Feedback'}
+                    </button>
+                  </div>
+                  {(feedbackLocalError || planFeedbackError) && (
+                    <div className="text-xs text-red-400">{feedbackLocalError || planFeedbackError}</div>
+                  )}
+                </div>
               )}
             </div>
           )}

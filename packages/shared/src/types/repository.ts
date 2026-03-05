@@ -10,6 +10,8 @@ export interface GitRepository {
   directoryName?: string;  // ディレクトリ名 (e.g., "frontend")
   /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
   allowedTools?: string[];
+  /** Engineer完了後に順次実行するバリデーションコマンド。失敗時は自動修正を試みる。 */
+  hooks?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -25,6 +27,7 @@ export interface CreateRepositoryRequest {
   directoryName?: string;
   /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
   allowedTools?: string[];
+  hooks?: string[];
 }
 
 export interface UpdateRepositoryRequest {
@@ -35,6 +38,7 @@ export interface UpdateRepositoryRequest {
   directoryName?: string;
   /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
   allowedTools?: string[];
+  hooks?: string[];
 }
 
 // API Response types

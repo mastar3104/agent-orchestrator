@@ -21,7 +21,8 @@ export type EventType =
   | 'repo_no_changes'
   | 'review_findings_extracted'
   | 'review_receive_started'
-  | 'review_receive_completed';
+  | 'review_receive_completed'
+  | 'hooks_executed';
 
 export interface BaseEvent {
   id: string;
@@ -222,6 +223,24 @@ export interface ClaudeExecutionEvent extends BaseEvent {
   success: boolean;
 }
 
+export interface HookResult {
+  command: string;
+  exitCode: number | null;
+  stderr: string;
+  stdout: string;
+  durationMs: number;
+  timedOut: boolean;
+  signal?: string;
+}
+
+export interface HooksExecutedEvent extends BaseEvent {
+  type: 'hooks_executed';
+  repoName: string;
+  results: HookResult[];
+  allPassed: boolean;
+  attempt: number;
+}
+
 export type AgentEvent =
   | AgentStartedEvent
   | AgentExitedEvent
@@ -250,4 +269,5 @@ export type ItemEvent =
   | ReviewReceiveStartedEvent
   | ReviewReceiveCompletedEvent
   | ClaudeExecutionEvent
+  | HooksExecutedEvent
   | AgentEvent;

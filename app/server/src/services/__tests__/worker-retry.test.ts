@@ -30,6 +30,11 @@ vi.mock('../../lib/paths', () => ({
   getWorkspaceRoot: vi.fn().mockReturnValue('/workspace'),
   getRepoWorkspaceDir: vi.fn((_itemId: string, repoName: string) => `/workspace/${repoName}`),
   getItemEventsPath: vi.fn().mockReturnValue('/events.jsonl'),
+  getItemPlanPath: vi.fn().mockReturnValue('/plan.yaml'),
+}));
+
+vi.mock('fs/promises', () => ({
+  readFile: vi.fn().mockResolvedValue('tasks:\n  - id: T1\n    title: Test Task'),
 }));
 
 vi.mock('../event-bus', () => ({
@@ -43,6 +48,8 @@ vi.mock('../../lib/jsonl', () => ({
 vi.mock('../../lib/events', () => ({
   createReviewFindingsExtractedEvent: vi.fn().mockReturnValue({ type: 'review' }),
   createStatusChangedEvent: vi.fn().mockReturnValue({ type: 'status' }),
+  createHooksExecutedEvent: vi.fn().mockReturnValue({ type: 'hooks_executed' }),
+  createErrorEvent: vi.fn().mockReturnValue({ type: 'error' }),
 }));
 
 vi.mock('../../lib/role-loader', () => ({
@@ -69,7 +76,17 @@ vi.mock('child_process', () => {
         } else if (args[0] === 'merge-base') {
           proc.stdout.emit('data', 'base123');
         } else if (args[0] === 'diff') {
-          proc.stdout.emit('data', 'diff content');
+          if (args.includes('--name-status')) {
+            proc.stdout.emit('data', 'M\tfile.ts');
+          } else if (args.includes('--numstat')) {
+            proc.stdout.emit('data', '10\t5\tfile.ts');
+          } else {
+            proc.stdout.emit('data', 'diff content');
+          }
+        } else if (args[0] === 'show') {
+          proc.stdout.emit('data', '// file content');
+        } else if (args[0] === 'cat-file') {
+          proc.stdout.emit('data', '1024');
         }
         proc.emit('close', 0);
       }, 0);
@@ -276,7 +293,7 @@ describe('Worker retry logic', () => {
     });
   });
 
-  it('should include initial and post-initial diff sections in reviewer prompt', async () => {
+  it('should include plan and changed files sections in reviewer prompt', async () => {
     mockExecuteAgent
       .mockResolvedValueOnce(successResult() as any) // Phase 1 engineer
       .mockResolvedValueOnce({
@@ -291,7 +308,8 @@ describe('Worker retry logic', () => {
     expect(reviewerCall).toBeDefined();
 
     const prompt = reviewerCall?.[0].prompt as string;
-    expect(prompt).toContain('### Initial Implementation Diff');
-    expect(prompt).toContain('### Post-Initial Fixes Diff (e.g. hooks/review follow-ups)');
+    expect(prompt).toContain('## Plan');
+    expect(prompt).toContain('## Changed Files');
+    expect(prompt).toContain('## Implemented Tasks');
   });
 });

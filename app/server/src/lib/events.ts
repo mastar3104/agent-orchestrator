@@ -26,6 +26,8 @@ import type {
   ReviewFindingsExtractedEvent,
   ReviewReceiveStartedEvent,
   ReviewReceiveCompletedEvent,
+  HooksExecutedEvent,
+  HookResult,
 } from '@agent-orch/shared';
 
 function createEventId(): string {
@@ -420,6 +422,25 @@ export function createReviewReceiveCompletedEvent(
     totalComments,
     newComments,
     filteredComments,
+  };
+}
+
+export function createHooksExecutedEvent(
+  itemId: string,
+  repoName: string,
+  results: HookResult[],
+  allPassed: boolean,
+  attempt: number
+): HooksExecutedEvent {
+  return {
+    id: createEventId(),
+    type: 'hooks_executed',
+    timestamp: timestamp(),
+    itemId,
+    repoName,
+    results,
+    allPassed,
+    attempt,
   };
 }
 

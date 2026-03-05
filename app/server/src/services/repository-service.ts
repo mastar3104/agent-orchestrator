@@ -51,6 +51,7 @@ export async function createRepository(
     linkMode: request.linkMode,
     directoryName: request.directoryName,
     allowedTools: sanitizedTools,
+    hooks: request.hooks,
     createdAt: now,
     updatedAt: now,
   };

@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import { readFile } from 'fs/promises';
 import { resolve } from 'path';
 import type { Plan, PlanTask, AgentRole, ItemRepositoryConfig } from '@agent-orch/shared';
 import { isDevRole } from '@agent-orch/shared';
@@ -12,10 +13,11 @@ import {
   stopAllGitSnapshots,
 } from './git-snapshot-service';
 import { createDraftPrsForAllRepos } from './git-pr-service';
-import { getWorkspaceRoot, getRepoWorkspaceDir, getItemEventsPath } from '../lib/paths';
+import { getWorkspaceRoot, getRepoWorkspaceDir, getItemEventsPath, getItemPlanPath } from '../lib/paths';
 import { eventBus } from './event-bus';
 import { appendJsonl } from '../lib/jsonl';
-import { createReviewFindingsExtractedEvent, createStatusChangedEvent } from '../lib/events';
+import { createReviewFindingsExtractedEvent, createStatusChangedEvent, createHooksExecutedEvent, createErrorEvent } from '../lib/events';
+import type { HookResult } from '@agent-orch/shared';
 import {
   type EngineerResponse,
   type ReviewerResponse,
@@ -28,6 +30,9 @@ const MAX_DIFF_LINES = 20000;
 const REVIEW_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const ENGINEER_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes
 const AGENT_MAX_RETRIES = 1;
+const MAX_HOOKS_RETRIES = 2;
+const HOOK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per command
+const MAX_OUTPUT_LENGTH = 2000;
 
 function getRoleDescription(role: string): string {
   const descriptions: Record<string, string> = {
@@ -99,6 +104,140 @@ interface EngineerPhaseResult {
   initialHead: string;
 }
 
+// ─── Hooks execution ───
+
+function truncateOutput(output: string, maxLength: number = MAX_OUTPUT_LENGTH): string {
+  if (output.length <= maxLength) return output;
+  return output.slice(0, maxLength) + '...(truncated)';
+}
+
+async function runHooks(
+  commands: string[],
+  cwd: string,
+  timeoutMs: number = HOOK_TIMEOUT_MS
+): Promise<HookResult[]> {
+  const results: HookResult[] = [];
+
+  for (const command of commands) {
+    const startTime = Date.now();
+    try {
+      const result = await new Promise<HookResult>((resolve) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+        const proc = spawn('sh', ['-c', command], {
+          cwd,
+          stdio: 'pipe',
+          signal: controller.signal,
+        });
+
+        let stdout = '';
+        let stderr = '';
+        proc.stdout?.on('data', (d) => {
+          stdout += d.toString();
+          if (stdout.length > MAX_OUTPUT_LENGTH * 2) {
+            stdout = stdout.slice(0, MAX_OUTPUT_LENGTH * 2);
+          }
+        });
+        proc.stderr?.on('data', (d) => {
+          stderr += d.toString();
+          if (stderr.length > MAX_OUTPUT_LENGTH * 2) {
+            stderr = stderr.slice(0, MAX_OUTPUT_LENGTH * 2);
+          }
+        });
+
+        proc.on('close', (code, signal) => {
+          clearTimeout(timer);
+          resolve({
+            command,
+            exitCode: code,
+            stderr: truncateOutput(stderr),
+            stdout: truncateOutput(stdout),
+            durationMs: Date.now() - startTime,
+            timedOut: false,
+            signal: signal || undefined,
+          });
+        });
+
+        proc.on('error', (err) => {
+          clearTimeout(timer);
+          const isAbort = err.name === 'AbortError' || (err as any).code === 'ABORT_ERR';
+          resolve({
+            command,
+            exitCode: null,
+            stderr: truncateOutput(isAbort ? `Timed out after ${timeoutMs}ms` : err.message),
+            stdout: truncateOutput(stdout),
+            durationMs: Date.now() - startTime,
+            timedOut: isAbort,
+            signal: isAbort ? 'SIGTERM' : undefined,
+          });
+        });
+      });
+
+      results.push(result);
+    } catch (err) {
+      results.push({
+        command,
+        exitCode: null,
+        stderr: truncateOutput(err instanceof Error ? err.message : String(err)),
+        stdout: '',
+        durationMs: Date.now() - startTime,
+        timedOut: false,
+      });
+    }
+  }
+
+  return results;
+}
+
+function buildHooksFixPrompt(
+  plan: Plan,
+  repoName: string,
+  hookResults: HookResult[],
+  tasks: PlanTask[]
+): string {
+  const role = getRole('engineer');
+
+  const taskList = tasks
+    .map(t => `- ${t.id}: ${t.title}\n  ${t.description}`)
+    .join('\n');
+
+  const failedHooks = hookResults
+    .filter(r => r.exitCode !== 0)
+    .map(r => {
+      const parts = [`Command: ${r.command}`, `Exit code: ${r.exitCode}`];
+      if (r.timedOut) parts.push('(TIMED OUT)');
+      if (r.stderr) parts.push(`Stderr:\n${r.stderr}`);
+      if (r.stdout) parts.push(`Stdout:\n${r.stdout}`);
+      return parts.join('\n');
+    })
+    .join('\n\n---\n\n');
+
+  const context = `## Working on: ${repoName}
+
+## Original Tasks
+${taskList}
+
+## Hook Validation Failures
+The following validation commands failed after your implementation.
+Please fix the issues and commit your changes.
+
+${failedHooks}
+
+## Instructions
+Please fix all issues reported by the hooks above and create a new commit.
+Follow the same commit rules as before:
+- NEVER use git add -A or git add .
+- Only commit files you actually modified
+- Run: git add <specific files>
+- Run: git commit -m "fix(<scope>): address hook validation failures"
+
+Return a JSON response with {"status": "success", "files_modified": ["path/to/file1"]} when done.
+If you encounter an error, return {"status": "failure", "files_modified": []}.`;
+
+  return `${role.promptTemplate}\n\n${context}`;
+}
+
 // ─── Main orchestration ───
 
 export async function startWorkers(itemId: string): Promise<void> {
@@ -133,6 +272,7 @@ export async function startWorkers(itemId: string): Promise<void> {
 
   // ─── Phase 1: Dev Workers (parallel per repo) ───
   const engineerResults = new Map<string, EngineerPhaseResult>();
+  const hooksFailedRepos = new Set<string>();
 
   const savedPhaseBases = new Map<string, string>();
   const devPromises: Promise<void>[] = [];
@@ -185,6 +325,68 @@ export async function startWorkers(itemId: string): Promise<void> {
             // Keep phaseBase as a safe fallback.
           }
 
+          // ─── Hooks execution ───
+          const hooks = repo.hooks;
+          if (hooks && hooks.length > 0) {
+            let hooksPassed = false;
+            for (let hookAttempt = 1; hookAttempt <= MAX_HOOKS_RETRIES; hookAttempt++) {
+              console.log(`[${itemId}/${repo.name}] Running hooks (attempt ${hookAttempt}/${MAX_HOOKS_RETRIES})`);
+              const hookResults = await runHooks(hooks, agentWorkdir);
+              const allPassed = hookResults.every(r => r.exitCode === 0);
+
+              const hooksEvent = createHooksExecutedEvent(itemId, repo.name, hookResults, allPassed, hookAttempt);
+              await appendJsonl(getItemEventsPath(itemId), hooksEvent);
+              eventBus.publish(itemId, hooksEvent);
+
+              if (allPassed) {
+                console.log(`[${itemId}/${repo.name}] All hooks passed on attempt ${hookAttempt}`);
+                hooksPassed = true;
+                break;
+              }
+
+              console.warn(`[${itemId}/${repo.name}] Hooks failed on attempt ${hookAttempt}/${MAX_HOOKS_RETRIES}`);
+
+              if (hookAttempt < MAX_HOOKS_RETRIES) {
+                // Re-run engineer with fix prompt
+                const fixPrompt = buildHooksFixPrompt(plan, repo.name, hookResults, devTasks);
+                try {
+                  await executeAgent<EngineerResponse>({
+                    itemId,
+                    role: 'engineer',
+                    repoName: repo.name,
+                    prompt: fixPrompt,
+                    workingDir: agentWorkdir,
+                    allowedTools: effectiveTools,
+                    jsonSchema: engineerRole.jsonSchema,
+                    timeoutMs: ENGINEER_TIMEOUT_MS,
+                  });
+                } catch (fixError) {
+                  const fixMsg = fixError instanceof Error ? fixError.message : String(fixError);
+                  console.error(`[${itemId}/${repo.name}] Hooks fix engineer failed: ${fixMsg}`);
+                }
+              }
+            }
+
+            if (!hooksPassed) {
+              console.error(`[${itemId}/${repo.name}] Hooks failed after ${MAX_HOOKS_RETRIES} attempts, skipping repo`);
+              hooksFailedRepos.add(repo.name);
+              const errorEvent = createErrorEvent(
+                itemId,
+                `Hooks validation failed for ${repo.name} after ${MAX_HOOKS_RETRIES} attempts`
+              );
+              await appendJsonl(getItemEventsPath(itemId), errorEvent);
+              eventBus.publish(itemId, errorEvent);
+              break; // Don't set engineerResults → skip review/PR
+            }
+
+            // Update initialHead after hooks fixes
+            try {
+              initialHead = await getGitHead(agentWorkdir);
+            } catch {
+              // Keep previous value
+            }
+          }
+
           engineerResults.set(repo.name, {
             response: result.output,
             reviewBase,
@@ -210,11 +412,12 @@ export async function startWorkers(itemId: string): Promise<void> {
   if (devPromises.length > 0) {
     await Promise.allSettled(devPromises);
 
-    // Retry failed repos (repos that didn't produce results after initial attempts)
+    // Retry failed repos (repos where engineer itself failed, NOT hooks-exhausted repos)
     const failedRepos = itemConfig.repositories.filter(
       repo => tasksByRepo.has(repo.name) &&
               (tasksByRepo.get(repo.name)?.some(t => isDevRole(t.agent)) ?? false) &&
-              !engineerResults.has(repo.name)
+              !engineerResults.has(repo.name) &&
+              !hooksFailedRepos.has(repo.name)
     );
 
     for (const repo of failedRepos) {
@@ -247,6 +450,59 @@ export async function startWorkers(itemId: string): Promise<void> {
         } catch {
           // Keep phaseBase as a safe fallback.
         }
+        // Run hooks if configured (this repo only enters retry because engineer itself failed,
+        // not because hooks were exhausted — hooksFailedRepos are excluded above)
+        const hooks = repo.hooks;
+        if (hooks && hooks.length > 0) {
+          let hooksPassed = false;
+          for (let hookAttempt = 1; hookAttempt <= MAX_HOOKS_RETRIES; hookAttempt++) {
+            console.log(`[${itemId}/${repo.name}] Running hooks after engineer retry (attempt ${hookAttempt}/${MAX_HOOKS_RETRIES})`);
+            const hookResults = await runHooks(hooks, agentWorkdir);
+            const allPassed = hookResults.every(r => r.exitCode === 0);
+
+            const hooksEvent = createHooksExecutedEvent(itemId, repo.name, hookResults, allPassed, hookAttempt);
+            await appendJsonl(getItemEventsPath(itemId), hooksEvent);
+            eventBus.publish(itemId, hooksEvent);
+
+            if (allPassed) {
+              hooksPassed = true;
+              break;
+            }
+
+            if (hookAttempt < MAX_HOOKS_RETRIES) {
+              const fixPrompt = buildHooksFixPrompt(plan, repo.name, hookResults, devTasks);
+              try {
+                await executeAgent<EngineerResponse>({
+                  itemId, role: 'engineer', repoName: repo.name, prompt: fixPrompt,
+                  workingDir: agentWorkdir, allowedTools: effectiveTools,
+                  jsonSchema: engineerRole.jsonSchema, timeoutMs: ENGINEER_TIMEOUT_MS,
+                });
+              } catch (fixError) {
+                const fixMsg = fixError instanceof Error ? fixError.message : String(fixError);
+                console.error(`[${itemId}/${repo.name}] Hooks fix engineer failed: ${fixMsg}`);
+              }
+            }
+          }
+
+          if (!hooksPassed) {
+            console.error(`[${itemId}/${repo.name}] Hooks failed after engineer retry, skipping repo`);
+            hooksFailedRepos.add(repo.name);
+            const errorEvent = createErrorEvent(
+              itemId,
+              `Hooks validation failed for ${repo.name} after ${MAX_HOOKS_RETRIES} attempts`
+            );
+            await appendJsonl(getItemEventsPath(itemId), errorEvent);
+            eventBus.publish(itemId, errorEvent);
+            continue; // Skip this repo
+          }
+
+          try {
+            initialHead = await getGitHead(agentWorkdir);
+          } catch {
+            // Keep previous value
+          }
+        }
+
         engineerResults.set(repo.name, { response: result.output, reviewBase, phaseBase, initialHead });
         console.log(`[${itemId}/${repo.name}] Engineer retry succeeded`);
       } catch (retryError) {
@@ -290,32 +546,13 @@ export async function startWorkers(itemId: string): Promise<void> {
       // Run reviewer with retry + graceful skip
       const devTasks = tasksByRepo.get(repo.name)?.filter(t => isDevRole(t.agent)) || [];
       const reviewerRole = getRole('reviewer');
-      let initialImplementationDiff = '<unable to generate initial implementation diff>';
-      try {
-        initialImplementationDiff = await getGitDiff(agentWorkdir, phaseBase, initialHead);
-      } catch {
-        // Keep placeholder string.
-      }
 
-      let followupDiff = '<no additional fixes after the initial implementation>';
-      if (initialHead !== currentHead) {
-        try {
-          followupDiff = await getGitDiff(agentWorkdir, initialHead, currentHead);
-        } catch {
-          followupDiff = '<unable to generate post-initial fixes diff>';
-        }
-      }
-
-      const includeCombinedFallback =
-        initialImplementationDiff.startsWith('<unable') || followupDiff.startsWith('<unable');
-
-      const reviewContext = buildReviewContext(
+      const reviewContext = await buildReviewContext(
+        itemId,
         repo.name,
-        {
-          initialImplementationDiff,
-          followupDiff,
-          combinedDiff: includeCombinedFallback ? reviewDiff : undefined,
-        },
+        agentWorkdir,
+        reviewBase,
+        currentHead,
         devTasks
       );
       const reviewPrompt = `${reviewerRole.promptTemplate}\n\n${reviewContext}`;
@@ -448,7 +685,7 @@ export async function startWorkers(itemId: string): Promise<void> {
   }
 
   // ─── Phase 3: Push & PR ───
-  await createDraftPrsForAllRepos(itemId);
+  await createDraftPrsForAllRepos(itemId, new Set(engineerResults.keys()));
 }
 
 export async function startWorkerForRepo(
@@ -547,45 +784,182 @@ ${filesStr}
 ${depsStr}`;
 }
 
-function buildReviewContext(
+const MAX_FILE_LINES = 500;
+const MAX_FILE_CHARS = 50000;
+const MAX_TOTAL_LINES = 20000;
+const MAX_TOTAL_CHARS = 500000;
+
+interface ChangedFileInfo {
+  status: string; // A, M, D, R, C, T, etc.
+  path: string;
+  oldPath?: string; // for renames
+}
+
+async function getChangedFiles(cwd: string, base: string, head: string): Promise<ChangedFileInfo[]> {
+  const output = await execGit(['diff', '--name-status', base, head], cwd);
+  if (!output.trim()) return [];
+
+  return output.trim().split('\n').map(line => {
+    const parts = line.split('\t');
+    const statusCode = parts[0][0]; // First char (R100 -> R)
+    if (statusCode === 'R' || statusCode === 'C') {
+      return { status: statusCode, oldPath: parts[1], path: parts[2] };
+    }
+    return { status: statusCode, path: parts[1] };
+  });
+}
+
+async function getBinaryFiles(cwd: string, base: string, head: string): Promise<Set<string>> {
+  const output = await execGit(['diff', '--numstat', base, head], cwd);
+  const binaries = new Set<string>();
+  if (!output.trim()) return binaries;
+
+  for (const line of output.trim().split('\n')) {
+    if (line.startsWith('-\t-\t')) {
+      const filePath = line.split('\t')[2];
+      if (filePath) binaries.add(filePath);
+    }
+  }
+  return binaries;
+}
+
+async function readFileAtCommit(
+  cwd: string, commitHash: string, filePath: string
+): Promise<{ content: string; lines: number; truncated: boolean }> {
+  try {
+    const raw = await execGit(['show', `${commitHash}:${filePath}`], cwd);
+    const lines = raw.split('\n');
+    let content = raw;
+    let truncated = false;
+
+    if (lines.length > MAX_FILE_LINES) {
+      content = lines.slice(0, MAX_FILE_LINES).join('\n');
+      truncated = true;
+    }
+    if (content.length > MAX_FILE_CHARS) {
+      content = content.slice(0, MAX_FILE_CHARS);
+      truncated = true;
+    }
+
+    return { content, lines: Math.min(lines.length, MAX_FILE_LINES), truncated };
+  } catch {
+    return { content: '<unable to read file>', lines: 1, truncated: false };
+  }
+}
+
+async function getFileSizeAtCommit(cwd: string, commitHash: string, filePath: string): Promise<number> {
+  try {
+    const output = await execGit(['cat-file', '-s', `${commitHash}:${filePath}`], cwd);
+    return parseInt(output, 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function buildReviewContext(
+  itemId: string,
   repoName: string,
-  reviewDiffs: {
-    initialImplementationDiff: string;
-    followupDiff: string;
-    combinedDiff?: string;
-  },
+  agentWorkdir: string,
+  reviewBase: string,
+  currentHead: string,
   reviewTasks: PlanTask[]
-): string {
+): Promise<string> {
   const taskDescriptions = reviewTasks
     .map((task) => `### Task: ${task.id} - ${task.title}\n${task.description}`)
     .join('\n\n');
 
-  const combinedDiffSection = reviewDiffs.combinedDiff
-    ? `
-### Fallback Combined Diff
-\`\`\`diff
-${reviewDiffs.combinedDiff}
+  // Read plan.yaml
+  let planContent = '';
+  try {
+    planContent = await readFile(getItemPlanPath(itemId), 'utf-8');
+  } catch {
+    planContent = '<unable to read plan>';
+  }
+
+  // Get changed files info
+  let changedFiles: ChangedFileInfo[] = [];
+  let binaryFiles = new Set<string>();
+  try {
+    changedFiles = await getChangedFiles(agentWorkdir, reviewBase, currentHead);
+    binaryFiles = await getBinaryFiles(agentWorkdir, reviewBase, currentHead);
+  } catch {
+    // Fallback: return minimal context
+    return `## Repository: ${repoName}
+
+## Plan
+\`\`\`yaml
+${planContent}
 \`\`\`
-`
+
+## Changed Files
+<unable to determine changed files>
+
+## Implemented Tasks
+
+${taskDescriptions}`;
+  }
+
+  // Build file contents section
+  const fileSections: string[] = [];
+  let totalLines = 0;
+  let totalChars = 0;
+  const skippedFiles: string[] = [];
+
+  for (const file of changedFiles) {
+    if (totalLines >= MAX_TOTAL_LINES || totalChars >= MAX_TOTAL_CHARS) {
+      skippedFiles.push(file.path);
+      continue;
+    }
+
+    const isBinary = binaryFiles.has(file.path);
+
+    if (file.status === 'D') {
+      fileSections.push(`### [DELETED] ${file.path}`);
+      totalLines += 1;
+      continue;
+    }
+
+    if (isBinary) {
+      const size = await getFileSizeAtCommit(agentWorkdir, currentHead, file.path);
+      const sizeStr = size > 1024 ? `${(size / 1024).toFixed(1)} KB` : `${size} B`;
+      fileSections.push(`### [BINARY] ${file.path} (${sizeStr})`);
+      totalLines += 1;
+      continue;
+    }
+
+    // A, M, R, C, T and other statuses: read the file content from the commit
+    const statusLabel = file.status === 'A' ? 'ADDED' : file.status === 'M' ? 'MODIFIED' : file.status === 'R' ? `RENAMED from ${file.oldPath}` : 'CHANGED';
+    const { content, lines, truncated } = await readFileAtCommit(agentWorkdir, currentHead, file.path);
+
+    if (totalLines + lines > MAX_TOTAL_LINES || totalChars + content.length > MAX_TOTAL_CHARS) {
+      skippedFiles.push(file.path);
+      continue;
+    }
+
+    const truncNote = truncated ? ' (truncated)' : '';
+    fileSections.push(`### [${statusLabel}] ${file.path}${truncNote}
+\`\`\`
+${content}
+\`\`\``);
+    totalLines += lines;
+    totalChars += content.length;
+  }
+
+  const skippedSection = skippedFiles.length > 0
+    ? `\n### Remaining files (content omitted due to size limits)\n${skippedFiles.map(f => `- ${f}`).join('\n')}`
     : '';
 
   return `## Repository: ${repoName}
 
-## Changes to Review
-
-The following diffs are organized by when they were created in this run:
-
-### Initial Implementation Diff
-\`\`\`diff
-${reviewDiffs.initialImplementationDiff}
+## Plan
+\`\`\`yaml
+${planContent}
 \`\`\`
 
-### Post-Initial Fixes Diff (e.g. hooks/review follow-ups)
-\`\`\`diff
-${reviewDiffs.followupDiff}
-\`\`\`
+## Changed Files
 
-${combinedDiffSection}
+${fileSections.join('\n\n')}
+${skippedSection}
 
 ## Implemented Tasks
 

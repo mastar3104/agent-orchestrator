@@ -1,7 +1,8 @@
 import { existsSync } from 'fs';
-import { readFile, writeFile, mkdir } from 'fs/promises';
-import { dirname } from 'path';
-import type { ItemConfig, Plan } from '@agent-orch/shared';
+import { readFile, writeFile, mkdir, rename } from 'fs/promises';
+import { dirname, join } from 'path';
+import { randomBytes } from 'crypto';
+import type { ItemConfig, Plan, PlanFeedbackItem } from '@agent-orch/shared';
 import { getAgentsByItem, executeAgent } from './agent-service';
 import { getItemConfig } from './item-service';
 import { readYamlSafe, parseYaml, stringifyYaml } from '../lib/yaml';
@@ -197,4 +198,147 @@ export async function validatePlan(plan: Plan, itemConfig?: ItemConfig | null): 
   }
 
   return errors;
+}
+
+export async function archiveCurrentPlan(itemId: string): Promise<string[]> {
+  const archivedPaths: string[] = [];
+
+  const now = new Date();
+  const timestamp = now
+    .toISOString()
+    .replace(/[-:]/g, '')
+    .replace('T', '_')
+    .replace(/\.\d{3}Z$/, `_${String(now.getMilliseconds()).padStart(3, '0')}`);
+
+  const randomSuffix = randomBytes(3).toString('hex');
+  const archiveFilename = `plan_${timestamp}_${randomSuffix}.yaml`;
+
+  const planPath = getItemPlanPath(itemId);
+  if (existsSync(planPath)) {
+    const archivePath = join(dirname(planPath), archiveFilename);
+    await rename(planPath, archivePath);
+    archivedPaths.push(archivePath);
+  }
+
+  return archivedPaths;
+}
+
+export function validatePlanFeedback(
+  feedbacks: PlanFeedbackItem[],
+  plan: Plan
+): string[] {
+  const errors: string[] = [];
+
+  if (feedbacks.length === 0) {
+    errors.push('feedbacks must not be empty');
+    return errors;
+  }
+
+  const seenTaskIds = new Set<string>();
+  const validTaskIds = new Set(plan.tasks.map(t => t.id));
+
+  for (const fb of feedbacks) {
+    const taskId = fb.taskId.trim();
+    const feedback = fb.feedback.trim();
+
+    if (!taskId) {
+      errors.push('taskId must not be empty');
+    }
+    if (!feedback) {
+      errors.push('feedback must not be empty');
+    }
+
+    if (taskId && seenTaskIds.has(taskId)) {
+      errors.push(`Duplicate taskId: ${taskId}`);
+    }
+    seenTaskIds.add(taskId);
+
+    if (taskId && !validTaskIds.has(taskId)) {
+      errors.push(`taskId not found in plan: ${taskId}`);
+    }
+  }
+
+  return errors;
+}
+
+export function formatFeedbacks(
+  feedbacks: PlanFeedbackItem[],
+  currentPlanContent: string
+): string {
+  const feedbackLines = feedbacks
+    .map(fb => `- **${fb.taskId.trim()}**: "${fb.feedback.trim()}"`)
+    .join('\n');
+
+  return `## User Feedback on Current Plan
+
+Revise plan.yaml to address the following feedback.
+Preserve tasks not mentioned in the feedback.
+
+### Current plan.yaml
+\`\`\`yaml
+${currentPlanContent}
+\`\`\`
+
+### Feedback
+${feedbackLines}`;
+}
+
+export async function planFeedback(
+  itemId: string,
+  feedbacks: PlanFeedbackItem[]
+): Promise<void> {
+  const config = await getItemConfig(itemId);
+  if (!config) {
+    throw new Error(`Item ${itemId} not found`);
+  }
+
+  const planPath = getItemPlanPath(itemId);
+  if (!existsSync(planPath)) {
+    throw new Error('No plan exists yet');
+  }
+
+  const currentPlanContent = await readFile(planPath, 'utf-8');
+
+  // Archive current plan
+  const archivedPaths = await archiveCurrentPlan(itemId);
+  if (archivedPaths.length > 0) {
+    console.log(`[${itemId}] Archived previous plan to: ${archivedPaths.join(', ')}`);
+  }
+
+  const role = getRole('planner');
+  const context = buildPlannerContext(config);
+  const feedbackSection = formatFeedbacks(feedbacks, currentPlanContent);
+  const prompt = `${role.promptTemplate}\n\n${context}\n\n${feedbackSection}`;
+  const workspaceRoot = getWorkspaceRoot(itemId);
+
+  // Execute planner agent
+  await executeAgent<PlannerResponse>({
+    itemId,
+    role: 'planner',
+    prompt,
+    workingDir: workspaceRoot,
+    allowedTools: role.allowedTools,
+    jsonSchema: role.jsonSchema,
+  });
+
+  // Validate plan was created
+  if (!existsSync(planPath)) {
+    throw new Error('Planner completed but plan.yaml was not created');
+  }
+
+  const content = await readFile(planPath, 'utf-8');
+  const plan = parseYaml<Plan>(content);
+  if (!plan || !plan.tasks || plan.tasks.length === 0) {
+    throw new Error('plan.yaml has no tasks');
+  }
+
+  const validationErrors = await validatePlan(plan, config);
+  if (validationErrors.length > 0) {
+    throw new Error(`Plan validation errors: ${validationErrors.join('; ')}`);
+  }
+
+  // Emit plan_created event
+  const event = createPlanCreatedEvent(itemId, planPath);
+  await appendJsonl(getItemEventsPath(itemId), event);
+  eventBus.emit('event', { itemId, event });
 }

@@ -14,6 +14,7 @@ export interface RepositoryConfig {
   linkMode?: 'symlink' | 'copy';  // localの場合のモード
   /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
   allowedTools?: string[];
+  hooks?: string[];
 }
 
 export interface CreateItemRepositoryInput {
@@ -53,6 +54,15 @@ export interface ApprovalDecisionRequest {
 
 export interface UpdatePlanRequest {
   content: string;
+}
+
+export interface PlanFeedbackItem {
+  taskId: string;
+  feedback: string;
+}
+
+export interface PlanFeedbackRequest {
+  feedbacks: PlanFeedbackItem[];
 }
 
 // Response types

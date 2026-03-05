@@ -96,6 +96,17 @@ export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
         });
       }
 
+      if (request.body.hooks) {
+        if (!Array.isArray(request.body.hooks)) {
+          return reply.status(400).send({ success: false, error: 'hooks must be an array' });
+        }
+        for (const hook of request.body.hooks) {
+          if (typeof hook !== 'string' || hook.trim().length === 0) {
+            return reply.status(400).send({ success: false, error: 'Each hook must be a non-empty string' });
+          }
+        }
+      }
+
       const repository = await createRepository(request.body);
       return reply.status(201).send({
         success: true,
@@ -120,6 +131,17 @@ export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
     Reply: ApiResponse<UpdateRepositoryResponse>;
   }>('/repositories/:id', async (request, reply) => {
     try {
+      if (request.body.hooks) {
+        if (!Array.isArray(request.body.hooks)) {
+          return reply.status(400).send({ success: false, error: 'hooks must be an array' });
+        }
+        for (const hook of request.body.hooks) {
+          if (typeof hook !== 'string' || hook.trim().length === 0) {
+            return reply.status(400).send({ success: false, error: 'Each hook must be a non-empty string' });
+          }
+        }
+      }
+
       const repository = await updateRepository(request.params.id, request.body);
       if (!repository) {
         return reply.status(404).send({
