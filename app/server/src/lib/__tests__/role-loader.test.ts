@@ -10,6 +10,10 @@ import {
   reloadRoles,
   validateRolesYaml,
   _setConfigPath,
+  getRolesReadPath,
+  getRolesLocalPath,
+  getRolesBasePath,
+  hasLocalRoles,
   sanitizeRepoAllowedTools,
   mergeAllowedTools,
   AllowedToolsFormatError,
@@ -277,6 +281,82 @@ describe('reloadRoles (cache-safe)', () => {
 
     const resolved = getRole('planner');
     expect(resolved.promptTemplate).toBe('Updated planner.');
+  });
+});
+
+describe('local file priority', () => {
+  it('reads from roles.local.yaml when it exists', () => {
+    const dir = join(tmpdir(), 'role-loader-local-' + randomBytes(4).toString('hex'));
+    mkdirSync(dir, { recursive: true });
+
+    const basePath = join(dir, 'roles.yaml');
+    const localPath = join(dir, 'roles.local.yaml');
+
+    writeYaml(basePath, VALID_ROLES);
+    writeYaml(localPath, {
+      roles: {
+        planner: {
+          promptTemplate: 'Local planner.',
+          allowedTools: ['Read', 'Write'],
+          schemaRef: 'planner',
+        },
+      },
+    });
+
+    _setConfigPath(basePath);
+    const roles = loadRoles();
+    expect(roles.planner.promptTemplate).toBe('Local planner.');
+    expect(Object.keys(roles)).toHaveLength(1);
+
+    // Cleanup
+    unlinkSync(localPath);
+  });
+
+  it('falls back to roles.yaml when local does not exist', () => {
+    const path = tmpFile();
+    writeYaml(path, VALID_ROLES);
+    _setConfigPath(path);
+
+    const roles = loadRoles();
+    expect(roles.planner.promptTemplate).toBe('You are a planner.');
+    expect(Object.keys(roles)).toHaveLength(4);
+  });
+
+  it('hasLocalRoles returns true when local file exists', () => {
+    const dir = join(tmpdir(), 'role-loader-has-' + randomBytes(4).toString('hex'));
+    mkdirSync(dir, { recursive: true });
+
+    const basePath = join(dir, 'roles.yaml');
+    const localPath = join(dir, 'roles.local.yaml');
+
+    writeYaml(basePath, VALID_ROLES);
+    writeYaml(localPath, VALID_ROLES);
+
+    _setConfigPath(basePath);
+    expect(hasLocalRoles()).toBe(true);
+
+    unlinkSync(localPath);
+    expect(hasLocalRoles()).toBe(false);
+  });
+
+  it('getRolesReadPath returns local path when local exists', () => {
+    const dir = join(tmpdir(), 'role-loader-rp-' + randomBytes(4).toString('hex'));
+    mkdirSync(dir, { recursive: true });
+
+    const basePath = join(dir, 'roles.yaml');
+    const localPath = join(dir, 'roles.local.yaml');
+
+    writeYaml(basePath, VALID_ROLES);
+    _setConfigPath(basePath);
+
+    expect(getRolesReadPath()).toBe(basePath);
+    expect(getRolesBasePath()).toBe(basePath);
+    expect(getRolesLocalPath()).toBe(localPath);
+
+    writeYaml(localPath, VALID_ROLES);
+    expect(getRolesReadPath()).toBe(localPath);
+
+    unlinkSync(localPath);
   });
 });
 

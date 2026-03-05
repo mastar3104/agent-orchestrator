@@ -20,6 +20,7 @@ data/
 
 # Local settings
 *.local.json
+roles.local.yaml
 
 # Logs
 *.log

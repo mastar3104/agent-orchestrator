@@ -5,8 +5,10 @@ import * as api from '../api/client';
 export function RolesEditorPage() {
   const [content, setContent] = useState('');
   const [original, setOriginal] = useState('');
+  const [isLocal, setIsLocal] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -21,8 +23,9 @@ export function RolesEditorPage() {
       const result = await api.getRolesYaml();
       setContent(result.content);
       setOriginal(result.content);
+      setIsLocal(result.isLocal);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load roles.yaml');
+      setError(err instanceof Error ? err.message : 'Failed to load roles');
     } finally {
       setLoading(false);
     }
@@ -48,6 +51,7 @@ export function RolesEditorPage() {
       const result = await api.updateRolesYaml(content);
       setContent(result.content);
       setOriginal(result.content);
+      setIsLocal(result.isLocal);
       setSuccess('Roles saved and reloaded successfully');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save');
@@ -55,6 +59,24 @@ export function RolesEditorPage() {
       setSaving(false);
     }
   }, [content, dirty, saving]);
+
+  const handleReset = useCallback(async () => {
+    if (resetting) return;
+    setResetting(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const result = await api.deleteLocalRolesYaml();
+      setContent(result.content);
+      setOriginal(result.content);
+      setIsLocal(false);
+      setSuccess('Reset to default roles.yaml');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to reset');
+    } finally {
+      setResetting(false);
+    }
+  }, [resetting]);
 
   // Cmd/Ctrl+S shortcut
   useEffect(() => {
@@ -85,12 +107,23 @@ export function RolesEditorPage() {
           <Link to="/" className="text-gray-400 hover:text-white">
             &larr; Back to Items
           </Link>
-          <h1 className="text-xl font-bold text-white">roles.yaml</h1>
+          <h1 className="text-xl font-bold text-white">
+            {isLocal ? 'roles.local.yaml' : 'roles.yaml (default)'}
+          </h1>
           {dirty && (
             <span className="text-sm text-yellow-400">(unsaved changes)</span>
           )}
         </div>
         <div className="flex gap-2">
+          {isLocal && (
+            <button
+              onClick={handleReset}
+              disabled={saving || resetting}
+              className="px-3 py-1.5 bg-red-700 text-white rounded hover:bg-red-600 text-sm disabled:opacity-50"
+            >
+              {resetting ? 'Resetting...' : 'Reset to Default'}
+            </button>
+          )}
           <button
             onClick={loadContent}
             disabled={loading}
@@ -103,14 +136,14 @@ export function RolesEditorPage() {
               setContent(original);
               setError(null);
             }}
-            disabled={!dirty || saving}
+            disabled={!dirty || saving || resetting}
             className="px-3 py-1.5 bg-gray-700 text-gray-200 rounded hover:bg-gray-600 text-sm disabled:opacity-50"
           >
             Revert
           </button>
           <button
             onClick={handleSave}
-            disabled={!dirty || saving}
+            disabled={!dirty || saving || resetting}
             className="px-3 py-1.5 bg-green-600 text-white rounded hover:bg-green-500 text-sm disabled:opacity-50"
           >
             {saving ? 'Saving...' : 'Save'}

@@ -1,4 +1,4 @@
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { parse } from 'yaml';
@@ -105,12 +105,22 @@ let roleCache: Record<string, RoleDefinition> | null = null;
 /** Override for testing — set to a custom path to load a different YAML file */
 let configPathOverride: string | null = null;
 
-function getConfigPath(): string {
+function getBasePath(): string {
   if (configPathOverride) {
     return configPathOverride;
   }
   const __dirname = dirname(fileURLToPath(import.meta.url));
   return resolve(__dirname, '../../config/roles.yaml');
+}
+
+function getLocalPath(): string {
+  return resolve(dirname(getBasePath()), 'roles.local.yaml');
+}
+
+function getReadPath(): string {
+  const localPath = getLocalPath();
+  if (existsSync(localPath)) return localPath;
+  return getBasePath();
 }
 
 // ─── Core parsing ───
@@ -142,9 +152,24 @@ export function validateRolesYaml(content: string): Record<string, RoleDefinitio
   return parseAndValidateRoles(content);
 }
 
-/** Get the resolved config file path (follows _setConfigPath override) */
-export function getRolesConfigPath(): string {
-  return getConfigPath();
+/** Get the read path (local if exists, otherwise base) */
+export function getRolesReadPath(): string {
+  return getReadPath();
+}
+
+/** Get the local override path (always roles.local.yaml) */
+export function getRolesLocalPath(): string {
+  return getLocalPath();
+}
+
+/** Get the base config path (always roles.yaml) */
+export function getRolesBasePath(): string {
+  return getBasePath();
+}
+
+/** Check if a local roles override exists */
+export function hasLocalRoles(): boolean {
+  return existsSync(getLocalPath());
 }
 
 /**
@@ -152,7 +177,7 @@ export function getRolesConfigPath(): string {
  * Called at startup. Throws on any error (fail-fast).
  */
 export function loadRoles(): Record<string, RoleDefinition> {
-  const configPath = getConfigPath();
+  const configPath = getReadPath();
 
   let raw: string;
   try {
@@ -199,7 +224,7 @@ export function getRole(name: string): ResolvedRole {
  * On failure, the previous cache remains intact.
  */
 export function reloadRoles(): void {
-  const configPath = getConfigPath();
+  const configPath = getReadPath();
   const raw = readFileSync(configPath, 'utf-8');
   const roles = parseAndValidateRoles(raw);
   roleCache = roles;  // atomic swap — only on success

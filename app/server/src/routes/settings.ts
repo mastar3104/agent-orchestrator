@@ -1,11 +1,12 @@
 import type { FastifyPluginAsync } from 'fastify';
 import type { ApiResponse } from '@agent-orch/shared';
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { writeFile, rename, unlink } from 'fs/promises';
 import { randomBytes } from 'crypto';
 import {
   validateRolesYaml,
-  getRolesConfigPath,
+  getRolesReadPath,
+  getRolesLocalPath,
   reloadRoles,
 } from '../lib/role-loader';
 
@@ -25,26 +26,27 @@ function withSaveLock<T>(fn: () => Promise<T>): Promise<T> {
 // ─── Routes ───
 
 export const settingsRoutes: FastifyPluginAsync = async (fastify) => {
-  // GET /api/settings/roles — read raw roles.yaml content
+  // GET /api/settings/roles — read raw roles content (local if exists, otherwise base)
   fastify.get<{
-    Reply: ApiResponse<{ content: string }>;
+    Reply: ApiResponse<{ content: string; isLocal: boolean }>;
   }>('/settings/roles', async (_request, reply) => {
     try {
-      const configPath = getRolesConfigPath();
-      const content = readFileSync(configPath, 'utf-8');
-      return reply.send({ success: true, data: { content } });
+      const readPath = getRolesReadPath();
+      const content = readFileSync(readPath, 'utf-8');
+      const isLocal = readPath === getRolesLocalPath();
+      return reply.send({ success: true, data: { content, isLocal } });
     } catch (err) {
       return reply.status(500).send({
         success: false,
-        error: `Failed to read roles.yaml: ${(err as Error).message}`,
+        error: `Failed to read roles: ${(err as Error).message}`,
       });
     }
   });
 
-  // PUT /api/settings/roles — validate, save, and reload roles.yaml
+  // PUT /api/settings/roles — validate, save to roles.local.yaml, and reload
   fastify.put<{
     Body: { content: string };
-    Reply: ApiResponse<{ content: string }>;
+    Reply: ApiResponse<{ content: string; isLocal: boolean }>;
   }>('/settings/roles', async (request, reply) => {
     // Input validation
     const body = (request.body ?? {}) as Record<string, unknown>;
@@ -77,50 +79,93 @@ export const settingsRoutes: FastifyPluginAsync = async (fastify) => {
     // Atomic save with rollback
     try {
       await withSaveLock(async () => {
-        const configPath = getRolesConfigPath();
+        const localPath = getRolesLocalPath();
         const suffix = randomBytes(4).toString('hex');
-        const tmpPath = `${configPath}.tmp.${suffix}`;
-        const backupPath = `${configPath}.bak.${suffix}`;
+        const tmpPath = `${localPath}.tmp.${suffix}`;
+        const hasExisting = existsSync(localPath);
+        let backupPath: string | null = null;
 
-        // Backup current file
-        await rename(configPath, backupPath);
+        if (hasExisting) {
+          backupPath = `${localPath}.bak.${suffix}`;
+          await rename(localPath, backupPath);
+        }
 
         try {
-          // Write new content atomically
           await writeFile(tmpPath, content, 'utf-8');
-          await rename(tmpPath, configPath);
+          await rename(tmpPath, localPath);
         } catch (writeErr) {
-          // Restore backup if write/rename fails
-          await rename(backupPath, configPath);
-          try {
-            await unlink(tmpPath);
-          } catch {
-            /* ignore */
-          }
+          if (backupPath) await rename(backupPath, localPath);
+          try { await unlink(tmpPath); } catch { /* ignore */ }
           throw writeErr;
         }
 
         try {
           reloadRoles();
         } catch (reloadErr) {
-          // Atomic rollback: restore backup
-          await rename(backupPath, configPath);
+          if (backupPath) {
+            await rename(backupPath, localPath);
+          } else {
+            try { await unlink(localPath); } catch { /* ignore */ }
+          }
+          reloadRoles();
           throw reloadErr;
         }
 
-        // Success — clean up backup
-        try {
-          await unlink(backupPath);
-        } catch {
-          /* ignore */
+        if (backupPath) {
+          try { await unlink(backupPath); } catch { /* ignore */ }
         }
       });
 
-      return reply.send({ success: true, data: { content } });
+      return reply.send({ success: true, data: { content, isLocal: true } });
     } catch (err) {
       return reply.status(500).send({
         success: false,
-        error: `Failed to save roles.yaml: ${(err as Error).message}`,
+        error: `Failed to save roles: ${(err as Error).message}`,
+      });
+    }
+  });
+
+  // DELETE /api/settings/roles/local — remove local override, fall back to base
+  fastify.delete<{
+    Reply: ApiResponse<{ content: string; isLocal: boolean }>;
+  }>('/settings/roles/local', async (_request, reply) => {
+    try {
+      const result = await withSaveLock(async () => {
+        const localPath = getRolesLocalPath();
+
+        if (!existsSync(localPath)) {
+          return { found: false } as const;
+        }
+
+        const suffix = randomBytes(4).toString('hex');
+        const backupPath = `${localPath}.bak.${suffix}`;
+        await rename(localPath, backupPath);
+
+        try {
+          reloadRoles();
+        } catch (reloadErr) {
+          await rename(backupPath, localPath);
+          throw reloadErr;
+        }
+
+        try { await unlink(backupPath); } catch { /* ignore */ }
+
+        const content = readFileSync(getRolesReadPath(), 'utf-8');
+        return { found: true, content } as const;
+      });
+
+      if (!result.found) {
+        return reply.status(404).send({
+          success: false,
+          error: 'No local roles override exists',
+        });
+      }
+
+      return reply.send({ success: true, data: { content: result.content, isLocal: false } });
+    } catch (err) {
+      return reply.status(500).send({
+        success: false,
+        error: `Failed to reset roles: ${(err as Error).message}`,
       });
     }
   });
