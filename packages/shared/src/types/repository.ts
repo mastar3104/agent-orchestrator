@@ -8,7 +8,8 @@ export interface GitRepository {
   submodules?: boolean;
   linkMode?: 'symlink' | 'copy';
   directoryName?: string;  // ディレクトリ名 (e.g., "frontend")
-  role?: string;           // 開発エージェントの役割 (e.g., "front")
+  /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
+  allowedTools?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -22,7 +23,8 @@ export interface CreateRepositoryRequest {
   submodules?: boolean;
   linkMode?: 'symlink' | 'copy';
   directoryName?: string;
-  role?: string;
+  /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
+  allowedTools?: string[];
 }
 
 export interface UpdateRepositoryRequest {
@@ -31,7 +33,8 @@ export interface UpdateRepositoryRequest {
   submodules?: boolean;
   linkMode?: 'symlink' | 'copy';
   directoryName?: string;
-  role?: string;
+  /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
+  allowedTools?: string[];
 }
 
 // API Response types

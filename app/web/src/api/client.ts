@@ -1,13 +1,12 @@
 import type {
   ApiResponse,
+  AgentExecutionOutput,
   CreateItemRequest,
   CreateItemResponse,
   ListItemsResponse,
   GetItemResponse,
   StartAgentRequest,
   StartAgentResponse,
-  ApprovalDecisionRequest,
-  ApprovalRequestEvent,
   Plan,
   ItemConfig,
   UpdatePlanRequest,
@@ -152,73 +151,25 @@ export async function stopAgent(
   );
 }
 
-export async function sendAgentInput(
-  itemId: string,
-  agentId: string,
-  input: string
-): Promise<{ sent: boolean }> {
-  return request<{ sent: boolean }>(
-    `/items/${itemId}/agents/${agentId}/input`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ input }),
-    }
-  );
-}
-
+// Agent Output
 export async function getAgentOutput(
   itemId: string,
   agentId: string
-): Promise<{ output: string }> {
-  return request<{ output: string }>(`/items/${itemId}/agents/${agentId}/output`);
-}
-
-export async function resizeAgentTerminal(
-  itemId: string,
-  agentId: string,
-  cols: number,
-  rows: number
-): Promise<{ resized: boolean }> {
-  return request<{ resized: boolean }>(
-    `/items/${itemId}/agents/${agentId}/resize`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ cols, rows }),
-    }
+): Promise<{ output: AgentExecutionOutput | null }> {
+  return request<{ output: AgentExecutionOutput | null }>(
+    `/items/${itemId}/agents/${agentId}/output`
   );
 }
 
-// Approvals
-export async function getPendingApprovals(
-  itemId: string
-): Promise<{ approvals: ApprovalRequestEvent[] }> {
-  return request<{ approvals: ApprovalRequestEvent[] }>(
-    `/items/${itemId}/approvals`
-  );
+// Settings — Roles
+export async function getRolesYaml(): Promise<{ content: string }> {
+  return request<{ content: string }>('/settings/roles');
 }
 
-export async function processApproval(
-  itemId: string,
-  eventId: string,
-  data: ApprovalDecisionRequest
-): Promise<{ processed: boolean }> {
-  return request<{ processed: boolean }>(
-    `/items/${itemId}/approval/${eventId}`,
-    {
-      method: 'POST',
-      body: JSON.stringify(data),
-    }
-  );
-}
-
-export async function batchProcessApprovals(
-  itemId: string,
-  decision: 'approve' | 'deny',
-  reason?: string
-): Promise<{ processed: number }> {
-  return request<{ processed: number }>(`/items/${itemId}/approvals/batch`, {
-    method: 'POST',
-    body: JSON.stringify({ decision, reason }),
+export async function updateRolesYaml(content: string): Promise<{ content: string }> {
+  return request<{ content: string }>('/settings/roles', {
+    method: 'PUT',
+    body: JSON.stringify({ content }),
   });
 }
 
@@ -226,8 +177,8 @@ export async function batchProcessApprovals(
 export async function startReviewReceive(
   itemId: string,
   repoName?: string
-): Promise<{ started: boolean; prNumber: number; repoName: string }> {
-  return request<{ started: boolean; prNumber: number; repoName: string }>(
+): Promise<{ started: boolean }> {
+  return request<{ started: boolean }>(
     `/items/${itemId}/review-receive/start`,
     {
       method: 'POST',

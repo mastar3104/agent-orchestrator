@@ -3,7 +3,7 @@ import type { AgentInfo, AgentStatus } from '@agent-orch/shared';
 interface AgentCardProps {
   agent: AgentInfo;
   onStop?: () => void;
-  onSelect?: () => void;
+  onClick?: () => void;
   isSelected?: boolean;
 }
 
@@ -11,8 +11,6 @@ const STATUS_COLORS: Record<AgentStatus, string> = {
   idle: 'bg-gray-500',
   starting: 'bg-blue-500',
   running: 'bg-green-500 animate-pulse',
-  waiting_approval: 'bg-orange-500 animate-pulse',
-  waiting_orchestrator: 'bg-cyan-500',
   stopped: 'bg-gray-600',
   completed: 'bg-green-600',
   error: 'bg-red-500',
@@ -22,8 +20,6 @@ const STATUS_LABELS: Record<AgentStatus, string> = {
   idle: 'Idle',
   starting: 'Starting',
   running: 'Running',
-  waiting_approval: 'Waiting Approval',
-  waiting_orchestrator: 'Task Done',
   stopped: 'Stopped',
   completed: 'Completed',
   error: 'Error',
@@ -31,12 +27,14 @@ const STATUS_LABELS: Record<AgentStatus, string> = {
 
 const KNOWN_ROLE_LABELS: Record<string, string> = {
   planner: 'Planner',
+  engineer: 'Engineer',
   review: 'Review',
   'review-receiver': 'Review Receiver',
 };
 
 const KNOWN_ROLE_COLORS: Record<string, string> = {
   planner: 'text-purple-400',
+  engineer: 'text-blue-400',
   review: 'text-yellow-400',
   'review-receiver': 'text-cyan-400',
 };
@@ -52,20 +50,22 @@ function getRoleColor(role: string): string {
   return 'text-gray-400';
 }
 
-export function AgentCard({ agent, onStop, onSelect, isSelected }: AgentCardProps) {
+export function AgentCard({ agent, onStop, onClick, isSelected }: AgentCardProps) {
   const isRunning = agent.status === 'running' || agent.status === 'starting';
-  const isWaiting = agent.status === 'waiting_approval';
+  const isFinished = agent.status === 'completed' || agent.status === 'error' || agent.status === 'stopped';
 
   const roleLabel = getRoleLabel(agent.role);
   const repoSuffix = agent.repoName ? ` (${agent.repoName})` : '';
 
   return (
     <div
-      onClick={onSelect}
-      className={`bg-gray-800 rounded-lg p-4 border transition-colors cursor-pointer ${
+      onClick={isFinished && onClick ? onClick : undefined}
+      className={`bg-gray-800 rounded-lg p-4 border transition-colors ${
         isSelected
           ? 'border-blue-500'
-          : 'border-gray-700 hover:border-gray-600'
+          : isFinished && onClick
+          ? 'border-gray-700 cursor-pointer hover:border-gray-600'
+          : 'border-gray-700'
       }`}
     >
       <div className="flex items-center justify-between mb-2">
@@ -96,7 +96,7 @@ export function AgentCard({ agent, onStop, onSelect, isSelected }: AgentCardProp
           {agent.pid && `PID: ${agent.pid}`}
           {agent.exitCode !== undefined && ` Exit: ${agent.exitCode}`}
         </span>
-        {(isRunning || isWaiting) && onStop && (
+        {isRunning && onStop && (
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -106,6 +106,9 @@ export function AgentCard({ agent, onStop, onSelect, isSelected }: AgentCardProp
           >
             Stop
           </button>
+        )}
+        {isFinished && onClick && !isSelected && (
+          <span className="text-gray-600">Click to view output</span>
         )}
       </div>
     </div>

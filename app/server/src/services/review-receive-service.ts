@@ -5,43 +5,23 @@ import { randomBytes } from 'crypto';
 import type {
   ItemEvent,
   PrCreatedEvent,
+  ReviewReceiveCompletedEvent,
   ItemStatus,
 } from '@agent-orch/shared';
-import { startAgent, getAgentsByItem, generateAgentId } from './agent-service';
+import { executeAgent, getAgentsByItem, generateAgentId } from './agent-service';
 import { getItemConfig } from './item-service';
 import { deriveItemStatus } from './state-service';
 import { readJsonl, appendJsonl } from '../lib/jsonl';
 import { getItemEventsPath, getItemPlanPath, getWorkspaceRoot } from '../lib/paths';
-import { createReviewReceiveStartedEvent } from '../lib/events';
+import { createReviewReceiveStartedEvent, createReviewReceiveCompletedEvent, createPlanCreatedEvent, createErrorEvent } from '../lib/events';
 import { eventBus } from './event-bus';
-import { watchForPlan } from './planner-service';
-
-/**
- * Item単位のキュー化ロック
- */
-const itemLockChains = new Map<string, Promise<void>>();
-
-async function withItemLock<T>(itemId: string, fn: () => Promise<T>): Promise<T> {
-  const previousChain = itemLockChains.get(itemId) ?? Promise.resolve();
-
-  let resolve: () => void;
-  const newChain = new Promise<void>((r) => {
-    resolve = r;
-  });
-
-  itemLockChains.set(itemId, newChain);
-
-  try {
-    await previousChain;
-    return await fn();
-  } finally {
-    resolve!();
-
-    if (itemLockChains.get(itemId) === newChain) {
-      itemLockChains.delete(itemId);
-    }
-  }
-}
+import { fetchPrComments, execGitInRepo } from './git-pr-service';
+import { getRepoWorkspaceDir } from '../lib/paths';
+import { parseYaml } from '../lib/yaml';
+import type { Plan } from '@agent-orch/shared';
+import { readFile } from 'fs/promises';
+import { type ReviewReceiverResponse } from '../lib/claude-schemas';
+import { getRole } from '../lib/role-loader';
 
 /**
  * 指定されたItemのPR情報を取得する（repoName でフィルタ可能）
@@ -72,8 +52,36 @@ async function getPrInfo(
 }
 
 /**
- * 現在のplan.yamlをタイムスタンプ+ランダムサフィックス付きファイル名でアーカイブ
- * plan.yaml は workspace root にのみ存在
+ * 対応済みコメントのカットオフ日時を取得
+ * イベントログから該当repoの review_receive_completed イベントを逆順で探索し、
+ * commentsCutoffAt フィールドを返す。初回（イベントなし）は null を返す。
+ */
+async function getCommentsCutoffAt(
+  itemId: string,
+  repoName: string
+): Promise<string | null> {
+  const events = await readJsonl<ItemEvent>(getItemEventsPath(itemId));
+
+  // 逆順で探索し、該当repoの有効なカットオフを見つける
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (
+      e.type === 'review_receive_completed' &&
+      (e as ReviewReceiveCompletedEvent).repoName === repoName
+    ) {
+      const cutoff = (e as ReviewReceiveCompletedEvent).commentsCutoffAt;
+      if (cutoff !== null) {
+        return cutoff;
+      }
+      // commentsCutoffAt が null のイベントはスキップし、直前の有効なカットオフを探す
+    }
+  }
+
+  return null;
+}
+
+/**
+ * 現在のplan.yamlをアーカイブ
  */
 async function archiveCurrentPlan(itemId: string): Promise<string[]> {
   const archivedPaths: string[] = [];
@@ -88,7 +96,6 @@ async function archiveCurrentPlan(itemId: string): Promise<string[]> {
   const randomSuffix = randomBytes(3).toString('hex');
   const archiveFilename = `plan_${timestamp}_${randomSuffix}.yaml`;
 
-  // workspace root の plan.yaml をアーカイブ
   const planPath = getItemPlanPath(itemId);
   if (existsSync(planPath)) {
     const archivePath = join(dirname(planPath), archiveFilename);
@@ -122,7 +129,7 @@ async function checkDuplicateExecution(itemId: string): Promise<void> {
   const runningReviewReceiver = agents.find(
     (a) =>
       a.role === 'review-receiver' &&
-      (a.status === 'running' || a.status === 'waiting_approval')
+      a.status === 'running'
   );
 
   if (runningReviewReceiver) {
@@ -139,155 +146,231 @@ export class ReviewReceiveValidationError extends Error {
   }
 }
 
-const REVIEW_RECEIVER_PROMPT_TEMPLATE = `You are a review receiver agent. Your task is to fetch PR review comments and create a plan to address them.
+/**
+ * Format PR comments for injection into prompt
+ */
+function formatPrComments(
+  comments: { author: string; body: string; path?: string; line?: number; createdAt: string }[]
+): string {
+  if (comments.length === 0) {
+    return 'No PR comments found.';
+  }
 
-## Context
+  return comments
+    .map((c, i) => {
+      let header = `### Comment ${i + 1} by @${c.author} (${c.createdAt})`;
+      if (c.path) {
+        header += ` on \`${c.path}\``;
+        if (c.line) {
+          header += `:${c.line}`;
+        }
+      }
+      return `${header}\n${c.body}`;
+    })
+    .join('\n\n');
+}
 
-**Project Name:** {{name}}
-**Target Repository:** {{repoName}}
-**PR Number:** {{prNumber}}
-**PR URL:** {{prUrl}}
+function buildReviewReceiverContext(
+  projectName: string,
+  repoName: string,
+  prNumber: number,
+  prUrl: string,
+  itemId: string,
+  repositories: { name: string; type: string }[],
+  formattedComments: string
+): string {
+  const repoList = repositories
+    .map(r => `- **${r.name}** (type: ${r.type})`)
+    .join('\n');
+
+  return `## Context
+
+**Project Name:** ${projectName}
+**Target Repository:** ${repoName}
+**PR Number:** ${prNumber}
+**PR URL:** ${prUrl}
+**Item ID:** ${itemId}
 
 **All Repositories:**
-{{repositories}}
+${repoList}
 
-**Repository-Role Mapping:**
-{{repoRoleMapping}}
+## PR Review Comments
 
-## Instructions
-
-1. Execute the /pr-comments skill to fetch PR review comments:
-   /pr-comments {{prNumber}}
-
-2. Analyze each comment to determine if it requires code changes:
-   - Address: Requests for changes, bug reports, improvements, architectural feedback
-   - Skip: Questions already answered, approvals, minor style preferences without substance
-
-3. For comments requiring action, create tasks in plan.yaml
-
-4. Before creating plan.yaml:
-   - Check if plan.yaml already exists
-   - If it exists, it has already been archived by the orchestrator - just create the new one
-
-## Output
-
-Create a file named \`plan.yaml\` with the following structure:
-
-\`\`\`yaml
-version: "1.0"
-itemId: "{{itemId}}"
-summary: "Address PR review comments from PR #{{prNumber}} for {{repoName}}"
-tasks:
-  - id: "review-fix-1"
-    title: "Task title based on review comment"
-    description: |
-      What needs to be fixed based on review feedback.
-
-      Original comment: "<paste the reviewer's comment here>"
-      File: <file path if applicable>
-    agent: "<role>"
-    repository: "<repoName>"
-    files: []
-\`\`\`
-
-IMPORTANT: Every task MUST have a \`repository\` field matching one of the repository names.
-
-If there are no actionable comments, create a plan with an empty tasks array and summary explaining that all feedback has been addressed or requires no code changes.
-
-After creating plan.yaml, output "TASKS_COMPLETED" on its own line and STOP.
-
-## CRITICAL CONSTRAINTS
-
-You are a PLANNER, NOT a developer. You MUST NOT:
-- Write or modify any code files (only plan.yaml is allowed)
-- Implement any features, fixes, or code changes
-- Continue working after plan.yaml is created
-
-Your ONLY job is to:
-1. Execute /pr-comments to fetch review comments
-2. Analyze the comments
-3. Create plan.yaml with tasks to address actionable feedback
-4. Output "TASKS_COMPLETED" on its own line
-5. STOP immediately`;
+${formattedComments}`;
+}
 
 /**
  * Review Receive プロセスを開始する
+ */
+/**
+ * バリデーションのみを実行（ルートハンドラーで事前チェック用）
+ * fire-and-forget パターンで 202 返却前にバリデーションエラーを返すために使用
+ */
+export async function validateReviewReceivePreConditions(
+  itemId: string,
+  repoName?: string
+): Promise<void> {
+  const config = await getItemConfig(itemId);
+  if (!config) {
+    throw new ReviewReceiveValidationError(`Item ${itemId} not found`);
+  }
+  await validateStatusForReviewReceive(itemId);
+  await checkDuplicateExecution(itemId);
+
+  const prInfo = await getPrInfo(itemId, repoName);
+  if (!prInfo) {
+    const repoMsg = repoName ? ` for repository '${repoName}'` : '';
+    throw new ReviewReceiveValidationError(
+      `No PR found${repoMsg} for item ${itemId}. Please create a PR first.`
+    );
+  }
+}
+
+/**
+ * Review Receive プロセスを開始する
+ * NOTE: withItemLock はルートハンドラー側で適用するため、内部では使用しない
  */
 export async function startReviewReceive(
   itemId: string,
   repoName?: string
 ): Promise<{ started: boolean; prNumber: number; repoName: string }> {
-  return withItemLock(itemId, async () => {
-    const config = await getItemConfig(itemId);
-    if (!config) {
-      throw new ReviewReceiveValidationError(`Item ${itemId} not found`);
-    }
+  const config = await getItemConfig(itemId);
+  if (!config) {
+    throw new ReviewReceiveValidationError(`Item ${itemId} not found`);
+  }
 
-    await validateStatusForReviewReceive(itemId);
-    await checkDuplicateExecution(itemId);
+  await validateStatusForReviewReceive(itemId);
+  await checkDuplicateExecution(itemId);
 
-    const prInfo = await getPrInfo(itemId, repoName);
-    if (!prInfo) {
-      const repoMsg = repoName ? ` for repository '${repoName}'` : '';
-      throw new ReviewReceiveValidationError(
-        `No PR found${repoMsg} for item ${itemId}. Please create a PR first.`
-      );
-    }
-
-    const targetRepoName = prInfo.repoName;
-    const workspaceRoot = getWorkspaceRoot(itemId);
-    const eventsPath = getItemEventsPath(itemId);
-
-    // AgentIDを事前生成
-    const agentId = generateAgentId(itemId, 'review-receiver', targetRepoName);
-
-    // review_receive_started イベントを記録
-    const startEvent = createReviewReceiveStartedEvent(
-      itemId,
-      agentId,
-      targetRepoName,
-      prInfo.prNumber,
-      prInfo.prUrl
+  const prInfo = await getPrInfo(itemId, repoName);
+  if (!prInfo) {
+    const repoMsg = repoName ? ` for repository '${repoName}'` : '';
+    throw new ReviewReceiveValidationError(
+      `No PR found${repoMsg} for item ${itemId}. Please create a PR first.`
     );
-    await appendJsonl(eventsPath, startEvent);
-    eventBus.emit('event', { itemId, event: startEvent });
+  }
 
-    // plan.yamlをアーカイブ
-    const archivedPaths = await archiveCurrentPlan(itemId);
-    if (archivedPaths.length > 0) {
-      console.log(`[${itemId}] Archived previous plans to: ${archivedPaths.join(', ')}`);
-    }
+  const targetRepoName = prInfo.repoName;
+  const workspaceRoot = getWorkspaceRoot(itemId);
+  const eventsPath = getItemEventsPath(itemId);
 
-    // plan.yaml監視を開始
-    watchForPlan(itemId, 'review-receiver', agentId);
+  // Pre-generate agent ID
+  const agentId = generateAgentId(itemId, 'review-receiver', targetRepoName);
 
-    // プロンプト構築
-    const repoList = config.repositories
-      .map(r => `- **${r.name}** (role: ${r.role}, type: ${r.type})`)
-      .join('\n');
-    const repoRoleMapping = config.repositories
-      .map(r => `- Repository: \`${r.name}\` → Agent role: \`${r.role}\``)
-      .join('\n');
+  // Record review_receive_started event
+  const startEvent = createReviewReceiveStartedEvent(
+    itemId,
+    agentId,
+    targetRepoName,
+    prInfo.prNumber,
+    prInfo.prUrl
+  );
+  await appendJsonl(eventsPath, startEvent);
+  eventBus.emit('event', { itemId, event: startEvent });
 
-    const prompt = REVIEW_RECEIVER_PROMPT_TEMPLATE
-      .replace(/\{\{name\}\}/g, config.name)
-      .replace(/\{\{repoName\}\}/g, targetRepoName)
-      .replace(/\{\{prNumber\}\}/g, String(prInfo.prNumber))
-      .replace(/\{\{prUrl\}\}/g, prInfo.prUrl)
-      .replace(/\{\{itemId\}\}/g, itemId)
-      .replace(/\{\{repositories\}\}/g, repoList)
-      .replace(/\{\{repoRoleMapping\}\}/g, repoRoleMapping);
+  // Get cutoff for filtering already-handled comments
+  const cutoffAt = await getCommentsCutoffAt(itemId, targetRepoName);
 
-    // review-receiver Agent を起動
-    await startAgent({
-      itemId,
-      role: 'review-receiver',
-      repoName: targetRepoName,
-      prompt,
-      workingDir: workspaceRoot,
-      agentId,
-    });
+  // Sync workspace with remote before starting review receive
+  const repoDir = getRepoWorkspaceDir(itemId, targetRepoName);
+  try {
+    const currentBranch = await execGitInRepo(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir);
+    await execGitInRepo(['pull', '--rebase', 'origin', currentBranch], repoDir);
+    console.log(`[${itemId}/${targetRepoName}] Git pull --rebase succeeded`);
+  } catch (error) {
+    console.warn(`[${itemId}/${targetRepoName}] Git pull --rebase failed: ${error}, continuing anyway`);
+  }
 
+  // Fetch PR comments via orchestrator (NOT via Claude)
+  let allPrComments;
+  try {
+    allPrComments = await fetchPrComments(repoDir, prInfo.prNumber);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const errorEvent = createErrorEvent(itemId, message.slice(0, 500));
+    await appendJsonl(eventsPath, errorEvent);
+    eventBus.emit('event', { itemId, event: errorEvent });
+    throw error;
+  }
+
+  // Filter by cutoff (strict >; comments at cutoff time are already handled)
+  const newPrComments = cutoffAt
+    ? allPrComments.filter(c => new Date(c.createdAt).getTime() > new Date(cutoffAt).getTime())
+    : allPrComments;
+
+  // Compute commentsCutoffAt: max(allFetchedComments.createdAt) — sort済みなので末尾が最新
+  const commentsCutoffAt = allPrComments.length > 0
+    ? allPrComments[allPrComments.length - 1].createdAt
+    : null;
+
+  // Early return if no new comments
+  if (newPrComments.length === 0) {
+    console.log(`[${itemId}/${targetRepoName}] No new PR comments since ${cutoffAt ?? 'initial'}. Skipping agent execution.`);
+    const completedEvent = createReviewReceiveCompletedEvent(
+      itemId, agentId, targetRepoName, prInfo.prNumber,
+      commentsCutoffAt, allPrComments.length, 0, allPrComments.length
+    );
+    await appendJsonl(eventsPath, completedEvent);
+    eventBus.emit('event', { itemId, event: completedEvent });
     return { started: true, prNumber: prInfo.prNumber, repoName: targetRepoName };
+  }
+
+  // Archive current plan (only when we have new comments to process)
+  const archivedPaths = await archiveCurrentPlan(itemId);
+  if (archivedPaths.length > 0) {
+    console.log(`[${itemId}] Archived previous plans to: ${archivedPaths.join(', ')}`);
+  }
+
+  const formattedComments = formatPrComments(newPrComments);
+
+  // Build prompt with pre-fetched comments
+  const role = getRole('reviewReceiver');
+  const context = buildReviewReceiverContext(
+    config.name,
+    targetRepoName,
+    prInfo.prNumber,
+    prInfo.prUrl,
+    itemId,
+    config.repositories,
+    formattedComments
+  );
+  const prompt = `${role.promptTemplate}\n\n${context}`;
+
+  // Execute review-receiver agent (NO Bash access)
+  await executeAgent<ReviewReceiverResponse>({
+    itemId,
+    role: 'review-receiver',
+    repoName: targetRepoName,
+    prompt,
+    workingDir: workspaceRoot,
+    agentId,
+    allowedTools: role.allowedTools,
+    jsonSchema: role.jsonSchema,
   });
+
+  // Verify plan.yaml was created
+  const planPath = getItemPlanPath(itemId);
+  if (existsSync(planPath)) {
+    try {
+      const content = await readFile(planPath, 'utf-8');
+      const plan = parseYaml<Plan>(content);
+      if (plan && plan.tasks) {
+        const planEvent = createPlanCreatedEvent(itemId, planPath);
+        await appendJsonl(eventsPath, planEvent);
+        eventBus.emit('event', { itemId, event: planEvent });
+      }
+    } catch {
+      // plan.yaml exists but may not be valid — not fatal
+    }
+  }
+
+  // Record review_receive_completed after successful agent execution
+  const completedEvent = createReviewReceiveCompletedEvent(
+    itemId, agentId, targetRepoName, prInfo.prNumber,
+    commentsCutoffAt, allPrComments.length, newPrComments.length, allPrComments.length - newPrComments.length
+  );
+  await appendJsonl(eventsPath, completedEvent);
+  eventBus.emit('event', { itemId, event: completedEvent });
+
+  return { started: true, prNumber: prInfo.prNumber, repoName: targetRepoName };
 }

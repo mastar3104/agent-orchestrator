@@ -6,6 +6,7 @@ import type {
 } from '@agent-orch/shared';
 import { readYamlSafe, writeYaml } from '../lib/yaml';
 import { getRepositoriesPath } from '../lib/paths';
+import { sanitizeRepoAllowedTools } from '../lib/role-loader';
 
 async function loadRepositories(): Promise<GitRepository[]> {
   const repos = await readYamlSafe<GitRepository[]>(getRepositoriesPath());
@@ -35,6 +36,10 @@ export async function createRepository(
   const repos = await loadRepositories();
   const now = new Date().toISOString();
 
+  const sanitizedTools = request.allowedTools
+    ? sanitizeRepoAllowedTools(request.name, request.allowedTools)
+    : undefined;
+
   const repository: GitRepository = {
     id: `REPO-${nanoid(8)}`,
     name: request.name,
@@ -45,7 +50,7 @@ export async function createRepository(
     submodules: request.submodules,
     linkMode: request.linkMode,
     directoryName: request.directoryName,
-    role: request.role,
+    allowedTools: sanitizedTools,
     createdAt: now,
     updatedAt: now,
   };
@@ -65,6 +70,13 @@ export async function updateRepository(
 
   if (index === -1) {
     return null;
+  }
+
+  if (request.allowedTools) {
+    request.allowedTools = sanitizeRepoAllowedTools(
+      request.name ?? repos[index].name,
+      request.allowedTools
+    );
   }
 
   const updated: GitRepository = {

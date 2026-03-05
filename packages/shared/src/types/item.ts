@@ -1,9 +1,5 @@
-// role を固定値ではなく string にし、将来の拡張 (docs, mobile 等) に対応
-export type DevAgentRole = string;  // "front", "back", "docs", "mobile" など自由
-
 export interface ItemRepositoryConfig {
   name: string;                    // ディレクトリ名 (例: "frontend")
-  role: DevAgentRole;              // 担当する開発エージェント (自由文字列)
   type: 'remote' | 'local';
   url?: string;
   localPath?: string;
@@ -11,6 +7,8 @@ export interface ItemRepositoryConfig {
   workBranch?: string;
   submodules?: boolean;
   linkMode?: 'symlink' | 'copy';
+  /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
+  allowedTools?: string[];
 }
 
 export interface ItemConfig {
@@ -29,7 +27,6 @@ export type ItemStatus =
   | 'planning'
   | 'ready'
   | 'running'
-  | 'waiting_approval'
   | 'completed'
   | 'review_receiving'
   | 'error';
@@ -45,7 +42,6 @@ export interface ItemSummary {
 
 export interface RepoSummary {
   repoName: string;
-  role: DevAgentRole;
   prUrl?: string;
   prNumber?: number;
   noChanges: boolean;  // repo_no_changes イベントから派生

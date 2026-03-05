@@ -12,6 +12,15 @@ import { isSystemRole } from '@agent-orch/shared';
 import { readJsonl } from '../lib/jsonl';
 import { getItemEventsPath, getAgentEventsPath } from '../lib/paths';
 
+/**
+ * Map old agent statuses to new ones for backward compat with persisted events.
+ */
+function mapAgentStatus(status: string): AgentStatus {
+  if (status === 'waiting_approval') return 'running';
+  if (status === 'waiting_orchestrator') return 'completed';
+  return status as AgentStatus;
+}
+
 export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
   const events = await readJsonl<ItemEvent>(getItemEventsPath(itemId));
 
@@ -38,7 +47,6 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
   const cloneCompletedEvents = events.filter((e) => e.type === 'clone_completed') as CloneCompletedEvent[];
 
   if (cloneStartedEvents.length > 0) {
-    // Check if any clone is still in progress or failed
     const completedRepos = new Set(
       cloneCompletedEvents.filter(e => e.success).map(e => e.repoName)
     );
@@ -128,20 +136,17 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
           break;
         }
         case 'approval_requested':
-          agentStates.set(event.agentId, 'waiting_approval');
+          // Backward compat: old events set waiting_approval, map to running
+          agentStates.set(event.agentId, 'running');
           break;
         case 'approval_decision':
-          // Resume running after approval decision
-          const currentStatus = agentStates.get(event.agentId);
-          if (currentStatus === 'waiting_approval') {
-            agentStates.set(event.agentId, 'running');
-          }
+          // Resume running after approval decision (backward compat)
           break;
         case 'status_changed': {
           const e = event as import('@agent-orch/shared').StatusChangedEvent;
           const currentStatusChanged = agentStates.get(event.agentId);
           if (currentStatusChanged !== 'stopped') {
-            agentStates.set(event.agentId, e.newStatus as AgentStatus);
+            agentStates.set(event.agentId, mapAgentStatus(e.newStatus));
           }
           break;
         }
@@ -151,10 +156,7 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
 
   const statuses = Array.from(agentStates.values());
 
-  // Check for pending approvals first (for any agent including planner)
-  if (statuses.includes('waiting_approval')) {
-    return 'waiting_approval';
-  }
+  // No more waiting_approval status for items
 
   // Check for review receive in progress
   const reviewReceiveStartedEvents = events.filter(
@@ -166,29 +168,38 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
       reviewReceiveStartedEvents[reviewReceiveStartedEvents.length - 1];
     const lastReviewReceiveIdx = events.indexOf(lastReviewReceiveEvent);
 
-    if (lastReviewReceiveEvent.agentId) {
-      const targetAgentId = lastReviewReceiveEvent.agentId;
+    // Check if review_receive_completed exists after the last started event
+    const completedAfterStart = events.some(
+      (e, idx) => e.type === 'review_receive_completed' && idx > lastReviewReceiveIdx
+    );
 
-      const planCreatedAfterLastReviewReceive = events.some(
-        (e, idx) => e.type === 'plan_created' && idx > lastReviewReceiveIdx
-      );
+    if (!completedAfterStart) {
+      if (lastReviewReceiveEvent.agentId) {
+        const targetAgentId = lastReviewReceiveEvent.agentId;
 
-      if (!planCreatedAfterLastReviewReceive) {
-        const reviewReceiverStatus = agentStates.get(targetAgentId);
+        const planCreatedAfterLastReviewReceive = events.some(
+          (e, idx) => e.type === 'plan_created' && idx > lastReviewReceiveIdx
+        );
 
-        // Still in progress: not started, running, or waiting for plan detection after TASKS_COMPLETED
-        if (
-          reviewReceiverStatus === undefined ||
-          reviewReceiverStatus === 'running' ||
-          reviewReceiverStatus === 'waiting_orchestrator'
-        ) {
-          return 'review_receiving';
+        if (!planCreatedAfterLastReviewReceive) {
+          const reviewReceiverStatus = agentStates.get(targetAgentId);
+
+          // Still in progress: not started, running, or completed (mapped from waiting_orchestrator)
+          if (
+            reviewReceiverStatus === undefined ||
+            reviewReceiverStatus === 'running'
+          ) {
+            return 'review_receiving';
+          }
+
+          // All other terminal states without plan = error
+          if (reviewReceiverStatus !== 'completed') {
+            return 'error';
+          }
         }
-
-        // All other terminal states (completed, error, stopped) without plan = error
-        return 'error';
       }
     }
+    // completedAfterStart が true なら通常のステータス判定にフォールスルー
   }
 
   // Check if planner is running (using role map with fallback)
@@ -231,11 +242,48 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
       const hasPlanAfterLastPr = events.some(
         (e, idx) => e.type === 'plan_created' && idx > lastPrIdx
       );
-      const hasReviewReceiveAfterLastPr = events.some(
-        (e, idx) => e.type === 'review_receive_started' && idx > lastPrIdx
-      );
+      const hasUnfinishedReviewReceiveAfterLastPr = (() => {
+        const reviewStartsAfterPr = events
+          .map((e, idx) => ({ e, idx }))
+          .filter(({ e, idx }) => e.type === 'review_receive_started' && idx > lastPrIdx);
+        if (reviewStartsAfterPr.length === 0) return false;
+        const lastStart = reviewStartsAfterPr[reviewStartsAfterPr.length - 1];
+        return !events.some(
+          (e, idx) => e.type === 'review_receive_completed' && idx > lastStart.idx
+        );
+      })();
 
-      if (!hasPlanAfterLastPr && !hasReviewReceiveAfterLastPr) {
+      if (!hasPlanAfterLastPr && !hasUnfinishedReviewReceiveAfterLastPr) {
+        return 'completed';
+      }
+    }
+
+    // Also check if all worker agents have completed/exited (new flow doesn't use tasks_completed)
+    const allWorkersCompleted = workerAgentIds.every(id => {
+      const status = agentStates.get(id);
+      return status === 'completed' || status === 'error' || status === 'stopped';
+    });
+
+    if (allWorkersCompleted && (hasPrCreated || hasRepoNoChanges)) {
+      const lastPrIdx = events.reduce(
+        (maxIdx, e, idx) => (e.type === 'pr_created' || e.type === 'repo_no_changes' ? Math.max(maxIdx, idx) : maxIdx),
+        -1
+      );
+      const hasPlanAfterLastPr = events.some(
+        (e, idx) => e.type === 'plan_created' && idx > lastPrIdx
+      );
+      const hasUnfinishedReviewReceiveAfterLastPr = (() => {
+        const reviewStartsAfterPr = events
+          .map((e, idx) => ({ e, idx }))
+          .filter(({ e, idx }) => e.type === 'review_receive_started' && idx > lastPrIdx);
+        if (reviewStartsAfterPr.length === 0) return false;
+        const lastStart = reviewStartsAfterPr[reviewStartsAfterPr.length - 1];
+        return !events.some(
+          (e, idx) => e.type === 'review_receive_completed' && idx > lastStart.idx
+        );
+      })();
+
+      if (!hasPlanAfterLastPr && !hasUnfinishedReviewReceiveAfterLastPr) {
         return 'completed';
       }
     }
@@ -274,17 +322,16 @@ export async function deriveAgentStatus(
         break;
       }
       case 'approval_requested':
-        status = 'waiting_approval';
+        // Backward compat: map to running
+        status = 'running';
         break;
       case 'approval_decision':
-        if (status === 'waiting_approval') {
-          status = 'running';
-        }
+        // No-op for backward compat
         break;
       case 'status_changed': {
         const e = event as import('@agent-orch/shared').StatusChangedEvent;
         if (status !== 'stopped') {
-          status = e.newStatus as AgentStatus;
+          status = mapAgentStatus(e.newStatus);
         }
         break;
       }
@@ -294,27 +341,13 @@ export async function deriveAgentStatus(
   return status;
 }
 
+/**
+ * @deprecated Approvals no longer exist. Always returns empty array.
+ */
 export async function getPendingApprovals(
   itemId: string
 ): Promise<ApprovalRequestEvent[]> {
-  const events = await readJsonl<ItemEvent>(getItemEventsPath(itemId));
-
-  // Get all approval requests
-  const requests = events.filter(
-    (e) => e.type === 'approval_requested'
-  ) as ApprovalRequestEvent[];
-
-  // Get all decisions
-  const decisions = events.filter(
-    (e) => e.type === 'approval_decision'
-  ) as ApprovalDecisionEvent[];
-
-  // Find requests without decisions
-  const decidedRequestIds = new Set(decisions.map((d) => d.requestEventId));
-
-  return requests.filter(
-    (r) => !decidedRequestIds.has(r.id) && r.autoDecision !== 'deny'
-  );
+  return [];
 }
 
 export async function getEventHistory(

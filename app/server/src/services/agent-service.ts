@@ -1,43 +1,42 @@
-import { mkdir } from 'fs/promises';
+import { mkdir, writeFile } from 'fs/promises';
+import { type ChildProcess } from 'child_process';
 import { nanoid } from 'nanoid';
 import type {
   AgentInfo,
   AgentRole,
   AgentStatus,
+  AgentExecutionOutput,
   ItemEvent,
 } from '@agent-orch/shared';
 
-// Extended options that support external agentId
-interface AgentStartOptionsExtended {
-  itemId: string;
-  role: AgentRole;
-  repoName?: string;
-  prompt: string;
-  workingDir: string;
-  env?: Record<string, string>;
-  agentId?: string; // 外部から指定された場合はこれを使用
-}
-import { ptyManager } from '../lib/pty-manager';
+import {
+  runClaude,
+  ClaudeExecutionError,
+  ClaudeSchemaValidationError,
+  type ClaudeExecutionOptions,
+  type ClaudeExecutionResult,
+} from '../lib/claude-executor';
 import { appendJsonl, readJsonl } from '../lib/jsonl';
 import {
   getAgentDir,
   getAgentEventsPath,
+  getAgentOutputPath,
   getItemEventsPath,
 } from '../lib/paths';
 import {
   createAgentStartedEvent,
   createAgentExitedEvent,
-  createOutputEvent,
   createStatusChangedEvent,
-  createApprovalRequestEvent,
-  createApprovalDecisionEvent,
-  createTasksCompletedEvent,
+  createClaudeExecutionEvent,
   createErrorEvent,
 } from '../lib/events';
 import { eventBus } from './event-bus';
 
 // In-memory state for running agents
 const agentState = new Map<string, AgentInfo>();
+
+// Track running processes for stopAgent
+const runningProcesses = new Map<string, { abort: AbortController }>();
 
 /**
  * Generate a unique agent ID
@@ -50,13 +49,41 @@ export function generateAgentId(_itemId: string, role: AgentRole, repoName?: str
   return `agent-${role}--${nanoid(6)}`;
 }
 
-export async function startAgent(options: AgentStartOptionsExtended): Promise<AgentInfo> {
+async function saveAgentOutput(itemId: string, agentId: string, data: AgentExecutionOutput): Promise<void> {
+  try {
+    await writeFile(getAgentOutputPath(itemId, agentId), JSON.stringify(data, null, 2), 'utf-8');
+  } catch (e) {
+    console.warn(`[${agentId}] Failed to save output.json: ${e instanceof Error ? e.message : e}`);
+  }
+}
+
+async function logEvent(itemId: string, agentId: string, event: ItemEvent): Promise<void> {
+  await appendJsonl(getAgentEventsPath(itemId, agentId), event);
+  await appendJsonl(getItemEventsPath(itemId), event);
+  eventBus.emit('event', { itemId, event });
+}
+
+/**
+ * Execute an agent using `claude -p` with JSON response.
+ * Replaces the old PTY-based startAgent + waitForAgentsByIds flow.
+ */
+export async function executeAgent<T>(options: {
+  itemId: string;
+  role: AgentRole;
+  repoName?: string;
+  prompt: string;
+  workingDir: string;
+  allowedTools: string[];
+  jsonSchema: object;
+  agentId?: string;
+  env?: Record<string, string>;
+  timeoutMs?: number;
+}): Promise<{ agent: AgentInfo; result: ClaudeExecutionResult<T> }> {
   // planner 以外は repoName 必須チェック
   if (options.role !== 'planner' && !options.repoName) {
     throw new Error(`repoName is required for role '${options.role}'`);
   }
 
-  // 外部からagentIdが渡された場合はそれを使用、なければ生成
   const agentId = options.agentId ?? generateAgentId(options.itemId, options.role, options.repoName);
 
   // Create agent directory
@@ -73,218 +100,107 @@ export async function startAgent(options: AgentStartOptionsExtended): Promise<Ag
 
   agentState.set(agentId, agent);
 
+  // Log agent started (pid 0 since we don't track PIDs for -p mode)
+  const startEvent = createAgentStartedEvent(
+    options.itemId,
+    agentId,
+    options.role,
+    0,
+    options.repoName
+  );
+  await logEvent(options.itemId, agentId, startEvent);
+
+  agent.status = 'running';
+
+  // Create abort controller for this agent
+  const abortController = new AbortController();
+  runningProcesses.set(agentId, { abort: abortController });
+
   try {
-    // Spawn PTY
-    const instance = await ptyManager.spawn({
-      id: agentId,
-      itemId: options.itemId,
-      role: options.role,
-      workingDir: options.workingDir,
+    const result = await runClaude<T>({
       prompt: options.prompt,
+      allowedTools: options.allowedTools,
+      jsonSchema: options.jsonSchema,
+      cwd: options.workingDir,
       env: options.env,
+      timeoutMs: options.timeoutMs,
+      signal: abortController.signal,
     });
 
-    agent.pid = instance.pid;
-    agent.status = 'running';
+    // Save output.json (best-effort)
+    await saveAgentOutput(options.itemId, agentId, {
+      prompt: options.prompt,
+      stdout: result.rawStdout,
+      stderr: result.stderr,
+      parsedOutput: result.output,
+      exitCode: result.exitCode,
+      durationMs: result.durationMs,
+      timestamp: new Date().toISOString(),
+    });
 
-    // Log agent started
-    const startEvent = createAgentStartedEvent(
+    // Log claude_execution event
+    const executionEvent = createClaudeExecutionEvent(
       options.itemId,
       agentId,
       options.role,
-      instance.pid,
-      options.repoName
+      result.exitCode,
+      result.durationMs,
+      1,
+      true
     );
-    await logEvent(options.itemId, agentId, startEvent);
+    await logEvent(options.itemId, agentId, executionEvent);
 
-    // Setup event handlers
-    setupAgentEventHandlers(agentId, options.itemId);
+    // Log agent exited
+    const exitEvent = createAgentExitedEvent(options.itemId, agentId, 0);
+    await logEvent(options.itemId, agentId, exitEvent);
 
-    return agent;
+    agent.status = 'completed';
+    agent.stoppedAt = new Date().toISOString();
+    agent.exitCode = 0;
+
+    return { agent, result };
   } catch (error) {
-    agent.status = 'error';
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
+    // Log error event
     const errorEvent = createErrorEvent(options.itemId, errorMessage, undefined, agentId);
     await logEvent(options.itemId, agentId, errorEvent);
 
+    // Log agent exited with error
+    const exitEvent = createAgentExitedEvent(options.itemId, agentId, 1);
+    await logEvent(options.itemId, agentId, exitEvent);
+
+    // Save output.json (best-effort)
+    if (error instanceof ClaudeExecutionError) {
+      await saveAgentOutput(options.itemId, agentId, {
+        prompt: options.prompt,
+        stdout: error.stdout,
+        stderr: error.stderr,
+        parsedOutput: null,
+        exitCode: error.exitCode,
+        durationMs: error.durationMs,
+        timestamp: new Date().toISOString(),
+      });
+    } else if (error instanceof ClaudeSchemaValidationError) {
+      await saveAgentOutput(options.itemId, agentId, {
+        prompt: options.prompt,
+        stdout: error.rawOutput,
+        stderr: error.stderr,
+        parsedOutput: null,
+        exitCode: error.exitCode,
+        durationMs: error.durationMs,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    agent.status = 'error';
+    agent.stoppedAt = new Date().toISOString();
+    agent.exitCode = 1;
+
     throw error;
+  } finally {
+    runningProcesses.delete(agentId);
   }
-}
-
-function setupAgentEventHandlers(agentId: string, itemId: string): void {
-  // Define cleanup function to remove all listeners
-  const cleanup = () => {
-    ptyManager.off('output', handleOutput);
-    ptyManager.off('exit', handleExit);
-    ptyManager.off('approval_requested', handleApprovalRequest);
-    ptyManager.off('approval_auto_denied', handleAutoDeny);
-    ptyManager.off('tasks_completed', handleTasksCompleted);
-  };
-
-  const handleOutput = async (event: { instanceId: string; data: string; timestamp: string }) => {
-    if (event.instanceId !== agentId) return;
-
-    const outputEvent = createOutputEvent(itemId, agentId, 'stdout', event.data);
-    await logEvent(itemId, agentId, outputEvent);
-  };
-
-  const handleExit = async (event: { instanceId: string; exitCode: number; signal?: number }) => {
-    if (event.instanceId !== agentId) return;
-
-    const agent = agentState.get(agentId);
-    if (agent) {
-      // stopped は意図的停止なので status を維持
-      if (agent.status !== 'stopped') {
-        agent.status = event.exitCode === 0 ? 'completed' : 'error';
-      }
-      agent.stoppedAt = new Date().toISOString();
-      agent.exitCode = event.exitCode;
-    }
-
-    const exitEvent = createAgentExitedEvent(
-      itemId,
-      agentId,
-      event.exitCode,
-      event.signal?.toString()
-    );
-    await logEvent(itemId, agentId, exitEvent);
-
-    // Cleanup all listeners
-    cleanup();
-  };
-
-  const handleApprovalRequest = async (event: {
-    instanceId: string;
-    command: string;
-    classification: 'blocklist' | 'approval_required';
-    uiKind: 'menu' | 'yn' | 'unknown';
-    context: string;
-    timestamp: string;
-  }) => {
-    if (event.instanceId !== agentId) return;
-
-    const agent = agentState.get(agentId);
-    if (agent) {
-      agent.status = 'waiting_approval';
-    }
-
-    const approvalEvent = createApprovalRequestEvent(
-      itemId,
-      agentId,
-      event.command,
-      event.classification,
-      event.uiKind,
-      event.context
-    );
-    await logEvent(itemId, agentId, approvalEvent);
-  };
-
-  const handleAutoDeny = async (event: { instanceId: string; command: string; reason: string }) => {
-    if (event.instanceId !== agentId) return;
-
-    // Log the auto-denial
-    const requestEvent = createApprovalRequestEvent(
-      itemId,
-      agentId,
-      event.command,
-      'blocklist',
-      'unknown',  // auto-denyの場合はuiKind不明でも問題ない
-      undefined,
-      'deny'
-    );
-    await logEvent(itemId, agentId, requestEvent);
-
-    const decisionEvent = createApprovalDecisionEvent(
-      itemId,
-      agentId,
-      requestEvent.id,
-      'deny',
-      'auto',
-      event.reason
-    );
-    await logEvent(itemId, agentId, decisionEvent);
-  };
-
-  const handleTasksCompleted = async (event: { instanceId: string; timestamp: string }) => {
-    if (event.instanceId !== agentId) return;
-
-    const agent = agentState.get(agentId);
-    if (agent) {
-      const previousStatus = agent.status;
-      agent.status = 'waiting_orchestrator';
-
-      // Log status change
-      const statusEvent = createStatusChangedEvent(
-        itemId,
-        previousStatus,
-        'waiting_orchestrator',
-        agentId
-      );
-      await logEvent(itemId, agentId, statusEvent);
-
-      // Log tasks completed event
-      const tasksCompletedEvent = createTasksCompletedEvent(itemId, agentId);
-      await logEvent(itemId, agentId, tasksCompletedEvent);
-    }
-  };
-
-  // Register all listeners
-  ptyManager.on('output', handleOutput);
-  ptyManager.on('exit', handleExit);
-  ptyManager.on('approval_requested', handleApprovalRequest);
-  ptyManager.on('approval_auto_denied', handleAutoDeny);
-  ptyManager.on('tasks_completed', handleTasksCompleted);
-}
-
-async function logEvent(itemId: string, agentId: string, event: ItemEvent): Promise<void> {
-  // Log to agent's events
-  await appendJsonl(getAgentEventsPath(itemId, agentId), event);
-
-  // Log to item's events
-  await appendJsonl(getItemEventsPath(itemId), event);
-
-  // Broadcast via event bus
-  eventBus.emit('event', { itemId, event });
-}
-
-export async function sendInput(agentId: string, input: string): Promise<boolean> {
-  return ptyManager.sendInput(agentId, input);
-}
-
-export async function sendLine(agentId: string, input: string): Promise<boolean> {
-  return ptyManager.sendLine(agentId, input);
-}
-
-export async function processApproval(
-  itemId: string,
-  agentId: string,
-  requestEventId: string,
-  decision: 'approve' | 'deny',
-  reason?: string,
-  uiKind?: 'menu' | 'yn' | 'unknown'
-): Promise<boolean> {
-  const approved = decision === 'approve';
-  const success = ptyManager.processApproval(agentId, approved, uiKind);
-
-  if (success) {
-    const agent = agentState.get(agentId);
-    if (agent) {
-      agent.status = 'running';
-    }
-
-    const decisionEvent = createApprovalDecisionEvent(
-      itemId,
-      agentId,
-      requestEventId,
-      decision,
-      'user',
-      reason
-    );
-    await logEvent(itemId, agentId, decisionEvent);
-  }
-
-  return success;
 }
 
 export async function stopAgent(agentId: string): Promise<boolean> {
@@ -293,23 +209,26 @@ export async function stopAgent(agentId: string): Promise<boolean> {
     return false;
   }
 
-  const killed = ptyManager.kill(agentId);
-
-  if (killed) {
-    const previousStatus = agent.status;
-    agent.status = 'stopped';
-    agent.stoppedAt = new Date().toISOString();
-
-    const statusEvent = createStatusChangedEvent(
-      agent.itemId,
-      previousStatus,
-      'stopped',
-      agentId
-    );
-    await logEvent(agent.itemId, agentId, statusEvent);
+  // Check if process is still running
+  const running = runningProcesses.get(agentId);
+  if (running) {
+    running.abort.abort();
+    runningProcesses.delete(agentId);
   }
 
-  return killed;
+  const previousStatus = agent.status;
+  agent.status = 'stopped';
+  agent.stoppedAt = new Date().toISOString();
+
+  const statusEvent = createStatusChangedEvent(
+    agent.itemId,
+    previousStatus,
+    'stopped',
+    agentId
+  );
+  await logEvent(agent.itemId, agentId, statusEvent);
+
+  return true;
 }
 
 export function getAgent(agentId: string): AgentInfo | undefined {
@@ -318,76 +237,6 @@ export function getAgent(agentId: string): AgentInfo | undefined {
 
 export async function getAgentsByItem(itemId: string): Promise<AgentInfo[]> {
   return Array.from(agentState.values()).filter((agent) => agent.itemId === itemId);
-}
-
-export function getOutputBuffer(agentId: string): string | null {
-  return ptyManager.getOutputBuffer(agentId);
-}
-
-export function resizeTerminal(agentId: string, cols: number, rows: number): boolean {
-  return ptyManager.resize(agentId, cols, rows);
-}
-
-// Wait for specific agents to complete (by agent IDs)
-// Agents are considered complete when they:
-// - Exit (exit event)
-// - Output TASKS_COMPLETED (tasks_completed event, status becomes waiting_orchestrator)
-// - Already in terminal state (waiting_orchestrator, completed, error, stopped)
-export function waitForAgentsByIds(
-  itemId: string,
-  agentIds: string[]
-): Promise<void> {
-  return new Promise((resolve) => {
-    const targetAgentIds = new Set<string>(agentIds);
-    const completedAgentIds = new Set<string>();
-
-    // Check current agents matching the IDs
-    for (const id of targetAgentIds) {
-      const agent = agentState.get(id);
-      if (agent && agent.itemId === itemId) {
-        // If already in terminal state, mark as completed
-        if (
-          agent.status === 'waiting_orchestrator' ||
-          agent.status === 'completed' ||
-          agent.status === 'error' ||
-          agent.status === 'stopped'
-        ) {
-          completedAgentIds.add(id);
-        }
-      }
-    }
-
-    // If no agents or all already completed
-    if (targetAgentIds.size === 0 || completedAgentIds.size === targetAgentIds.size) {
-      resolve();
-      return;
-    }
-
-    const checkCompletion = () => {
-      if (completedAgentIds.size === targetAgentIds.size) {
-        ptyManager.off('exit', handleExit);
-        ptyManager.off('tasks_completed', handleTasksCompleted);
-        resolve();
-      }
-    };
-
-    const handleExit = (event: { instanceId: string; exitCode: number; signal?: number }) => {
-      if (targetAgentIds.has(event.instanceId)) {
-        completedAgentIds.add(event.instanceId);
-        checkCompletion();
-      }
-    };
-
-    const handleTasksCompleted = (event: { instanceId: string; timestamp: string }) => {
-      if (targetAgentIds.has(event.instanceId)) {
-        completedAgentIds.add(event.instanceId);
-        checkCompletion();
-      }
-    };
-
-    ptyManager.on('exit', handleExit);
-    ptyManager.on('tasks_completed', handleTasksCompleted);
-  });
 }
 
 // Reconstruct agent state from events on startup
@@ -423,13 +272,20 @@ export async function reconstructAgentState(itemId: string): Promise<void> {
       const agent = agents.get(event.agentId);
       if (agent) {
         if (agent.status !== 'stopped') {
-          agent.status = e.newStatus as AgentStatus;
+          // Backward compat: map old statuses to new ones
+          let newStatus = e.newStatus as AgentStatus;
+          if (newStatus === ('waiting_approval' as AgentStatus)) {
+            newStatus = 'running';
+          } else if (newStatus === ('waiting_orchestrator' as AgentStatus)) {
+            newStatus = 'completed';
+          }
+          agent.status = newStatus;
         }
       }
     }
   }
 
-  // Only keep non-running agents in state (running ones would have PTYs)
+  // Only keep non-running agents in state (running ones would have processes)
   for (const [id, agent] of agents) {
     if (agent.status !== 'running') {
       agentState.set(id, agent);
@@ -437,8 +293,7 @@ export async function reconstructAgentState(itemId: string): Promise<void> {
   }
 }
 
-// Clean up orphaned agents (running in events but no PTY exists)
-// This should be called on server startup for each item
+// Clean up orphaned agents (running in events but no process exists)
 export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<number> {
   const events = await readJsonl<ItemEvent>(getItemEventsPath(itemId));
 
@@ -474,33 +329,35 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
     } else if (event.type === 'status_changed' && event.agentId) {
       const e = event as import('@agent-orch/shared').StatusChangedEvent;
       const existing = agents.get(event.agentId);
+      // Backward compat mapping
+      let newStatus = e.newStatus as AgentStatus;
+      if (newStatus === ('waiting_approval' as AgentStatus)) {
+        newStatus = 'running';
+      } else if (newStatus === ('waiting_orchestrator' as AgentStatus)) {
+        newStatus = 'completed';
+      }
       if (existing) {
         if (existing.status !== 'stopped') {
-          existing.status = e.newStatus as AgentStatus;
+          existing.status = newStatus;
         }
       } else {
         agents.set(event.agentId, {
-          status: e.newStatus as AgentStatus,
+          status: newStatus,
           agentId: event.agentId,
         });
       }
     }
   }
 
-  // Find agents that are in "active" status but have no PTY
+  // Find agents that are in "active" status but have no running process
   let cleanedCount = 0;
   for (const [agentId, agent] of agents) {
-    const isActiveStatus = agent.status === 'running' ||
-                           agent.status === 'waiting_approval' ||
-                           agent.status === 'waiting_orchestrator';
+    const isActiveStatus = agent.status === 'running';
 
     if (isActiveStatus) {
-      // Check if PTY exists
-      const ptyInstance = ptyManager.getInstance(agentId);
-      if (!ptyInstance) {
-        // No PTY exists - agent was orphaned by server restart
-
-        // 1. Determine role FIRST (before any writes)
+      // Check if process exists
+      const hasProcess = runningProcesses.has(agentId);
+      if (!hasProcess) {
         const role = agent.role ?? tryExtractRoleFromAgentId(agentId);
 
         if (!role) {
@@ -510,7 +367,6 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
 
         console.log(`[${itemId}] Cleaning up orphaned agent: ${agentId} (was ${agent.status})`);
 
-        // 2. Write event first
         const statusEvent = createStatusChangedEvent(
           itemId,
           agent.status,
@@ -525,7 +381,6 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
           continue;
         }
 
-        // 3. Update in-memory state ONLY after successful event write
         agentState.set(agentId, {
           id: agentId,
           itemId,
@@ -543,22 +398,16 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
 }
 
 // Helper to extract role from agent ID
-// New format: "agent-{role}--{repoName}--{nanoid}" or "agent-{role}--{nanoid}"
-// Legacy format: "agent-{role}-{repoName}-{nanoid}" or "agent-{role}-{nanoid}"
-// Returns null if pattern is unknown - caller must handle this case
 function tryExtractRoleFromAgentId(agentId: string): AgentRole | null {
-  // New format: split by '--' → ["agent-{role}", "{repoName}", "{nanoid}"] or ["agent-{role}", "{nanoid}"]
   const parts = agentId.split('--');
   if (parts.length >= 2 && parts[0].startsWith('agent-')) {
     return parts[0].slice('agent-'.length) as AgentRole;
   }
 
-  // Legacy fallback: known roles with hyphens
   if (agentId.includes('-planner-')) return 'planner';
   if (agentId.includes('-review-receiver-')) return 'review-receiver';
   if (agentId.includes('-review-')) return 'review';
 
-  // Legacy fallback: agent-{role}-{repoName}-{nanoid}
   const match = agentId.match(/^agent-([^-]+)-/);
   if (match) return match[1];
 

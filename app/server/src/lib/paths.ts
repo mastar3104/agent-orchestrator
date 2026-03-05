@@ -34,6 +34,10 @@ export function getAgentDir(itemId: string, agentId: string): string {
   return join(getAgentsDir(itemId), agentId);
 }
 
+export function getAgentOutputPath(itemId: string, agentId: string): string {
+  return join(getAgentDir(itemId, agentId), 'output.json');
+}
+
 export function getAgentEventsPath(itemId: string, agentId: string): string {
   return join(getAgentDir(itemId, agentId), 'events.jsonl');
 }

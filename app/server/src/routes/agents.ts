@@ -1,45 +1,58 @@
+import { readFile } from 'fs/promises';
 import type { FastifyPluginAsync } from 'fastify';
 import type {
   ApiResponse,
-  StartAgentRequest,
-  StartAgentResponse,
-  SendInputRequest,
   AgentInfo,
+  AgentExecutionOutput,
   AgentRole,
 } from '@agent-orch/shared';
-import { isSystemRole } from '@agent-orch/shared';
 import {
-  startAgent,
   stopAgent,
-  sendInput,
   getAgent,
   getAgentsByItem,
-  getOutputBuffer,
-  resizeTerminal,
 } from '../services/agent-service';
 import { startPlanner, getPlan, getPlanContent, updatePlanContent } from '../services/planner-service';
-import { startWorkers, startWorkerForRole, getWorkerStatus } from '../services/worker-service';
-import { getWorkspaceRoot } from '../lib/paths';
+import { startWorkers, startWorkerForRepo, getWorkerStatus } from '../services/worker-service';
+import { getWorkspaceRoot, getAgentOutputPath } from '../lib/paths';
+import { withItemLock, isItemLocked } from '../lib/locks';
+import { createErrorEvent } from '../lib/events';
+import { appendJsonl } from '../lib/jsonl';
+import { getItemEventsPath } from '../lib/paths';
+import { eventBus } from '../services/event-bus';
+import { stopAllGitSnapshots } from '../services/git-snapshot-service';
+
+const WORKERS_MAX_RETRIES = 1; // Total 2 attempts
 
 export const agentRoutes: FastifyPluginAsync = async (fastify) => {
-  // Start planner for an item
+  // Start planner for an item (async — returns 202 immediately)
   fastify.post<{
     Params: { id: string };
     Reply: ApiResponse<{ started: boolean }>;
   }>('/items/:id/planner/start', async (request, reply) => {
-    try {
-      await startPlanner(request.params.id);
-      return reply.send({
-        success: true,
-        data: { started: true },
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      return reply.status(500).send({
+    const itemId = request.params.id;
+
+    if (isItemLocked(itemId)) {
+      return reply.status(409).send({
         success: false,
-        error: message,
+        error: 'Operation already in progress for this item',
       });
     }
+
+    // Fire-and-forget with item lock + error logging
+    withItemLock(itemId, () => startPlanner(itemId)).catch(async (err) => {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      console.error(`[${itemId}] Planner failed:`, message);
+      try {
+        const errorEvent = createErrorEvent(itemId, message);
+        await appendJsonl(getItemEventsPath(itemId), errorEvent);
+        eventBus.emit('event', { itemId, event: errorEvent });
+      } catch { /* best-effort */ }
+    });
+
+    return reply.status(202).send({
+      success: true,
+      data: { started: true },
+    });
   });
 
   // Get plan for an item
@@ -104,24 +117,51 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
     }
   });
 
-  // Start all workers
+  // Start all workers (async — returns 202 immediately)
   fastify.post<{
     Params: { id: string };
     Reply: ApiResponse<{ started: boolean }>;
   }>('/items/:id/workers/start', async (request, reply) => {
-    try {
-      await startWorkers(request.params.id);
-      return reply.send({
-        success: true,
-        data: { started: true },
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      return reply.status(500).send({
+    const itemId = request.params.id;
+
+    if (isItemLocked(itemId)) {
+      return reply.status(409).send({
         success: false,
-        error: message,
+        error: 'Operation already in progress for this item',
       });
     }
+
+    // Fire-and-forget with item lock + retry + error logging
+    withItemLock(itemId, async () => {
+      let lastError: Error | null = null;
+      for (let attempt = 0; attempt <= WORKERS_MAX_RETRIES; attempt++) {
+        try {
+          await startWorkers(itemId);
+          return;
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          if (attempt < WORKERS_MAX_RETRIES) {
+            stopAllGitSnapshots(itemId);
+            console.warn(`[${itemId}] Workers attempt ${attempt + 1} failed: ${lastError.message}, retrying...`);
+            continue;
+          }
+        }
+      }
+      throw lastError!;
+    }).catch(async (err) => {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      console.error(`[${itemId}] Workers failed:`, message);
+      try {
+        const errorEvent = createErrorEvent(itemId, message);
+        await appendJsonl(getItemEventsPath(itemId), errorEvent);
+        eventBus.emit('event', { itemId, event: errorEvent });
+      } catch { /* best-effort */ }
+    });
+
+    return reply.status(202).send({
+      success: true,
+      data: { started: true },
+    });
   });
 
   // Get worker status
@@ -167,33 +207,44 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
   // Start a specific agent
   fastify.post<{
     Params: { id: string };
-    Body: StartAgentRequest;
-    Reply: ApiResponse<StartAgentResponse>;
+    Body: { repoName: string; role?: string; prompt?: string };
+    Reply: ApiResponse<{ agent: AgentInfo }>;
   }>('/items/:id/agents/start', async (request, reply) => {
     try {
-      const { role, prompt } = request.body;
+      const { repoName, role } = request.body;
+      const effectiveRole = (role || 'engineer') as AgentRole;
 
-      // If role is a dev role or review, start via worker service
-      if (!isSystemRole(role) || role === 'review') {
-        await startWorkerForRole(request.params.id, role as AgentRole);
-        const agents = await getAgentsByItem(request.params.id);
-        const agent = agents.find((a) => a.role === role);
-        if (agent) {
-          return reply.status(201).send({
-            success: true,
-            data: { agent },
-          });
-        }
+      if (!repoName) {
+        return reply.status(400).send({
+          success: false,
+          error: 'repoName is required',
+        });
       }
 
-      // Otherwise start a generic agent
-      const agent = await startAgent({
-        itemId: request.params.id,
-        role,
-        prompt: prompt || 'Start working on the assigned tasks.',
-        workingDir: getWorkspaceRoot(request.params.id),
-      });
+      // Reject system roles that have dedicated start flows
+      if (effectiveRole === 'planner') {
+        return reply.status(400).send({
+          success: false,
+          error: 'Use POST /items/:id/planner/start to start the planner',
+        });
+      }
+      if (effectiveRole === 'review-receiver') {
+        return reply.status(400).send({
+          success: false,
+          error: 'review-receiver requires PR context; use the review-receive endpoint',
+        });
+      }
 
+      // Dev roles (and 'review') → delegate to startWorkerForRepo
+      await startWorkerForRepo(request.params.id, repoName, effectiveRole);
+      const agents = await getAgentsByItem(request.params.id);
+      const agent = agents.find((a) => a.role === effectiveRole && a.repoName === repoName);
+      if (!agent) {
+        return reply.status(404).send({
+          success: false,
+          error: `Agent for role '${effectiveRole}' in repo '${repoName}' not found after start`,
+        });
+      }
       return reply.status(201).send({
         success: true,
         data: { agent },
@@ -233,6 +284,48 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
     }
   });
 
+  // Get agent output
+  fastify.get<{
+    Params: { id: string; agentId: string };
+    Reply: ApiResponse<{ output: AgentExecutionOutput | null }>;
+  }>('/items/:id/agents/:agentId/output', async (request, reply) => {
+    try {
+      const agent = getAgent(request.params.agentId);
+      if (!agent || agent.itemId !== request.params.id) {
+        return reply.status(404).send({
+          success: false,
+          error: 'Agent not found',
+        });
+      }
+
+      const outputPath = getAgentOutputPath(request.params.id, request.params.agentId);
+      let output: AgentExecutionOutput | null = null;
+      try {
+        const raw = await readFile(outputPath, 'utf-8');
+        output = JSON.parse(raw) as AgentExecutionOutput;
+      } catch (err: unknown) {
+        if (err && typeof err === 'object' && 'code' in err && (err as { code: string }).code === 'ENOENT') {
+          // File not found — agent hasn't completed yet
+          output = null;
+        } else {
+          console.warn(`[${request.params.agentId}] Failed to read output.json: ${err instanceof Error ? err.message : err}`);
+          output = null;
+        }
+      }
+
+      return reply.send({
+        success: true,
+        data: { output },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return reply.status(500).send({
+        success: false,
+        error: message,
+      });
+    }
+  });
+
   // Stop an agent
   fastify.post<{
     Params: { id: string; agentId: string };
@@ -249,87 +342,6 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.send({
         success: true,
         data: { stopped: true },
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      return reply.status(500).send({
-        success: false,
-        error: message,
-      });
-    }
-  });
-
-  // Send input to an agent
-  fastify.post<{
-    Params: { id: string; agentId: string };
-    Body: SendInputRequest;
-    Reply: ApiResponse<{ sent: boolean }>;
-  }>('/items/:id/agents/:agentId/input', async (request, reply) => {
-    try {
-      const sent = await sendInput(request.params.agentId, request.body.input);
-      if (!sent) {
-        return reply.status(404).send({
-          success: false,
-          error: 'Agent not found or not running',
-        });
-      }
-      return reply.send({
-        success: true,
-        data: { sent: true },
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      return reply.status(500).send({
-        success: false,
-        error: message,
-      });
-    }
-  });
-
-  // Get agent output buffer
-  fastify.get<{
-    Params: { id: string; agentId: string };
-    Reply: ApiResponse<{ output: string }>;
-  }>('/items/:id/agents/:agentId/output', async (request, reply) => {
-    try {
-      const output = getOutputBuffer(request.params.agentId);
-      if (output === null) {
-        return reply.status(404).send({
-          success: false,
-          error: 'Agent not found',
-        });
-      }
-      return reply.send({
-        success: true,
-        data: { output },
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      return reply.status(500).send({
-        success: false,
-        error: message,
-      });
-    }
-  });
-
-  // Resize agent terminal
-  fastify.post<{
-    Params: { id: string; agentId: string };
-    Body: { cols: number; rows: number };
-    Reply: ApiResponse<{ resized: boolean }>;
-  }>('/items/:id/agents/:agentId/resize', async (request, reply) => {
-    try {
-      const { cols, rows } = request.body;
-      const resized = resizeTerminal(request.params.agentId, cols, rows);
-      if (!resized) {
-        return reply.status(404).send({
-          success: false,
-          error: 'Agent not found or not running',
-        });
-      }
-      return reply.send({
-        success: true,
-        data: { resized: true },
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';

@@ -17,8 +17,11 @@ import {
 import { createDraftPrsForAllRepos } from '../services/git-pr-service';
 import {
   startReviewReceive,
+  validateReviewReceivePreConditions,
   ReviewReceiveValidationError,
 } from '../services/review-receive-service';
+import { withItemLock, isItemLocked } from '../lib/locks';
+import { AllowedToolsFormatError } from '../lib/role-loader';
 
 export const itemRoutes: FastifyPluginAsync = async (fastify) => {
   // Create a new item
@@ -39,6 +42,9 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
         data: { item },
       });
     } catch (error) {
+      if (error instanceof AllowedToolsFormatError) {
+        return reply.status(400).send({ success: false, error: error.message });
+      }
       const message = error instanceof Error ? error.message : 'Unknown error';
       return reply.status(500).send({
         success: false,
@@ -197,36 +203,44 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
     }
   });
 
-  // Review Receive - fetch PR comments and create plan
+  // Review Receive - fetch PR comments and create plan (async — returns 202 immediately)
   fastify.post<{
     Params: { id: string };
     Body: { repoName?: string };
-    Reply: ApiResponse<{ started: boolean; prNumber: number; repoName: string }>;
+    Reply: ApiResponse<{ started: boolean }>;
   }>('/items/:id/review-receive/start', async (request, reply) => {
-    try {
-      const result = await startReviewReceive(request.params.id, request.body?.repoName);
-      return reply.send({
-        success: true,
-        data: result,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
+    const itemId = request.params.id;
 
-      if (error instanceof ReviewReceiveValidationError) {
-        return reply.status(400).send({
-          success: false,
-          error: message,
-        });
-      }
-
-      fastify.log.error(
-        { itemId: request.params.id, error },
-        'Review receive failed'
-      );
-      return reply.status(500).send({
+    if (isItemLocked(itemId)) {
+      return reply.status(409).send({
         success: false,
-        error: message,
+        error: 'Operation already in progress for this item',
       });
     }
+
+    // Validation (synchronous, fast)
+    try {
+      await validateReviewReceivePreConditions(itemId, request.body?.repoName);
+    } catch (error) {
+      if (error instanceof ReviewReceiveValidationError) {
+        return reply.status(400).send({ success: false, error: error.message });
+      }
+      throw error;
+    }
+
+    // Fire-and-forget with item lock
+    // Error events are recorded internally by review-receive-service (fetchPrComments)
+    // and agent-service (executeAgent), so we only log to console here.
+    withItemLock(itemId, () =>
+      startReviewReceive(itemId, request.body?.repoName)
+    ).catch((err) => {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      console.error(`[${itemId}] Review receive failed:`, message);
+    });
+
+    return reply.status(202).send({
+      success: true,
+      data: { started: true },
+    });
   });
 };

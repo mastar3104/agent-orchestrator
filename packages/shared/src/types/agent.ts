@@ -7,15 +7,13 @@ export function isSystemRole(role: string): boolean {
 }
 
 export function isDevRole(role: string): boolean {
-  return !SYSTEM_ROLES.has(role);
+  return role === 'engineer';
 }
 
 export type AgentStatus =
   | 'idle'
   | 'starting'
   | 'running'
-  | 'waiting_approval'
-  | 'waiting_orchestrator'  // タスク完了後、オーケストレーターからの指示待ち
   | 'stopped'
   | 'completed'
   | 'error';
@@ -46,5 +44,15 @@ export interface AgentOutput {
   agentId: string;
   type: 'stdout' | 'stderr';
   data: string;
+  timestamp: string;
+}
+
+export interface AgentExecutionOutput {
+  prompt: string;
+  stdout: string;
+  stderr: string;
+  parsedOutput: unknown;
+  exitCode: number;
+  durationMs: number;
   timestamp: string;
 }

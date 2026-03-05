@@ -16,6 +16,7 @@ import {
   updateRepository,
   deleteRepository,
 } from '../services/repository-service';
+import { AllowedToolsFormatError } from '../lib/role-loader';
 
 export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
   // List all repositories
@@ -101,6 +102,9 @@ export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
         data: { repository },
       });
     } catch (error) {
+      if (error instanceof AllowedToolsFormatError) {
+        return reply.status(400).send({ success: false, error: error.message });
+      }
       const message = error instanceof Error ? error.message : 'Unknown error';
       return reply.status(500).send({
         success: false,
@@ -128,6 +132,9 @@ export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
         data: { repository },
       });
     } catch (error) {
+      if (error instanceof AllowedToolsFormatError) {
+        return reply.status(400).send({ success: false, error: error.message });
+      }
       const message = error instanceof Error ? error.message : 'Unknown error';
       return reply.status(500).send({
         success: false,

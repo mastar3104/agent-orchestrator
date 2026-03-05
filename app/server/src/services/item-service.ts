@@ -16,6 +16,7 @@ import type {
   RepoNoChangesEvent,
 } from '@agent-orch/shared';
 import { getRepository, createRepository } from './repository-service';
+import { sanitizeRepoAllowedTools } from '../lib/role-loader';
 import { readYaml, writeYaml, readYamlSafe } from '../lib/yaml';
 import { appendJsonl, readJsonl } from '../lib/jsonl';
 import {
@@ -62,7 +63,6 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
       }
       repoConfig = {
         name: repoInput.name,
-        role: repoInput.role,
         type: savedRepo.type,
         url: savedRepo.url,
         localPath: savedRepo.localPath,
@@ -70,12 +70,12 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
         workBranch: repoInput.workBranch || `work/${id}/${repoInput.name}`,
         submodules: savedRepo.submodules,
         linkMode: savedRepo.linkMode,
+        allowedTools: repoInput.allowedTools || savedRepo.allowedTools,
       };
     } else if (repoInput.repository) {
       // Use directly provided repository config
       repoConfig = {
         name: repoInput.name,
-        role: repoInput.role,
         type: repoInput.repository.type,
         url: repoInput.repository.url,
         localPath: repoInput.repository.localPath,
@@ -83,6 +83,7 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
         workBranch: repoInput.repository.workBranch || `work/${id}/${repoInput.name}`,
         submodules: repoInput.repository.submodules,
         linkMode: repoInput.repository.linkMode,
+        allowedTools: repoInput.allowedTools || repoInput.repository.allowedTools,
       };
 
       // Optionally save the repository for reuse
@@ -96,11 +97,15 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
           submodules: repoInput.repository.submodules,
           linkMode: repoInput.repository.linkMode,
           directoryName: repoInput.name,
-          role: repoInput.role,
+          allowedTools: repoConfig.allowedTools,
         });
       }
     } else {
       throw new Error(`Repository input for "${repoInput.name}" must have either repositoryId or repository`);
+    }
+
+    if (repoConfig.allowedTools && repoConfig.allowedTools.length > 0) {
+      repoConfig.allowedTools = sanitizeRepoAllowedTools(repoConfig.name, repoConfig.allowedTools);
     }
 
     repositories.push(repoConfig);
@@ -370,7 +375,6 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
     const hasNoChanges = noChangesEvents.some(e => e.repoName === repo.name);
     return {
       repoName: repo.name,
-      role: repo.role,
       prUrl: prEvent?.prUrl,
       prNumber: prEvent?.prNumber,
       noChanges: hasNoChanges,

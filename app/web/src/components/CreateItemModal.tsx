@@ -16,7 +16,6 @@ type RepoSource = 'saved' | 'manual';
 interface RepoEntry {
   key: number;
   name: string;
-  role: string;
   repoSource: RepoSource;
   selectedRepoId?: string;
   repoType: RepoType;
@@ -28,6 +27,7 @@ interface RepoEntry {
   submodules: boolean;
   saveRepository: boolean;
   repositoryName: string;
+  allowedTools: string;
 }
 
 let nextKey = 0;
@@ -35,7 +35,6 @@ function createEmptyRepoEntry(): RepoEntry {
   return {
     key: nextKey++,
     name: '',
-    role: '',
     repoSource: 'saved',
     selectedRepoId: undefined,
     repoType: 'remote',
@@ -47,6 +46,7 @@ function createEmptyRepoEntry(): RepoEntry {
     submodules: false,
     saveRepository: false,
     repositoryName: '',
+    allowedTools: '',
   };
 }
 
@@ -99,9 +99,14 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
 
     try {
       const repoInputs: CreateItemRepositoryInput[] = repos.map((repo) => {
+        const parsedTools = repo.allowedTools
+          .split(',')
+          .map(t => t.trim())
+          .filter(t => t.length > 0);
+
         const input: CreateItemRepositoryInput = {
           name: repo.name,
-          role: repo.role,
+          allowedTools: parsedTools.length > 0 ? parsedTools : undefined,
         };
 
         if (repo.repoSource === 'saved' && repo.selectedRepoId) {
@@ -156,7 +161,7 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
   };
 
   const isRepoValid = (repo: RepoEntry) => {
-    if (!repo.name || !repo.role) return false;
+    if (!repo.name) return false;
     if (repo.repoSource === 'saved') {
       return !!repo.selectedRepoId;
     } else {
@@ -247,35 +252,18 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                     )}
                   </div>
 
-                  {/* Name and Role */}
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs font-medium text-gray-400 mb-1">
-                        Directory Name *
-                      </label>
-                      <input
-                        type="text"
-                        value={repo.name}
-                        onChange={(e) => updateRepo(repo.key, { name: e.target.value })}
-                        className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
-                        placeholder="frontend"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-gray-400 mb-1">
-                        Role *
-                      </label>
-                      <input
-                        type="text"
-                        value={repo.role}
-                        onChange={(e) => updateRepo(repo.key, { role: e.target.value })}
-                        className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
-                        placeholder="front"
-                      />
-                      <p className="text-xs text-gray-500 mt-0.5">
-                        Dev agent role (e.g. front, back, docs)
-                      </p>
-                    </div>
+                  {/* Directory Name */}
+                  <div>
+                    <label className="block text-xs font-medium text-gray-400 mb-1">
+                      Directory Name *
+                    </label>
+                    <input
+                      type="text"
+                      value={repo.name}
+                      onChange={(e) => updateRepo(repo.key, { name: e.target.value })}
+                      className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                      placeholder="frontend"
+                    />
                   </div>
 
                   {/* Repository Source Selection */}
@@ -318,8 +306,8 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                               if (selectedRepo.directoryName) {
                                 updates.name = selectedRepo.directoryName;
                               }
-                              if (selectedRepo.role) {
-                                updates.role = selectedRepo.role;
+                              if (selectedRepo.allowedTools && selectedRepo.allowedTools.length > 0) {
+                                updates.allowedTools = selectedRepo.allowedTools.join(', ');
                               }
                             }
                           }
@@ -328,32 +316,49 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                         loading={reposLoading}
                       />
                       {repo.selectedRepoId && (
-                        <div className="grid grid-cols-2 gap-3">
-                          <div>
-                            <label className="block text-xs font-medium text-gray-400 mb-1">
-                              Clone Branch
-                            </label>
-                            <input
-                              type="text"
-                              value={repo.branch}
-                              onChange={(e) => updateRepo(repo.key, { branch: e.target.value })}
-                              className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
-                              placeholder={repositories.find(r => r.id === repo.selectedRepoId)?.branch || 'main'}
-                            />
+                        <>
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <label className="block text-xs font-medium text-gray-400 mb-1">
+                                Clone Branch
+                              </label>
+                              <input
+                                type="text"
+                                value={repo.branch}
+                                onChange={(e) => updateRepo(repo.key, { branch: e.target.value })}
+                                className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                                placeholder={repositories.find(r => r.id === repo.selectedRepoId)?.branch || 'main'}
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium text-gray-400 mb-1">
+                                Work Branch
+                              </label>
+                              <input
+                                type="text"
+                                value={repo.workBranch}
+                                onChange={(e) => updateRepo(repo.key, { workBranch: e.target.value })}
+                                className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                                placeholder="auto-generated"
+                              />
+                            </div>
                           </div>
                           <div>
                             <label className="block text-xs font-medium text-gray-400 mb-1">
-                              Work Branch
+                              Allowed Tools
                             </label>
                             <input
                               type="text"
-                              value={repo.workBranch}
-                              onChange={(e) => updateRepo(repo.key, { workBranch: e.target.value })}
-                              className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
-                              placeholder="auto-generated"
+                              value={repo.allowedTools}
+                              onChange={(e) => updateRepo(repo.key, { allowedTools: e.target.value })}
+                              className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm font-mono focus:outline-none focus:border-blue-500"
+                              placeholder="Bash(make:*), Bash(go:*)"
                             />
+                            <p className="text-xs text-yellow-600 mt-0.5">
+                              Dangerous commands can also be configured — use at your own risk.
+                            </p>
                           </div>
-                        </div>
+                        </>
                       )}
                     </>
                   ) : (
@@ -474,6 +479,23 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                           </div>
                         </>
                       )}
+
+                      {/* Allowed Tools */}
+                      <div>
+                        <label className="block text-xs font-medium text-gray-400 mb-1">
+                          Allowed Tools
+                        </label>
+                        <input
+                          type="text"
+                          value={repo.allowedTools}
+                          onChange={(e) => updateRepo(repo.key, { allowedTools: e.target.value })}
+                          className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm font-mono focus:outline-none focus:border-blue-500"
+                          placeholder="Bash(make:*), Bash(go:*)"
+                        />
+                        <p className="text-xs text-yellow-600 mt-0.5">
+                          Dangerous commands can also be configured — use at your own risk.
+                        </p>
+                      </div>
 
                       {/* Save Repository Option */}
                       <div className="p-2 bg-gray-700/50 rounded">

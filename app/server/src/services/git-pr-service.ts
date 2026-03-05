@@ -22,7 +22,11 @@ const PROTECTED_BRANCHES = ['main', 'master'];
 // 一時ファイルリスト（ワークフロー終了時に削除）
 const TEMP_FILES = ['review_findings.json'];
 
-// ヘルパー: コマンド実行
+// ヘルパー: コマンド実行 (exported as execGitInRepo for use by other services)
+export async function execGitInRepo(args: string[], cwd: string): Promise<string> {
+  return execGit(args, cwd);
+}
+
 async function execGit(args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const proc = spawn('git', args, { cwd, stdio: 'pipe' });
@@ -182,12 +186,23 @@ export async function createDraftPrForRepo(
   // コミットハッシュ取得
   const commitHash = await execGit(['rev-parse', 'HEAD'], repoDir);
 
-  // git push
+  // git push (with fallback to -fix branch if rejected)
+  let pushBranch = currentBranch;
   try {
     await execGit(['push', '-u', 'origin', currentBranch], repoDir);
-  } catch (error) {
-    await safeLogErrorEvent(eventsPath, itemId, `Git push failed for ${repo.name}: ${getErrorMessage(error)}`);
-    throw error;
+  } catch (pushError) {
+    const pushErrMsg = getErrorMessage(pushError);
+    console.warn(`[${itemId}/${repo.name}] Push to ${currentBranch} failed: ${pushErrMsg}, creating fix branch`);
+    const fixBranch = `${currentBranch}-fix`;
+    try {
+      await execGit(['checkout', '-b', fixBranch], repoDir);
+      await execGit(['push', '-u', 'origin', fixBranch], repoDir);
+      pushBranch = fixBranch;
+      console.log(`[${itemId}/${repo.name}] Pushed to fix branch: ${fixBranch}`);
+    } catch (fixError) {
+      await safeLogErrorEvent(eventsPath, itemId, `Git push failed for ${repo.name} (fix branch also failed): ${getErrorMessage(fixError)}`);
+      throw fixError;
+    }
   }
 
   // ghユーザー名取得
@@ -208,20 +223,49 @@ export async function createDraftPrForRepo(
 
   const baseBranch = repo.branch || 'main';
   let prInfo: { number: number; url: string };
-  try {
-    await execGh(
-      ['pr', 'create', '--draft', '--base', baseBranch, '--title', prTitle, '--body', prBody],
-      repoDir
-    );
 
-    const prJsonOutput = await execGh(
-      ['pr', 'view', '--json', 'number,url'],
-      repoDir
-    );
-    prInfo = JSON.parse(prJsonOutput);
-  } catch (error) {
-    await safeLogErrorEvent(eventsPath, itemId, `PR creation failed for ${repo.name}: ${getErrorMessage(error)}`);
-    throw error;
+  // Check if PR already exists (only when pushing to the original branch)
+  if (pushBranch === currentBranch) {
+    try {
+      const existingPrJson = await execGh(
+        ['pr', 'view', pushBranch, '--json', 'number,url'],
+        repoDir
+      );
+      prInfo = JSON.parse(existingPrJson);
+      console.log(`[${itemId}/${repo.name}] PR already exists: ${prInfo.url}`);
+    } catch {
+      // No existing PR → create new one
+      try {
+        await execGh(
+          ['pr', 'create', '--draft', '--base', baseBranch, '--title', prTitle, '--body', prBody],
+          repoDir
+        );
+        const prJsonOutput = await execGh(
+          ['pr', 'view', '--json', 'number,url'],
+          repoDir
+        );
+        prInfo = JSON.parse(prJsonOutput);
+      } catch (error) {
+        await safeLogErrorEvent(eventsPath, itemId, `PR creation failed for ${repo.name}: ${getErrorMessage(error)}`);
+        throw error;
+      }
+    }
+  } else {
+    // fix branch → always create new PR
+    try {
+      await execGh(
+        ['pr', 'create', '--draft', '--base', baseBranch, '--head', pushBranch, '--title', prTitle, '--body', prBody],
+        repoDir
+      );
+      const prJsonOutput = await execGh(
+        ['pr', 'view', pushBranch, '--json', 'number,url'],
+        repoDir
+      );
+      prInfo = JSON.parse(prJsonOutput);
+    } catch (error) {
+      await safeLogErrorEvent(eventsPath, itemId, `PR creation failed for ${repo.name} (fix branch): ${getErrorMessage(error)}`);
+      throw error;
+    }
   }
 
   // イベント記録
@@ -231,7 +275,7 @@ export async function createDraftPrForRepo(
       repo.name,
       prInfo.url,
       prInfo.number,
-      currentBranch,
+      pushBranch,
       commitHash
     );
     await appendJsonl(eventsPath, event);
@@ -243,6 +287,63 @@ export async function createDraftPrForRepo(
   console.log(`[${itemId}/${repo.name}] Draft PR created: ${prInfo.url}`);
 
   return { prUrl: prInfo.url, prNumber: prInfo.number };
+}
+
+/**
+ * Fetch PR comments (both review comments and issue comments)
+ */
+export async function fetchPrComments(
+  repoDir: string,
+  prNumber: number
+): Promise<{ author: string; body: string; path?: string; line?: number; createdAt: string }[]> {
+  const comments: { author: string; body: string; path?: string; line?: number; createdAt: string }[] = [];
+  let reviewFetchSuccess = false;
+  let issueFetchSuccess = false;
+
+  // Fetch PR review comments (inline comments on diff)
+  try {
+    const reviewCommentsJson = await execGh(
+      ['api', `repos/{owner}/{repo}/pulls/${prNumber}/comments`, '--jq', '.[] | {author: .user.login, body: .body, path: .path, line: .line, createdAt: .created_at}'],
+      repoDir
+    );
+    if (reviewCommentsJson.trim()) {
+      for (const line of reviewCommentsJson.trim().split('\n')) {
+        try {
+          comments.push(JSON.parse(line));
+        } catch { /* skip malformed lines */ }
+      }
+    }
+    reviewFetchSuccess = true;
+  } catch (error) {
+    console.warn(`Failed to fetch PR review comments: ${error instanceof Error ? error.message : error}`);
+  }
+
+  // Fetch PR issue comments (general comments)
+  try {
+    const issueCommentsJson = await execGh(
+      ['api', `repos/{owner}/{repo}/issues/${prNumber}/comments`, '--jq', '.[] | {author: .user.login, body: .body, createdAt: .created_at}'],
+      repoDir
+    );
+    if (issueCommentsJson.trim()) {
+      for (const line of issueCommentsJson.trim().split('\n')) {
+        try {
+          comments.push(JSON.parse(line));
+        } catch { /* skip malformed lines */ }
+      }
+    }
+    issueFetchSuccess = true;
+  } catch (error) {
+    console.warn(`Failed to fetch PR issue comments: ${error instanceof Error ? error.message : error}`);
+  }
+
+  if (!reviewFetchSuccess || !issueFetchSuccess) {
+    throw new Error(`Failed to fetch PR comments for PR #${prNumber}`);
+  }
+
+  // Sort by creation time
+  comments.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+
+  return comments;
 }
 
 /**

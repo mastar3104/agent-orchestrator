@@ -1,11 +1,10 @@
 import { useState, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import type { ItemEvent, AgentInfo, ReviewFindingsExtractedEvent } from '@agent-orch/shared';
+import type { ItemEvent, ReviewFindingsExtractedEvent } from '@agent-orch/shared';
 import { useItem } from '../hooks/useItems';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { AgentCard } from '../components/AgentCard';
-import { AgentTerminal } from '../components/AgentTerminal';
-import { ApprovalQueue } from '../components/ApprovalQueue';
+import { AgentOutputPanel } from '../components/AgentOutputPanel';
 import * as api from '../api/client';
 
 export function ItemDetailPage() {
@@ -21,8 +20,8 @@ export function ItemDetailPage() {
     startReviewReceive,
     reviewReceiveError,
   } = useItem(id);
-  const [selectedAgent, setSelectedAgent] = useState<AgentInfo | null>(null);
   const [recentEvents, setRecentEvents] = useState<ItemEvent[]>([]);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [planEditorOpen, setPlanEditorOpen] = useState(false);
   const [planContent, setPlanContent] = useState('');
   const [planOriginal, setPlanOriginal] = useState('');
@@ -41,6 +40,8 @@ export function ItemDetailPage() {
       event.type === 'approval_requested' ||
       event.type === 'approval_decision' ||
       event.type === 'plan_created' ||
+      event.type === 'review_receive_started' ||
+      event.type === 'review_receive_completed' ||
       event.type === 'review_findings_extracted' ||
       event.type === 'pr_created' ||
       event.type === 'repo_no_changes'
@@ -233,15 +234,6 @@ export function ItemDetailPage() {
         <p className="text-white">{item.description}</p>
       </div>
 
-      {/* Approval Queue */}
-      {item.pendingApprovals.length > 0 && (
-        <ApprovalQueue
-          itemId={item.id}
-          approvals={item.pendingApprovals}
-          onProcessed={refresh}
-        />
-      )}
-
       {/* Plan Summary */}
       {item.plan && (
         <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
@@ -401,39 +393,26 @@ export function ItemDetailPage() {
               <AgentCard
                 key={agent.id}
                 agent={agent}
-                isSelected={selectedAgent?.id === agent.id}
-                onSelect={() => setSelectedAgent(agent)}
                 onStop={() => stopAgent(agent.id)}
+                onClick={() =>
+                  setSelectedAgentId((prev) =>
+                    prev === agent.id ? null : agent.id
+                  )
+                }
+                isSelected={selectedAgentId === agent.id}
               />
             ))}
           </div>
         )}
+        {selectedAgentId && id && (
+          <AgentOutputPanel
+            key={selectedAgentId}
+            itemId={id}
+            agentId={selectedAgentId}
+            onClose={() => setSelectedAgentId(null)}
+          />
+        )}
       </div>
-
-      {/* Terminal */}
-      {selectedAgent && (
-        <div>
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-lg font-medium text-white">
-              Terminal - {selectedAgent.role}
-            </h3>
-            <button
-              onClick={() => setSelectedAgent(null)}
-              className="text-gray-400 hover:text-white"
-            >
-              Close
-            </button>
-          </div>
-          <div className="h-96">
-            <AgentTerminal
-              key={selectedAgent.id}
-              itemId={item.id}
-              agentId={selectedAgent.id}
-              events={recentEvents}
-            />
-          </div>
-        </div>
-      )}
 
       {/* Design Doc */}
       {item.designDoc && (

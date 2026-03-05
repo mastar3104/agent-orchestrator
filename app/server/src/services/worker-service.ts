@@ -1,20 +1,33 @@
-import { join, resolve } from 'path';
-import { readFile, unlink } from 'fs/promises';
-import type { Plan, PlanTask, AgentRole, AgentInfo, AgentStatus, ItemRepositoryConfig } from '@agent-orch/shared';
-import { isSystemRole, isDevRole } from '@agent-orch/shared';
-import { startAgent, getAgentsByItem, waitForAgentsByIds, sendLine, stopAgent } from './agent-service';
+import { spawn } from 'child_process';
+import { resolve } from 'path';
+import type { Plan, PlanTask, AgentRole, ItemRepositoryConfig } from '@agent-orch/shared';
+import { isDevRole } from '@agent-orch/shared';
+
+import { executeAgent, getAgentsByItem, stopAgent } from './agent-service';
 import { getPlan } from './planner-service';
 import { getItemConfig } from './item-service';
 import {
   startGitSnapshot,
+  stopGitSnapshot,
   stopAllGitSnapshots,
 } from './git-snapshot-service';
 import { createDraftPrsForAllRepos } from './git-pr-service';
 import { getWorkspaceRoot, getRepoWorkspaceDir, getItemEventsPath } from '../lib/paths';
-import { ptyManager } from '../lib/pty-manager';
 import { eventBus } from './event-bus';
 import { appendJsonl } from '../lib/jsonl';
 import { createReviewFindingsExtractedEvent, createStatusChangedEvent } from '../lib/events';
+import {
+  type EngineerResponse,
+  type ReviewerResponse,
+  type ReviewComment,
+} from '../lib/claude-schemas';
+import { getRole, mergeAllowedTools } from '../lib/role-loader';
+
+const MAX_REVIEW_ITERATIONS = 3;
+const MAX_DIFF_LINES = 20000;
+const REVIEW_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const ENGINEER_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes
+const AGENT_MAX_RETRIES = 1;
 
 function getRoleDescription(role: string): string {
   const descriptions: Record<string, string> = {
@@ -25,129 +38,44 @@ function getRoleDescription(role: string): string {
   return descriptions[role] || `${role} development`;
 }
 
-const WORKER_PROMPT_TEMPLATE = `You are a {{role}} development agent working on implementing specific tasks from a development plan.
+// ─── Git helpers ───
 
-## Your Role: {{roleDescription}}
-
-## Project Context
-
-**Repository:** {{repoName}}
-**Task ID:** {{taskId}}
-**Task Title:** {{taskTitle}}
-
-**Task Description:**
-{{taskDescription}}
-
-**Files to work on:**
-{{files}}
-
-**Dependencies:**
-{{dependencies}}
-
-## Instructions
-
-1. Focus ONLY on the task assigned to you
-2. Follow the existing code patterns and conventions in the repository
-3. Write clean, well-documented code
-4. Create or modify only the files necessary for your task
-5. Do not modify files outside your task scope unless absolutely necessary
-6. If you encounter blocking issues, document them clearly
-
-## Completion
-
-When your task is complete:
-1. Ensure all code compiles/runs without errors
-2. Write any necessary tests
-3. Clean up any temporary files you created (e.g., debug logs, test outputs)
-4. Commit your changes:
-   a. FIRST run: git status --porcelain
-   b. Review the output carefully - only files YOU intentionally modified should be committed
-   c. If unexpected files appear:
-      - Temporary files you created: delete them (rm <file>)
-      - Files you didn't modify: do NOT add them
-   d. Run: git add <only the files you intentionally modified>
-   e. Run: git commit -m "feat(<scope>): <description>"
-
-   IMPORTANT - Commit Rules:
-   - NEVER use git add -A or git add .
-   - Only commit files you actually modified for your task
-   - Do NOT commit:
-     * Temporary files (review_findings.json, plan.yaml, debug logs, etc.)
-     * Lock files (yarn.lock, package-lock.json, go.sum, etc.) UNLESS you intentionally added/removed dependencies
-     * Files you didn't modify
-   - If you created any temporary files during your work, DELETE them before committing
-
-5. Output "TASKS_COMPLETED" on a new line
-6. Wait for further instructions from the orchestrator
-
-Do NOT run /exit unless explicitly instructed by the orchestrator.
-
-Start working on your assigned task now.`;
-
-const REVIEW_PROMPT_TEMPLATE = `You are a code review agent reviewing the {{repoName}} repository. Your task is to review the code changes made by the development agents and provide actionable feedback.
-
-## Your Role
-
-Review the code for:
-1. Code quality and best practices
-2. Potential bugs or security issues
-3. Performance concerns
-4. Adherence to project conventions
-5. Test coverage
-
-## Output Format
-
-After reviewing, output your findings as JSON in the following format:
-
-\`\`\`json:review_findings.json
-{
-  "findings": [
-    {
-      "severity": "critical" | "major" | "minor",
-      "file": "path/to/file.ts",
-      "line": 42,
-      "description": "Issue description",
-      "suggestedFix": "How to fix",
-      "targetAgent": "{{targetRole}}"
-    }
-  ],
-  "overallAssessment": "pass" | "needs_fixes",
-  "summary": "Overall summary"
-}
-\`\`\`
-
-Then output "TASKS_COMPLETED" and wait for further instructions.
-
-## Instructions
-
-1. Examine all changed files in the workspace
-2. Focus on critical and major issues first
-3. Be specific about file paths and line numbers
-4. Provide actionable fix suggestions
-5. If no issues found, set overallAssessment to "pass"
-
-Start your review now.`;
-
-// Types for review findings
-interface ReviewFinding {
-  severity: 'critical' | 'major' | 'minor';
-  file: string;
-  line?: number;
-  description: string;
-  suggestedFix: string;
-  targetAgent: string;
+async function execGit(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('git', args, { cwd, stdio: 'pipe' });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout?.on('data', (d) => (stdout += d.toString()));
+    proc.stderr?.on('data', (d) => (stderr += d.toString()));
+    proc.on('close', (code) => {
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(`git ${args[0]} failed: ${stderr}`));
+    });
+    proc.on('error', reject);
+  });
 }
 
-interface ReviewFindings {
-  findings: ReviewFinding[];
-  overallAssessment: 'pass' | 'needs_fixes';
-  summary: string;
+async function getGitHead(cwd: string): Promise<string> {
+  return execGit(['rev-parse', 'HEAD'], cwd);
 }
 
-const MAX_REVIEW_ITERATIONS = 3;
+async function getGitMergeBase(cwd: string, baseBranch: string): Promise<string> {
+  return execGit(['merge-base', `origin/${baseBranch}`, 'HEAD'], cwd);
+}
 
-// Active dev agents: `${itemId}/${repoName}` -> agentId
-const activeDevAgents = new Map<string, string>();
+async function getGitDiff(cwd: string, base: string, head: string, files?: string[]): Promise<string> {
+  const args = ['diff', base, head];
+  if (files && files.length > 0) {
+    args.push('--');
+    args.push(...files);
+  }
+  const diff = await execGit(args, cwd);
+  const lines = diff.split('\n');
+  if (lines.length > MAX_DIFF_LINES) {
+    return lines.slice(0, MAX_DIFF_LINES).join('\n') + `\n<diff truncated at ${MAX_DIFF_LINES} lines; total ${lines.length} lines>`;
+  }
+  return diff;
+}
 
 // パストラバーサル防止
 function validateAgentWorkdir(agentWorkdir: string, workspaceRoot: string): void {
@@ -162,24 +90,16 @@ function validateAgentWorkdir(agentWorkdir: string, workspaceRoot: string): void
   }
 }
 
-// Worker起動 + git snapshot 開始
-async function startWorkerAgentWithSnapshot(
-  itemId: string,
-  role: AgentRole,
-  repoName: string,
-  tasks: PlanTask[],
-  plan: Plan,
-  agentWorkdir: string,
-  workspaceRoot: string
-): Promise<AgentInfo> {
-  validateAgentWorkdir(agentWorkdir, workspaceRoot);
+// ─── Engineer Phase Result ───
 
-  const agent = await startWorkerAgent(itemId, role, repoName, tasks, plan, agentWorkdir);
-
-  await startGitSnapshot(itemId, agentWorkdir, agent.id);
-
-  return agent;
+interface EngineerPhaseResult {
+  response: EngineerResponse;
+  reviewBase: string;
+  phaseBase: string;
+  initialHead: string;
 }
+
+// ─── Main orchestration ───
 
 export async function startWorkers(itemId: string): Promise<void> {
   const plan = await getPlan(itemId);
@@ -211,139 +131,330 @@ export async function startWorkers(itemId: string): Promise<void> {
     tasksByRepo.set(repoName, tasks);
   }
 
-  // Phase 1: Start dev workers for each repository in parallel
-  const devPromises: Promise<AgentInfo>[] = [];
-  const devAgentIds: string[] = [];
+  // ─── Phase 1: Dev Workers (parallel per repo) ───
+  const engineerResults = new Map<string, EngineerPhaseResult>();
+
+  const savedPhaseBases = new Map<string, string>();
+  const devPromises: Promise<void>[] = [];
 
   for (const repo of itemConfig.repositories) {
     const repoTasks = tasksByRepo.get(repo.name);
-    // Filter to only dev tasks (not review)
     const devTasks = repoTasks?.filter(t => isDevRole(t.agent)) || [];
     if (devTasks.length === 0) continue;
 
     const agentWorkdir = resolve(getRepoWorkspaceDir(itemId, repo.name));
-    const promise = startWorkerAgentWithSnapshot(
-      itemId, repo.role, repo.name, devTasks, plan, agentWorkdir, workspaceRoot
-    ).then(agent => {
-      // Track active dev agent
-      activeDevAgents.set(`${itemId}/${repo.name}`, agent.id);
-      devAgentIds.push(agent.id);
-      return agent;
-    });
+    validateAgentWorkdir(agentWorkdir, workspaceRoot);
+
+    const promise = (async () => {
+      const baseBranch = repo.branch || 'main';
+      const phaseBase = await getGitHead(agentWorkdir);
+      savedPhaseBases.set(repo.name, phaseBase);
+
+      // reviewBase: try merge-base first, fallback to phaseBase
+      let reviewBase: string;
+      try {
+        reviewBase = await getGitMergeBase(agentWorkdir, baseBranch);
+      } catch {
+        reviewBase = phaseBase;
+      }
+
+      // Start git snapshot
+      await startGitSnapshot(itemId, agentWorkdir);
+
+      const engineerRole = getRole('engineer');
+      const effectiveTools = mergeAllowedTools(engineerRole.allowedTools, repo.allowedTools);
+      const context = buildWorkerContext('engineer', repo.name, devTasks, plan);
+      const prompt = `${engineerRole.promptTemplate}\n\n${context}`;
+
+      for (let attempt = 0; attempt <= AGENT_MAX_RETRIES; attempt++) {
+        try {
+          const { result } = await executeAgent<EngineerResponse>({
+            itemId,
+            role: 'engineer',
+            repoName: repo.name,
+            prompt,
+            workingDir: agentWorkdir,
+            allowedTools: effectiveTools,
+            jsonSchema: engineerRole.jsonSchema,
+            timeoutMs: ENGINEER_TIMEOUT_MS,
+          });
+          let initialHead = phaseBase;
+          try {
+            initialHead = await getGitHead(agentWorkdir);
+          } catch {
+            // Keep phaseBase as a safe fallback.
+          }
+
+          engineerResults.set(repo.name, {
+            response: result.output,
+            reviewBase,
+            phaseBase,
+            initialHead,
+          });
+          break;
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          if (attempt < AGENT_MAX_RETRIES) {
+            console.warn(`[${itemId}/${repo.name}] Engineer attempt ${attempt + 1} failed: ${msg}, retrying...`);
+            continue;
+          }
+          console.error(`[${itemId}/${repo.name}] Engineer failed after ${attempt + 1} attempts: ${msg}, skipping repo`);
+        }
+      }
+    })();
 
     devPromises.push(promise);
   }
 
-  // Wait for dev workers to complete
+  // Wait for all dev workers to complete (allSettled to tolerate individual failures)
   if (devPromises.length > 0) {
-    await Promise.all(devPromises);
-    await waitForAgentsByIds(itemId, devAgentIds);
-  }
+    await Promise.allSettled(devPromises);
 
-  // Phase 2: Review Feedback Loop (per repository)
-  for (const repo of itemConfig.repositories) {
-    const repoTasks = tasksByRepo.get(repo.name);
-    const reviewTasks = repoTasks?.filter(t => t.agent === 'review') || [];
-    if (reviewTasks.length === 0) continue;
+    // Retry failed repos (repos that didn't produce results after initial attempts)
+    const failedRepos = itemConfig.repositories.filter(
+      repo => tasksByRepo.has(repo.name) &&
+              (tasksByRepo.get(repo.name)?.some(t => isDevRole(t.agent)) ?? false) &&
+              !engineerResults.has(repo.name)
+    );
 
-    const agentWorkdir = resolve(getRepoWorkspaceDir(itemId, repo.name));
+    for (const repo of failedRepos) {
+      const agentWorkdir = resolve(getRepoWorkspaceDir(itemId, repo.name));
+      // Cleanup stale state and restart snapshot
+      stopGitSnapshot(itemId, agentWorkdir);
+      await startGitSnapshot(itemId, agentWorkdir);
 
-    for (let iteration = 0; iteration < MAX_REVIEW_ITERATIONS; iteration++) {
-      console.log(`[${itemId}/${repo.name}] Starting review iteration ${iteration + 1}/${MAX_REVIEW_ITERATIONS}`);
+      const baseBranch = repo.branch || 'main';
+      const phaseBase = savedPhaseBases.get(repo.name)!;
+      let reviewBase: string;
+      try { reviewBase = await getGitMergeBase(agentWorkdir, baseBranch); }
+      catch { reviewBase = phaseBase; }
 
-      // Delete stale review_findings.json
+      const engineerRole = getRole('engineer');
+      const effectiveTools = mergeAllowedTools(engineerRole.allowedTools, repo.allowedTools);
+      const devTasks = tasksByRepo.get(repo.name)?.filter(t => isDevRole(t.agent)) || [];
+      const context = buildWorkerContext('engineer', repo.name, devTasks, plan);
+      const prompt = `${engineerRole.promptTemplate}\n\n${context}`;
+
       try {
-        await unlink(join(agentWorkdir, 'review_findings.json'));
-      } catch {
-        // File doesn't exist
-      }
-
-      // Start review agent for this repo
-      const reviewAgent = await startWorkerAgentWithSnapshot(
-        itemId, 'review', repo.name, reviewTasks, plan, agentWorkdir, workspaceRoot
-      );
-      await waitForAgentsByIds(itemId, [reviewAgent.id]);
-
-      // Extract and analyze findings
-      const findings = await extractReviewFindings(itemId, repo.name);
-
-      // Publish review findings event
-      if (findings) {
-        const event = createReviewFindingsExtractedEvent(
-          itemId,
-          reviewAgent.id,
-          repo.name,
-          findings.findings,
-          findings.overallAssessment,
-          findings.summary
-        );
-        await appendJsonl(getItemEventsPath(itemId), event);
-        eventBus.publish(itemId, event);
-      }
-
-      // Exit review agent
-      await stopAgent(reviewAgent.id);
-
-      // Check if review passed
-      if (!findings || findings.overallAssessment === 'pass') {
-        console.log(`[${itemId}/${repo.name}] Review passed on iteration ${iteration + 1}`);
-        break;
-      }
-
-      // Last iteration - don't send feedback
-      if (iteration === MAX_REVIEW_ITERATIONS - 1) {
-        console.warn(`[${itemId}/${repo.name}] Max review iterations reached`);
-        break;
-      }
-
-      console.log(`[${itemId}/${repo.name}] Review found ${findings.findings.length} issues`);
-
-      // Send feedback to the dev agent for this repo
-      const devAgentId = activeDevAgents.get(`${itemId}/${repo.name}`);
-      if (devAgentId) {
-        const devAgent = (await getAgentsByItem(itemId)).find(a => a.id === devAgentId);
-        if (devAgent && (devAgent.status === 'running' || devAgent.status === 'waiting_orchestrator')) {
-          const feedbackPrompt = buildFeedbackPrompt(findings.findings);
-          await sendCommandToAgent(devAgent.id, feedbackPrompt);
-
-          // Reset agent status to running
-          const previousStatus = devAgent.status;
-          devAgent.status = 'running';
-          const statusEvent = createStatusChangedEvent(
-            itemId,
-            previousStatus,
-            'running',
-            devAgent.id
-          );
-          await appendJsonl(getItemEventsPath(itemId), statusEvent);
-          eventBus.emit('event', { itemId, event: statusEvent });
-
-          // Wait for dev agent to complete fixes
-          await waitForAgentsByIds(itemId, [devAgent.id]);
-        } else {
-          console.warn(`[${itemId}/${repo.name}] Dev agent not available for feedback`);
+        const { result } = await executeAgent<EngineerResponse>({
+          itemId, role: 'engineer', repoName: repo.name, prompt,
+          workingDir: agentWorkdir, allowedTools: effectiveTools,
+          jsonSchema: engineerRole.jsonSchema, timeoutMs: ENGINEER_TIMEOUT_MS,
+        });
+        let initialHead = phaseBase;
+        try {
+          initialHead = await getGitHead(agentWorkdir);
+        } catch {
+          // Keep phaseBase as a safe fallback.
         }
-      } else {
-        console.warn(`[${itemId}/${repo.name}] No active dev agent found for feedback`);
+        engineerResults.set(repo.name, { response: result.output, reviewBase, phaseBase, initialHead });
+        console.log(`[${itemId}/${repo.name}] Engineer retry succeeded`);
+      } catch (retryError) {
+        const msg = retryError instanceof Error ? retryError.message : String(retryError);
+        console.error(`[${itemId}/${repo.name}] Engineer retry also failed: ${msg}`);
       }
+    }
+
+    if (engineerResults.size === 0) {
+      throw new Error(`All engineer agents failed for item ${itemId}`);
     }
   }
 
-  // Phase 3: Kill all remaining agents and create Draft PRs for all repos
-  await killAllRemainingAgents(itemId);
-
-  // Clear activeDevAgents for this item
+  // ─── Phase 2: Review Loop (per repo, max 3 cycles) ───
   for (const repo of itemConfig.repositories) {
-    activeDevAgents.delete(`${itemId}/${repo.name}`);
+    const engineerResult = engineerResults.get(repo.name);
+    if (!engineerResult) continue;
+
+    const agentWorkdir = resolve(getRepoWorkspaceDir(itemId, repo.name));
+
+    const { reviewBase, phaseBase, initialHead } = engineerResult;
+
+    for (let cycle = 0; cycle < MAX_REVIEW_ITERATIONS; cycle++) {
+      console.log(`[${itemId}/${repo.name}] Starting review cycle ${cycle + 1}/${MAX_REVIEW_ITERATIONS}`);
+
+      const currentHead = await getGitHead(agentWorkdir);
+
+      // Build review diff (what the PR will show)
+      let reviewDiff: string;
+      try {
+        reviewDiff = await getGitDiff(agentWorkdir, reviewBase, currentHead);
+      } catch {
+        reviewDiff = '<unable to generate diff>';
+      }
+
+      if (!reviewDiff || reviewDiff.trim() === '') {
+        console.log(`[${itemId}/${repo.name}] No diff to review, skipping`);
+        break;
+      }
+
+      // Run reviewer with retry + graceful skip
+      const devTasks = tasksByRepo.get(repo.name)?.filter(t => isDevRole(t.agent)) || [];
+      const reviewerRole = getRole('reviewer');
+      let initialImplementationDiff = '<unable to generate initial implementation diff>';
+      try {
+        initialImplementationDiff = await getGitDiff(agentWorkdir, phaseBase, initialHead);
+      } catch {
+        // Keep placeholder string.
+      }
+
+      let followupDiff = '<no additional fixes after the initial implementation>';
+      if (initialHead !== currentHead) {
+        try {
+          followupDiff = await getGitDiff(agentWorkdir, initialHead, currentHead);
+        } catch {
+          followupDiff = '<unable to generate post-initial fixes diff>';
+        }
+      }
+
+      const includeCombinedFallback =
+        initialImplementationDiff.startsWith('<unable') || followupDiff.startsWith('<unable');
+
+      const reviewContext = buildReviewContext(
+        repo.name,
+        {
+          initialImplementationDiff,
+          followupDiff,
+          combinedDiff: includeCombinedFallback ? reviewDiff : undefined,
+        },
+        devTasks
+      );
+      const reviewPrompt = `${reviewerRole.promptTemplate}\n\n${reviewContext}`;
+
+      let reviewResponse: ReviewerResponse | null = null;
+      for (let attempt = 0; attempt <= AGENT_MAX_RETRIES; attempt++) {
+        try {
+          const { result: reviewResult } = await executeAgent<ReviewerResponse>({
+            itemId,
+            role: 'review',
+            repoName: repo.name,
+            prompt: reviewPrompt,
+            workingDir: agentWorkdir,
+            allowedTools: reviewerRole.allowedTools,
+            jsonSchema: reviewerRole.jsonSchema,
+            timeoutMs: REVIEW_TIMEOUT_MS,
+          });
+          reviewResponse = reviewResult.output;
+          break;
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          if (attempt < AGENT_MAX_RETRIES) {
+            console.warn(`[${itemId}/${repo.name}] Review attempt ${attempt + 1} failed: ${msg}, retrying...`);
+            continue;
+          }
+          console.warn(`[${itemId}/${repo.name}] Review failed after ${attempt + 1} attempts: ${msg}, skipping review`);
+        }
+      }
+
+      if (!reviewResponse) {
+        console.log(`[${itemId}/${repo.name}] Skipping review due to failure, proceeding to PR`);
+        break;
+      }
+      const comments = reviewResponse.comments ?? [];
+      const findings = comments.map(c => ({
+        severity: (c.severity || 'minor') as 'critical' | 'major' | 'minor',
+        file: c.file,
+        line: c.line,
+        description: c.comment,
+        suggestedFix: c.suggestedFix || '',
+        targetAgent: repo.name,
+      }));
+
+      const findingsEvent = createReviewFindingsExtractedEvent(
+        itemId,
+        `review-${repo.name}-cycle${cycle + 1}`,
+        repo.name,
+        findings,
+        reviewResponse.review_status === 'approve' ? 'pass' : 'needs_fixes',
+        reviewResponse.review_status === 'approve'
+          ? 'Code review passed'
+          : `${comments.length} issues found`
+      );
+      await appendJsonl(getItemEventsPath(itemId), findingsEvent);
+      eventBus.publish(itemId, findingsEvent);
+
+      if (reviewResponse.review_status === 'approve') {
+        console.log(`[${itemId}/${repo.name}] Review approved on cycle ${cycle + 1}`);
+        break;
+      }
+
+      // Last cycle - don't send feedback
+      if (cycle === MAX_REVIEW_ITERATIONS - 1) {
+        console.warn(`[${itemId}/${repo.name}] Max review cycles reached`);
+        break;
+      }
+
+      console.log(`[${itemId}/${repo.name}] Review found ${comments.length} issues`);
+
+      // Get feedback diff (what engineer changed during this phase)
+      let feedbackDiff: string;
+      try {
+        // Prefer targeted diff when reviewer comments specify files
+        const commentFiles = comments
+          .map(c => c.file)
+          .filter(Boolean);
+        feedbackDiff = await getGitDiff(
+          agentWorkdir,
+          phaseBase,
+          currentHead,
+          commentFiles.length > 0 ? commentFiles : undefined
+        );
+      } catch {
+        feedbackDiff = '<unable to generate diff>';
+      }
+
+      // Build feedback prompt
+      const feedbackRole = getRole('engineer');
+      const feedbackEffectiveTools = mergeAllowedTools(feedbackRole.allowedTools, repo.allowedTools);
+      const feedbackPrompt = buildFeedbackPrompt(
+        plan,
+        repo,
+        comments,
+        feedbackDiff,
+        tasksByRepo.get(repo.name)?.filter(t => isDevRole(t.agent)) || []
+      );
+
+      // New engineer execution for fixes (with retry)
+      let feedbackFailed = false;
+      for (let feedbackAttempt = 0; feedbackAttempt <= AGENT_MAX_RETRIES; feedbackAttempt++) {
+        try {
+          await executeAgent<EngineerResponse>({
+            itemId,
+            role: 'engineer',
+            repoName: repo.name,
+            prompt: feedbackPrompt,
+            workingDir: agentWorkdir,
+            allowedTools: feedbackEffectiveTools,
+            jsonSchema: feedbackRole.jsonSchema,
+            timeoutMs: ENGINEER_TIMEOUT_MS,
+          });
+          break;
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          if (feedbackAttempt < AGENT_MAX_RETRIES) {
+            console.warn(`[${itemId}/${repo.name}] Feedback engineer attempt ${feedbackAttempt + 1} failed: ${msg}, retrying...`);
+            continue;
+          }
+          console.error(`[${itemId}/${repo.name}] Feedback engineer failed after ${feedbackAttempt + 1} attempts: ${msg}`);
+          feedbackFailed = true;
+        }
+      }
+      if (feedbackFailed) {
+        console.warn(`[${itemId}/${repo.name}] Skipping remaining review cycles due to feedback engineer failure`);
+        break;
+      }
+
+      // phaseBase stays the same — next cycle's diff still covers everything
+    }
   }
 
+  // ─── Phase 3: Push & PR ───
   await createDraftPrsForAllRepos(itemId);
 }
 
-export async function startWorkerForRole(
+export async function startWorkerForRepo(
   itemId: string,
-  role: AgentRole,
-  repoName?: string
+  repoName: string,
+  role: AgentRole = 'engineer'
 ): Promise<void> {
   const plan = await getPlan(itemId);
   if (!plan) {
@@ -357,71 +468,40 @@ export async function startWorkerForRole(
 
   const workspaceRoot = resolve(getWorkspaceRoot(itemId));
 
-  if (repoName) {
-    // Start for specific repo
-    const tasks = plan.tasks.filter(t => t.agent === role && t.repository === repoName);
-    if (tasks.length === 0) {
-      throw new Error(`No tasks found for role ${role} in repository ${repoName}`);
-    }
+  const workerRole = getRole('engineer');
 
-    const agentWorkdir = resolve(getRepoWorkspaceDir(itemId, repoName));
-    await startWorkerAgentWithSnapshot(itemId, role, repoName, tasks, plan, agentWorkdir, workspaceRoot);
-  } else {
-    // Start for all repos that have tasks for this role
-    for (const repo of itemConfig.repositories) {
-      const tasks = plan.tasks.filter(t => t.agent === role && t.repository === repo.name);
-      if (tasks.length === 0) continue;
-
-      const agentWorkdir = resolve(getRepoWorkspaceDir(itemId, repo.name));
-      await startWorkerAgentWithSnapshot(itemId, role, repo.name, tasks, plan, agentWorkdir, workspaceRoot);
-    }
+  const tasks = plan.tasks.filter(t => t.agent === role && t.repository === repoName);
+  if (tasks.length === 0) {
+    throw new Error(`No tasks found for agent ${role} in repository ${repoName}`);
   }
-}
 
-async function startWorkerAgent(
-  itemId: string,
-  role: AgentRole,
-  repoName: string,
-  tasks: PlanTask[],
-  plan: Plan,
-  workingDir: string
-): Promise<AgentInfo> {
-  const prompt = buildWorkerPrompt(role, repoName, tasks, plan);
+  const repoConfig = itemConfig.repositories.find(r => r.name === repoName);
+  const effectiveTools = isDevRole(role)
+    ? mergeAllowedTools(workerRole.allowedTools, repoConfig?.allowedTools)
+    : workerRole.allowedTools;
 
-  return await startAgent({
+  const agentWorkdir = resolve(getRepoWorkspaceDir(itemId, repoName));
+  validateAgentWorkdir(agentWorkdir, workspaceRoot);
+
+  const context = buildWorkerContext(role, repoName, tasks, plan);
+  const prompt = `${workerRole.promptTemplate}\n\n${context}`;
+  await executeAgent<EngineerResponse>({
     itemId,
     role,
     repoName,
     prompt,
-    workingDir,
+    workingDir: agentWorkdir,
+    allowedTools: effectiveTools,
+    jsonSchema: workerRole.jsonSchema,
   });
 }
 
-export async function stopWorkers(itemId: string): Promise<void> {
-  stopAllGitSnapshots(itemId);
-}
-
-function buildWorkerPrompt(
+function buildWorkerContext(
   role: AgentRole,
   repoName: string,
   tasks: PlanTask[],
   plan: Plan
 ): string {
-  if (role === 'review') {
-    const taskDescriptions = tasks
-      .map((task) => `### Task: ${task.id} - ${task.title}\n${task.description}`)
-      .join('\n\n');
-
-    // Find the dev role for this repo from the tasks
-    const devTask = plan.tasks.find(t => t.repository === repoName && isDevRole(t.agent));
-    const targetRole = devTask?.agent || repoName;
-
-    return REVIEW_PROMPT_TEMPLATE
-      .replace(/\{\{repoName\}\}/g, repoName)
-      .replace(/\{\{targetRole\}\}/g, targetRole)
-      + '\n\n## Task-Specific Review Instructions\n\n' + taskDescriptions;
-  }
-
   const taskList = tasks
     .map((task) => {
       const deps =
@@ -449,15 +529,114 @@ ${deps}`;
   const depsStr =
     allDeps.length > 0 ? allDeps.join(', ') : 'No dependencies';
 
-  return WORKER_PROMPT_TEMPLATE
-    .replace('{{role}}', role)
-    .replace('{{roleDescription}}', getRoleDescription(role))
-    .replace('{{repoName}}', repoName)
-    .replace('{{taskId}}', tasks.map((t) => t.id).join(', '))
-    .replace('{{taskTitle}}', tasks.map((t) => t.title).join('; '))
-    .replace('{{taskDescription}}', taskList)
-    .replace('{{files}}', filesStr)
-    .replace('{{dependencies}}', depsStr);
+  return `## Your Role: ${getRoleDescription(role)}
+
+## Project Context
+
+**Repository:** ${repoName}
+**Task ID:** ${tasks.map((t) => t.id).join(', ')}
+**Task Title:** ${tasks.map((t) => t.title).join('; ')}
+
+**Task Description:**
+${taskList}
+
+**Files to work on:**
+${filesStr}
+
+**Dependencies:**
+${depsStr}`;
+}
+
+function buildReviewContext(
+  repoName: string,
+  reviewDiffs: {
+    initialImplementationDiff: string;
+    followupDiff: string;
+    combinedDiff?: string;
+  },
+  reviewTasks: PlanTask[]
+): string {
+  const taskDescriptions = reviewTasks
+    .map((task) => `### Task: ${task.id} - ${task.title}\n${task.description}`)
+    .join('\n\n');
+
+  const combinedDiffSection = reviewDiffs.combinedDiff
+    ? `
+### Fallback Combined Diff
+\`\`\`diff
+${reviewDiffs.combinedDiff}
+\`\`\`
+`
+    : '';
+
+  return `## Repository: ${repoName}
+
+## Changes to Review
+
+The following diffs are organized by when they were created in this run:
+
+### Initial Implementation Diff
+\`\`\`diff
+${reviewDiffs.initialImplementationDiff}
+\`\`\`
+
+### Post-Initial Fixes Diff (e.g. hooks/review follow-ups)
+\`\`\`diff
+${reviewDiffs.followupDiff}
+\`\`\`
+
+${combinedDiffSection}
+
+## Implemented Tasks
+
+${taskDescriptions}`;
+}
+
+function buildFeedbackPrompt(
+  plan: Plan,
+  repo: ItemRepositoryConfig,
+  comments: ReviewComment[],
+  diff: string,
+  originalTasks: PlanTask[]
+): string {
+  const role = getRole('engineer');
+
+  const taskList = originalTasks
+    .map(t => `- ${t.id}: ${t.title}`)
+    .join('\n');
+
+  const commentList = comments
+    .map((c, i) => `- [${(c.severity || 'minor').toUpperCase()}] ${c.file}${c.line ? `:${c.line}` : ''}: ${c.comment}${c.suggestedFix ? ` (Fix: ${c.suggestedFix})` : ''}`)
+    .join('\n');
+
+  const context = `## Working on: ${repo.name}
+
+## Original Tasks
+${taskList}
+
+## Review Feedback
+The previous implementation was reviewed and rejected.
+
+Review comments:
+${commentList}
+
+## Current Changes (git diff from phase start)
+\`\`\`diff
+${diff}
+\`\`\`
+
+## Instructions
+Please address all review comments and create a new commit.
+Follow the same commit rules as before:
+- NEVER use git add -A or git add .
+- Only commit files you actually modified
+- Run: git add <specific files>
+- Run: git commit -m "fix(<scope>): address review feedback"
+
+Return a JSON response with {"status": "success", "files_modified": ["path/to/file1"]} when done.
+If you encounter an error, return {"status": "failure", "files_modified": []}.`;
+
+  return `${role.promptTemplate}\n\n${context}`;
 }
 
 export async function getWorkerStatus(
@@ -470,26 +649,22 @@ export async function getWorkerStatus(
   const result: { role: AgentRole; repoName?: string; taskCount: number; status: string }[] = [];
 
   if (itemConfig) {
-    // Add dev and review roles per repo
     for (const repo of itemConfig.repositories) {
-      // Dev tasks
       const devTaskCount = plan?.tasks.filter(t => t.repository === repo.name && isDevRole(t.agent)).length || 0;
       const devAgent = agents.find(a => a.repoName === repo.name && isDevRole(a.role));
       result.push({
-        role: repo.role,
+        role: 'engineer',
         repoName: repo.name,
         taskCount: devTaskCount,
         status: devAgent?.status || 'not_started',
       });
 
-      // Review tasks
-      const reviewTaskCount = plan?.tasks.filter(t => t.repository === repo.name && t.agent === 'review').length || 0;
-      if (reviewTaskCount > 0) {
+      if (devTaskCount > 0) {
         const reviewAgent = agents.find(a => a.repoName === repo.name && a.role === 'review');
         result.push({
           role: 'review',
           repoName: repo.name,
-          taskCount: reviewTaskCount,
+          taskCount: devTaskCount,
           status: reviewAgent?.status || 'not_started',
         });
       }
@@ -499,59 +674,6 @@ export async function getWorkerStatus(
   return result;
 }
 
-// Helper: Send command to an agent
-async function sendCommandToAgent(agentId: string, command: string): Promise<boolean> {
-  return sendLine(agentId, command);
-}
-
-// Helper: Signal agent to exit
-async function signalAgentToExit(agentId: string): Promise<boolean> {
-  return sendLine(agentId, '/exit');
-}
-
-// Helper: Kill all remaining agents
-async function killAllRemainingAgents(itemId: string): Promise<void> {
-  const agents = await getAgentsByItem(itemId);
-
-  for (const agent of agents) {
-    if (agent.status === 'running' || agent.status === 'waiting_orchestrator') {
-      await stopAgent(agent.id);
-    }
-  }
-}
-
-// Helper: Extract review findings from a specific repo
-async function extractReviewFindings(itemId: string, repoName: string): Promise<ReviewFindings | null> {
-  const repoDir = getRepoWorkspaceDir(itemId, repoName);
-  const findingsPath = join(repoDir, 'review_findings.json');
-
-  try {
-    const content = await readFile(findingsPath, 'utf-8');
-    return JSON.parse(content);
-  } catch {
-    return null;
-  }
-}
-
-// Helper: Build feedback prompt from findings
-function buildFeedbackPrompt(findings: ReviewFinding[]): string {
-  const findingsText = findings.map((f, i) =>
-    `${i + 1}. [${f.severity.toUpperCase()}] ${f.file}${f.line ? `:${f.line}` : ''}
-   Issue: ${f.description}
-   Fix: ${f.suggestedFix}`
-  ).join('\n\n');
-
-  return `## Review Feedback
-
-The code reviewer found the following issues that need to be addressed:
-
-${findingsText}
-
-Please fix these issues and then output "TASKS_COMPLETED" when done.`;
-}
-
-// Run iterative review (exported for external use)
-export async function runIterativeReview(itemId: string): Promise<void> {
-  // This is now handled within startWorkers
-  await startWorkers(itemId);
+export async function stopWorkers(itemId: string): Promise<void> {
+  stopAllGitSnapshots(itemId);
 }

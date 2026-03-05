@@ -17,7 +17,6 @@
     "chokidar": "^3.5.3",
     "fastify": "^4.26.0",
     "nanoid": "^5.0.4",
-    "node-pty": "^1.0.0",
     "yaml": "^2.3.4"
   },
   "devDependencies": {

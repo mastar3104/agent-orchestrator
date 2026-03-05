@@ -12,17 +12,20 @@ export interface RepositoryConfig {
   workBranch?: string;       // 作業用ブランチ名（指定時は自動作成）
   submodules?: boolean;
   linkMode?: 'symlink' | 'copy';  // localの場合のモード
+  /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
+  allowedTools?: string[];
 }
 
 export interface CreateItemRepositoryInput {
   repositoryId?: string;
   repository?: RepositoryConfig;
   name: string;              // ディレクトリ名
-  role: string;              // 開発エージェントの役割 (自由文字列: "front", "back", "docs" 等)
   branch?: string;
   workBranch?: string;
   saveRepository?: boolean;
   repositoryName?: string;
+  /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
+  allowedTools?: string[];
 }
 
 // Request types
@@ -34,7 +37,8 @@ export interface CreateItemRequest {
 }
 
 export interface StartAgentRequest {
-  role: AgentRole;
+  repoName: string;
+  role?: AgentRole;
   prompt?: string;
 }
 

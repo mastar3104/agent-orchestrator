@@ -5,12 +5,13 @@ import { mkdir } from 'fs/promises';
 
 import { itemRoutes } from './routes/items';
 import { agentRoutes } from './routes/agents';
-import { approvalRoutes } from './routes/approval';
 import { wsRoutes } from './routes/ws';
 import { repositoryRoutes } from './routes/repositories';
+import { settingsRoutes } from './routes/settings';
 import { getItemsDir, getDataDir } from './lib/paths';
 import { cleanupOrphanedAgentsForItem } from './services/agent-service';
 import { listItems } from './services/item-service';
+import { loadRoles } from './lib/role-loader';
 
 const PORT = parseInt(process.env.PORT || '3001', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -38,6 +39,9 @@ async function cleanupOrphanedAgents(): Promise<void> {
 }
 
 async function main() {
+  // Validate role config at startup (fail-fast)
+  loadRoles();
+
   // Ensure data directories exist
   await mkdir(getDataDir(), { recursive: true });
   await mkdir(getItemsDir(), { recursive: true });
@@ -69,8 +73,8 @@ async function main() {
   // Register routes
   await fastify.register(itemRoutes, { prefix: '/api' });
   await fastify.register(agentRoutes, { prefix: '/api' });
-  await fastify.register(approvalRoutes, { prefix: '/api' });
   await fastify.register(repositoryRoutes, { prefix: '/api' });
+  await fastify.register(settingsRoutes, { prefix: '/api' });
   await fastify.register(wsRoutes);
 
   // Health check

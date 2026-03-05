@@ -110,10 +110,19 @@ function RepositoryDetails({ repository }: RepositoryDetailsProps) {
             <span className="text-gray-200">{repository.directoryName}</span>
           </div>
         )}
-        {repository.role && (
-          <div>
-            <span className="text-gray-400">Role:</span>{' '}
-            <span className="text-gray-200">{repository.role}</span>
+        {repository.allowedTools && repository.allowedTools.length > 0 && (
+          <div className="col-span-2">
+            <span className="text-gray-400">Tools:</span>{' '}
+            <span className="flex items-center gap-1 flex-wrap mt-0.5">
+              {repository.allowedTools.map((tool, i) => (
+                <span
+                  key={i}
+                  className="px-1.5 py-0.5 rounded bg-gray-600 text-gray-200 font-mono text-xs"
+                >
+                  {tool}
+                </span>
+              ))}
+            </span>
           </div>
         )}
       </div>

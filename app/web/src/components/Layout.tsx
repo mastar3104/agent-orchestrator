@@ -12,6 +12,12 @@ export function Layout() {
             <Link to="/" className="text-gray-300 hover:text-white">
               Items
             </Link>
+            <Link to="/settings/roles" className="text-gray-300 hover:text-white">
+              Roles
+            </Link>
+            <Link to="/settings/repositories" className="text-gray-300 hover:text-white">
+              Repositories
+            </Link>
           </nav>
         </div>
       </header>

@@ -12,6 +12,7 @@ import type {
   GitSnapshotEvent,
   GitSnapshotErrorEvent,
   TasksCompletedEvent,
+  ClaudeExecutionEvent,
   ItemCreatedEvent,
   CloneStartedEvent,
   CloneCompletedEvent,
@@ -24,6 +25,7 @@ import type {
   ReviewFinding,
   ReviewFindingsExtractedEvent,
   ReviewReceiveStartedEvent,
+  ReviewReceiveCompletedEvent,
 } from '@agent-orch/shared';
 
 function createEventId(): string {
@@ -393,5 +395,53 @@ export function createReviewReceiveStartedEvent(
     repoName,
     prNumber,
     prUrl,
+  };
+}
+
+export function createReviewReceiveCompletedEvent(
+  itemId: string,
+  agentId: string,
+  repoName: string,
+  prNumber: number,
+  commentsCutoffAt: string | null,
+  totalComments: number,
+  newComments: number,
+  filteredComments: number
+): ReviewReceiveCompletedEvent {
+  return {
+    id: createEventId(),
+    type: 'review_receive_completed',
+    timestamp: timestamp(),
+    itemId,
+    agentId,
+    repoName,
+    prNumber,
+    commentsCutoffAt,
+    totalComments,
+    newComments,
+    filteredComments,
+  };
+}
+
+export function createClaudeExecutionEvent(
+  itemId: string,
+  agentId: string,
+  role: AgentRole,
+  exitCode: number,
+  durationMs: number,
+  attempt: number,
+  success: boolean
+): ClaudeExecutionEvent {
+  return {
+    id: createEventId(),
+    type: 'claude_execution',
+    timestamp: timestamp(),
+    itemId,
+    agentId,
+    role,
+    exitCode,
+    durationMs,
+    attempt,
+    success,
   };
 }

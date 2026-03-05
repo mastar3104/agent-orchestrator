@@ -10,6 +10,7 @@ export type EventType =
   | 'git_snapshot'
   | 'git_snapshot_error'
   | 'tasks_completed'
+  | 'claude_execution'
   | 'item_created'
   | 'clone_started'
   | 'clone_completed'
@@ -19,7 +20,8 @@ export type EventType =
   | 'pr_created'
   | 'repo_no_changes'
   | 'review_findings_extracted'
-  | 'review_receive_started';
+  | 'review_receive_started'
+  | 'review_receive_completed';
 
 export interface BaseEvent {
   id: string;
@@ -199,6 +201,27 @@ export interface ReviewReceiveStartedEvent extends BaseEvent {
   prUrl: string;
 }
 
+export interface ReviewReceiveCompletedEvent extends BaseEvent {
+  type: 'review_receive_completed';
+  agentId: string;
+  repoName: string;
+  prNumber: number;
+  commentsCutoffAt: string | null; // max(fetchedComments.createdAt)。コメント0件ならnull
+  totalComments: number;           // GitHub取得コメント総数
+  newComments: number;             // フィルタ通過コメント数
+  filteredComments: number;        // 除外コメント数
+}
+
+export interface ClaudeExecutionEvent extends BaseEvent {
+  type: 'claude_execution';
+  agentId: string;
+  role: import('./agent').AgentRole;
+  exitCode: number;
+  durationMs: number;
+  attempt: number;
+  success: boolean;
+}
+
 export type AgentEvent =
   | AgentStartedEvent
   | AgentExitedEvent
@@ -209,6 +232,7 @@ export type AgentEvent =
   | GitSnapshotEvent
   | GitSnapshotErrorEvent
   | TasksCompletedEvent
+  | ClaudeExecutionEvent
   | ErrorEvent;
 
 export type ItemEvent =
@@ -224,4 +248,6 @@ export type ItemEvent =
   | RepoNoChangesEvent
   | ReviewFindingsExtractedEvent
   | ReviewReceiveStartedEvent
+  | ReviewReceiveCompletedEvent
+  | ClaudeExecutionEvent
   | AgentEvent;
