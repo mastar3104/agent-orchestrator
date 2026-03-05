@@ -90,17 +90,19 @@ export function useItem(id: string | undefined) {
     await refresh();
   };
 
-  const submitPlanFeedback = async (feedbacks: { taskId: string; feedback: string }[]) => {
-    if (!id) return;
+  const submitPlanFeedback = async (feedbacks: { taskId: string; feedback: string }[]): Promise<boolean> => {
+    if (!id) return false;
     setPlanFeedbackSubmitting(true);
     setPlanFeedbackError(null);
     try {
       await api.submitPlanFeedback(id, feedbacks);
       await refresh();
+      return true;
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Failed to submit plan feedback';
       setPlanFeedbackError(message);
+      return false;
     } finally {
       setPlanFeedbackSubmitting(false);
     }

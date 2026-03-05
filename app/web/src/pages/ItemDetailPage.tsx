@@ -395,8 +395,8 @@ export function ItemDetailPage() {
                           setFeedbackLocalError('No valid feedback provided');
                           return;
                         }
-                        await submitPlanFeedback(valid);
-                        setFeedbackRows([{ taskId: '', feedback: '' }]);
+                        const ok = await submitPlanFeedback(valid);
+                        if (ok) setFeedbackRows([{ taskId: '', feedback: '' }]);
                       }}
                       disabled={planFeedbackSubmitting || feedbackRows.every(r => !r.taskId || !r.feedback.trim())}
                       className="px-2 py-0.5 bg-purple-600 text-white rounded text-xs hover:bg-purple-500 disabled:opacity-50"

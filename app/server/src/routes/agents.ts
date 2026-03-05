@@ -152,7 +152,7 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
     }
 
     for (const fb of feedbacks) {
-      if (typeof fb.taskId !== 'string' || typeof fb.feedback !== 'string') {
+      if (!fb || typeof fb !== 'object' || typeof fb.taskId !== 'string' || typeof fb.feedback !== 'string') {
         return reply.status(400).send({
           success: false,
           error: 'Each feedback must have string taskId and feedback',

@@ -144,6 +144,18 @@ describe('POST /api/items/:id/plan/feedback', () => {
     expect(res.json().error).toContain('feedbacks must be an array');
   });
 
+  it('returns 400 when element is null', async () => {
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/items/item-1/plan/feedback',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({ feedbacks: [null] }),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toContain('string taskId and feedback');
+  });
+
   it('returns 400 when feedbacks is empty array', async () => {
     const app = buildApp();
     const res = await app.inject({
