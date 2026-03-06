@@ -228,6 +228,8 @@ export interface HookResult {
   exitCode: number | null;
   stderr: string;
   stdout: string;
+  stdoutLogPath?: string;
+  stderrLogPath?: string;
   durationMs: number;
   timedOut: boolean;
   signal?: string;

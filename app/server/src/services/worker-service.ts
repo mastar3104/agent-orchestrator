@@ -1,6 +1,8 @@
 import { spawn } from 'child_process';
-import { readFile } from 'fs/promises';
-import { resolve } from 'path';
+import { createWriteStream } from 'fs';
+import { readFile, mkdir, writeFile } from 'fs/promises';
+import { finished } from 'stream/promises';
+import { resolve, join } from 'path';
 import type { Plan, PlanTask, AgentRole, ItemRepositoryConfig } from '@agent-orch/shared';
 import { isDevRole } from '@agent-orch/shared';
 
@@ -13,7 +15,7 @@ import {
   stopAllGitSnapshots,
 } from './git-snapshot-service';
 import { createDraftPrsForAllRepos } from './git-pr-service';
-import { getWorkspaceRoot, getRepoWorkspaceDir, getItemEventsPath, getItemPlanPath } from '../lib/paths';
+import { getWorkspaceRoot, getRepoWorkspaceDir, getItemEventsPath, getItemPlanPath, getHookLogDir } from '../lib/paths';
 import { eventBus } from './event-bus';
 import { appendJsonl } from '../lib/jsonl';
 import { createReviewFindingsExtractedEvent, createStatusChangedEvent, createHooksExecutedEvent, createErrorEvent } from '../lib/events';
@@ -31,7 +33,7 @@ const REVIEW_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const ENGINEER_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes
 const AGENT_MAX_RETRIES = 1;
 const MAX_HOOKS_RETRIES = 2;
-const HOOK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per command
+const HOOK_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes per command
 const MAX_OUTPUT_LENGTH = 2000;
 
 function getRoleDescription(role: string): string {
@@ -114,16 +116,30 @@ function truncateOutput(output: string, maxLength: number = MAX_OUTPUT_LENGTH): 
 async function runHooks(
   commands: string[],
   cwd: string,
+  logDir: string,
+  attempt: number,
   timeoutMs: number = HOOK_TIMEOUT_MS
 ): Promise<HookResult[]> {
+  const attemptDir = join(logDir, `attempt-${attempt}`);
+  await mkdir(attemptDir, { recursive: true });
   const results: HookResult[] = [];
 
-  for (const command of commands) {
+  for (let i = 0; i < commands.length; i++) {
+    const command = commands[i];
+    const stdoutPath = join(attemptDir, `hook-${i}.stdout.log`);
+    const stderrPath = join(attemptDir, `hook-${i}.stderr.log`);
     const startTime = Date.now();
+
     try {
       const result = await new Promise<HookResult>((resolve) => {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+        const stdoutStream = createWriteStream(stdoutPath);
+        const stderrStream = createWriteStream(stderrPath);
+
+        let stdoutBuf = '';
+        let stderrBuf = '';
 
         const proc = spawn('sh', ['-c', command], {
           cwd,
@@ -131,42 +147,60 @@ async function runHooks(
           signal: controller.signal,
         });
 
-        let stdout = '';
-        let stderr = '';
-        proc.stdout?.on('data', (d) => {
-          stdout += d.toString();
-          if (stdout.length > MAX_OUTPUT_LENGTH * 2) {
-            stdout = stdout.slice(0, MAX_OUTPUT_LENGTH * 2);
-          }
+        proc.stdout?.on('data', (d: Buffer) => {
+          const chunk = d.toString();
+          if (stdoutBuf.length < MAX_OUTPUT_LENGTH) stdoutBuf += chunk;
         });
-        proc.stderr?.on('data', (d) => {
-          stderr += d.toString();
-          if (stderr.length > MAX_OUTPUT_LENGTH * 2) {
-            stderr = stderr.slice(0, MAX_OUTPUT_LENGTH * 2);
-          }
+        proc.stderr?.on('data', (d: Buffer) => {
+          const chunk = d.toString();
+          if (stderrBuf.length < MAX_OUTPUT_LENGTH) stderrBuf += chunk;
         });
 
-        proc.on('close', (code, signal) => {
+        proc.stdout?.pipe(stdoutStream);
+        proc.stderr?.pipe(stderrStream);
+
+        proc.on('close', async (code, signal) => {
           clearTimeout(timer);
+          stdoutStream.end();
+          stderrStream.end();
+          try {
+            await Promise.all([finished(stdoutStream), finished(stderrStream)]);
+          } catch {
+            // Log write failure is not fatal
+          }
           resolve({
             command,
             exitCode: code,
-            stderr: truncateOutput(stderr),
-            stdout: truncateOutput(stdout),
+            stdout: truncateOutput(stdoutBuf),
+            stderr: truncateOutput(stderrBuf),
+            stdoutLogPath: stdoutPath,
+            stderrLogPath: stderrPath,
             durationMs: Date.now() - startTime,
             timedOut: false,
             signal: signal || undefined,
           });
         });
 
-        proc.on('error', (err) => {
+        proc.on('error', async (err) => {
           clearTimeout(timer);
+          stdoutStream.end();
+          stderrStream.end();
+          try {
+            await Promise.all([finished(stdoutStream), finished(stderrStream)]);
+          } catch {
+            // Log write failure is not fatal
+          }
           const isAbort = err.name === 'AbortError' || (err as any).code === 'ABORT_ERR';
+          if (isAbort) {
+            await writeFile(stderrPath, `Timed out after ${timeoutMs}ms`).catch(() => {});
+          }
           resolve({
             command,
             exitCode: null,
+            stdout: truncateOutput(stdoutBuf),
             stderr: truncateOutput(isAbort ? `Timed out after ${timeoutMs}ms` : err.message),
-            stdout: truncateOutput(stdout),
+            stdoutLogPath: stdoutPath,
+            stderrLogPath: stderrPath,
             durationMs: Date.now() - startTime,
             timedOut: isAbort,
             signal: isAbort ? 'SIGTERM' : undefined,
@@ -176,11 +210,14 @@ async function runHooks(
 
       results.push(result);
     } catch (err) {
+      await writeFile(stderrPath, err instanceof Error ? err.message : String(err)).catch(() => {});
       results.push({
         command,
         exitCode: null,
-        stderr: truncateOutput(err instanceof Error ? err.message : String(err)),
         stdout: '',
+        stderr: truncateOutput(err instanceof Error ? err.message : String(err)),
+        stdoutLogPath: stdoutPath,
+        stderrLogPath: stderrPath,
         durationMs: Date.now() - startTime,
         timedOut: false,
       });
@@ -190,52 +227,36 @@ async function runHooks(
   return results;
 }
 
-function buildHooksFixPrompt(
-  plan: Plan,
-  repoName: string,
-  hookResults: HookResult[],
-  tasks: PlanTask[]
-): string {
-  const role = getRole('engineer');
-
-  const taskList = tasks
-    .map(t => `- ${t.id}: ${t.title}\n  ${t.description}`)
-    .join('\n');
-
+function buildHooksFixPrompt(hookResults: HookResult[]): string {
   const failedHooks = hookResults
-    .filter(r => r.exitCode !== 0)
-    .map(r => {
+    .map((r) => {
+      if (r.exitCode === 0) return null;
       const parts = [`Command: ${r.command}`, `Exit code: ${r.exitCode}`];
       if (r.timedOut) parts.push('(TIMED OUT)');
-      if (r.stderr) parts.push(`Stderr:\n${r.stderr}`);
-      if (r.stdout) parts.push(`Stdout:\n${r.stdout}`);
+      if (r.stderrLogPath) parts.push(`Stderr log: ${r.stderrLogPath}`);
+      if (r.stdoutLogPath) parts.push(`Stdout log: ${r.stdoutLogPath}`);
       return parts.join('\n');
     })
+    .filter(Boolean)
     .join('\n\n---\n\n');
 
-  const context = `## Working on: ${repoName}
-
-## Original Tasks
-${taskList}
-
-## Hook Validation Failures
+  return `## Hook Validation Failures
 The following validation commands failed after your implementation.
-Please fix the issues and commit your changes.
+Read the log files to identify the root cause, then fix the issues.
 
 ${failedHooks}
 
 ## Instructions
-Please fix all issues reported by the hooks above and create a new commit.
-Follow the same commit rules as before:
-- NEVER use git add -A or git add .
-- Only commit files you actually modified
-- Run: git add <specific files>
-- Run: git commit -m "fix(<scope>): address hook validation failures"
+1. Read the log files above to understand what failed
+2. Fix all issues
+3. Commit your changes:
+   - NEVER use git add -A or git add .
+   - Only commit files you actually modified
+   - Run: git add <specific files>
+   - Run: git commit -m "fix(<scope>): address hook validation failures"
 
 Return a JSON response with {"status": "success", "files_modified": ["path/to/file1"]} when done.
 If you encounter an error, return {"status": "failure", "files_modified": []}.`;
-
-  return `${role.promptTemplate}\n\n${context}`;
 }
 
 // ─── Main orchestration ───
@@ -328,10 +349,11 @@ export async function startWorkers(itemId: string): Promise<void> {
           // ─── Hooks execution ───
           const hooks = repo.hooks;
           if (hooks && hooks.length > 0) {
+            const hookLogDir = getHookLogDir(itemId, repo.name);
             let hooksPassed = false;
             for (let hookAttempt = 1; hookAttempt <= MAX_HOOKS_RETRIES; hookAttempt++) {
               console.log(`[${itemId}/${repo.name}] Running hooks (attempt ${hookAttempt}/${MAX_HOOKS_RETRIES})`);
-              const hookResults = await runHooks(hooks, agentWorkdir);
+              const hookResults = await runHooks(hooks, agentWorkdir, hookLogDir, hookAttempt);
               const allPassed = hookResults.every(r => r.exitCode === 0);
 
               const hooksEvent = createHooksExecutedEvent(itemId, repo.name, hookResults, allPassed, hookAttempt);
@@ -348,7 +370,7 @@ export async function startWorkers(itemId: string): Promise<void> {
 
               if (hookAttempt < MAX_HOOKS_RETRIES) {
                 // Re-run engineer with fix prompt
-                const fixPrompt = buildHooksFixPrompt(plan, repo.name, hookResults, devTasks);
+                const fixPrompt = buildHooksFixPrompt(hookResults);
                 try {
                   await executeAgent<EngineerResponse>({
                     itemId,
@@ -454,10 +476,11 @@ export async function startWorkers(itemId: string): Promise<void> {
         // not because hooks were exhausted — hooksFailedRepos are excluded above)
         const hooks = repo.hooks;
         if (hooks && hooks.length > 0) {
+          const hookLogDir = getHookLogDir(itemId, repo.name);
           let hooksPassed = false;
           for (let hookAttempt = 1; hookAttempt <= MAX_HOOKS_RETRIES; hookAttempt++) {
             console.log(`[${itemId}/${repo.name}] Running hooks after engineer retry (attempt ${hookAttempt}/${MAX_HOOKS_RETRIES})`);
-            const hookResults = await runHooks(hooks, agentWorkdir);
+            const hookResults = await runHooks(hooks, agentWorkdir, hookLogDir, hookAttempt);
             const allPassed = hookResults.every(r => r.exitCode === 0);
 
             const hooksEvent = createHooksExecutedEvent(itemId, repo.name, hookResults, allPassed, hookAttempt);
@@ -470,7 +493,7 @@ export async function startWorkers(itemId: string): Promise<void> {
             }
 
             if (hookAttempt < MAX_HOOKS_RETRIES) {
-              const fixPrompt = buildHooksFixPrompt(plan, repo.name, hookResults, devTasks);
+              const fixPrompt = buildHooksFixPrompt(hookResults);
               try {
                 await executeAgent<EngineerResponse>({
                   itemId, role: 'engineer', repoName: repo.name, prompt: fixPrompt,

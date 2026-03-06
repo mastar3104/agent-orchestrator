@@ -52,6 +52,10 @@ export function getRepoWorkspaceDir(itemId: string, repoName: string): string {
   return join(getItemDir(itemId), 'workspace', repoName);
 }
 
+export function getHookLogDir(itemId: string, repoName: string): string {
+  return join(getItemDir(itemId), 'hooks', repoName);
+}
+
 export function getRepositoriesPath(): string {
   return join(DATA_DIR, 'repositories.yaml');
 }

@@ -28,20 +28,6 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
     return 'created';
   }
 
-  // Check for errors
-  const hasError = events.some((e) => e.type === 'error');
-  if (hasError) {
-    const hasPrCreated = events.some((e) => e.type === 'pr_created');
-    const hasNoChanges = events.some((e) => e.type === 'repo_no_changes');
-    if (!hasPrCreated && !hasNoChanges) {
-      return 'error';
-    }
-    const lastEvent = events[events.length - 1];
-    if (lastEvent.type === 'error') {
-      return 'error';
-    }
-  }
-
   // Check for active clone operation (remote) - any repo
   const cloneStartedEvents = events.filter((e) => e.type === 'clone_started');
   const cloneCompletedEvents = events.filter((e) => e.type === 'clone_completed') as CloneCompletedEvent[];
@@ -214,6 +200,20 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
   // Check for running agents (workers, not planner)
   if (statuses.includes('running')) {
     return 'running';
+  }
+
+  // Check for errors (only after confirming no agents are running)
+  const hasError = events.some((e) => e.type === 'error');
+  if (hasError) {
+    const hasPrCreated = events.some((e) => e.type === 'pr_created');
+    const hasNoChanges = events.some((e) => e.type === 'repo_no_changes');
+    if (!hasPrCreated && !hasNoChanges) {
+      return 'error';
+    }
+    const lastEvent = events[events.length - 1];
+    if (lastEvent.type === 'error') {
+      return 'error';
+    }
   }
 
   // Check if any worker (non-planner, non-review-receiver) agents exist

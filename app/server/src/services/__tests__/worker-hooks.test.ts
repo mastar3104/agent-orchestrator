@@ -31,6 +31,7 @@ vi.mock('../../lib/paths', () => ({
   getRepoWorkspaceDir: vi.fn((_itemId: string, repoName: string) => `/workspace/${repoName}`),
   getItemEventsPath: vi.fn().mockReturnValue('/events.jsonl'),
   getItemPlanPath: vi.fn().mockReturnValue('/plan.yaml'),
+  getHookLogDir: vi.fn((_itemId: string, repoName: string) => `/hooks/${repoName}`),
 }));
 
 vi.mock('../event-bus', () => ({
@@ -72,7 +73,29 @@ vi.mock('../../lib/role-loader', () => ({
 
 vi.mock('fs/promises', () => ({
   readFile: vi.fn().mockResolvedValue('tasks:\n  - id: T1\n    title: Test Task'),
+  mkdir: vi.fn().mockResolvedValue(undefined),
+  writeFile: vi.fn().mockResolvedValue(undefined),
 }));
+
+vi.mock('stream/promises', () => ({
+  finished: vi.fn().mockResolvedValue(undefined),
+}));
+
+// Mock createWriteStream to return a dummy writable stream
+vi.mock('fs', () => {
+  const { PassThrough } = require('stream');
+  return {
+    createWriteStream: vi.fn().mockImplementation(() => {
+      const stream = new PassThrough();
+      // Make end() a no-op that marks the stream as finished
+      stream.end = vi.fn().mockImplementation(() => {
+        stream.emit('finish');
+        return stream;
+      });
+      return stream;
+    }),
+  };
+});
 
 // Mock child_process spawn for git commands AND hook commands
 const mockSpawn = vi.fn();
@@ -157,6 +180,9 @@ function createHookProc(exitCode: number, stdout: string = '', stderr: string = 
   const proc = new EventEmitter();
   proc.stdout = new EventEmitter();
   proc.stderr = new EventEmitter();
+  // Add pipe method for stream piping
+  proc.stdout.pipe = vi.fn().mockReturnValue(proc.stdout);
+  proc.stderr.pipe = vi.fn().mockReturnValue(proc.stderr);
   setTimeout(() => {
     if (stdout) proc.stdout.emit('data', stdout);
     if (stderr) proc.stderr.emit('data', stderr);
@@ -389,6 +415,82 @@ describe('Worker hooks', () => {
     expect(successSet.has('repo-a')).toBe(false);
   });
 
+  it('fix prompt should not contain role promptTemplate', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    // First hook run: fail, second hook run: pass
+    setupSpawnMock([
+      { exitCode: 1, stderr: 'test failed' },
+      { exitCode: 0, stdout: 'tests pass' },
+    ]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any) // initial engineer
+      .mockResolvedValueOnce(successResult() as any) // fix engineer
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'approve', comments: [] } },
+      } as any); // reviewer
+
+    await startWorkers(ITEM_ID);
+
+    // Fix engineer call should NOT contain promptTemplate
+    const fixCall = mockExecuteAgent.mock.calls[1];
+    expect(fixCall[0].prompt).not.toContain('You are an engineer.');
+  });
+
+  it('fix prompt should contain log file paths', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    setupSpawnMock([
+      { exitCode: 1, stderr: 'test failed' },
+      { exitCode: 0, stdout: 'tests pass' },
+    ]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any)
+      .mockResolvedValueOnce(successResult() as any)
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'approve', comments: [] } },
+      } as any);
+
+    await startWorkers(ITEM_ID);
+
+    const fixCall = mockExecuteAgent.mock.calls[1];
+    expect(fixCall[0].prompt).toContain('.stdout.log');
+    expect(fixCall[0].prompt).toContain('.stderr.log');
+  });
+
+  it('fix prompt should not embed raw hook output', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    setupSpawnMock([
+      { exitCode: 1, stdout: 'UNIQUE_STDOUT_MARKER', stderr: 'UNIQUE_STDERR_MARKER' },
+      { exitCode: 0, stdout: 'tests pass' },
+    ]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any)
+      .mockResolvedValueOnce(successResult() as any)
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'approve', comments: [] } },
+      } as any);
+
+    await startWorkers(ITEM_ID);
+
+    const fixCall = mockExecuteAgent.mock.calls[1];
+    expect(fixCall[0].prompt).not.toContain('UNIQUE_STDOUT_MARKER');
+    expect(fixCall[0].prompt).not.toContain('UNIQUE_STDERR_MARKER');
+  });
+
   it('should handle hook with signal kill as failure', async () => {
     mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
     mockGetItemConfig.mockResolvedValue(
@@ -414,6 +516,8 @@ describe('Worker hooks', () => {
         const proc = new EventEmitter();
         proc.stdout = new EventEmitter();
         proc.stderr = new EventEmitter();
+        proc.stdout.pipe = vi.fn().mockReturnValue(proc.stdout);
+        proc.stderr.pipe = vi.fn().mockReturnValue(proc.stderr);
         // Simulate process killed by signal (null exit code + signal)
         setTimeout(() => {
           proc.emit('close', null, 'SIGTERM');
