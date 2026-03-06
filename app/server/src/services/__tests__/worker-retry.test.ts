@@ -293,6 +293,39 @@ describe('Worker retry logic', () => {
     });
   });
 
+  it('should not run reviewer after last feedback round', async () => {
+    // MAX_FEEDBACK_ROUNDS = 2 の場合:
+    // Engineer → [Review → Fix] × 2 → PR（3回目の reviewer は走らない）
+    const requestChanges = (comments: Array<{ file: string; line: number; comment: string }>) => ({
+      result: { output: { review_status: 'request_changes', comments } },
+    });
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any) // Phase 1 engineer
+      // Cycle 1: reviewer request_changes → feedback engineer
+      .mockResolvedValueOnce(requestChanges([{ file: 'a.ts', line: 1, comment: 'fix' }]) as any)
+      .mockResolvedValueOnce(successResult() as any)
+      // Cycle 2: reviewer request_changes → feedback engineer
+      .mockResolvedValueOnce(requestChanges([{ file: 'b.ts', line: 2, comment: 'fix' }]) as any)
+      .mockResolvedValueOnce(successResult() as any);
+      // 3回目の reviewer は呼ばれない
+
+    await startWorkers(ITEM_ID);
+
+    // 1 engineer + 2×(reviewer + feedback) = 5 calls
+    expect(mockExecuteAgent).toHaveBeenCalledTimes(5);
+
+    // role='review' の呼び出しが 2 回であること
+    const reviewCalls = mockExecuteAgent.mock.calls.filter(
+      call => call[0].role === 'review'
+    );
+    expect(reviewCalls).toHaveLength(2);
+
+    // 最後の呼び出しが engineer（feedback）であること
+    const lastCall = mockExecuteAgent.mock.calls[mockExecuteAgent.mock.calls.length - 1];
+    expect(lastCall[0].role).toBe('engineer');
+  });
+
   it('should include plan and changed files sections in reviewer prompt', async () => {
     mockExecuteAgent
       .mockResolvedValueOnce(successResult() as any) // Phase 1 engineer

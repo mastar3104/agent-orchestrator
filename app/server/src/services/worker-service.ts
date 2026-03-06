@@ -25,7 +25,7 @@ import {
 } from '../lib/claude-schemas';
 import { getRole, mergeAllowedTools } from '../lib/role-loader';
 
-const MAX_REVIEW_ITERATIONS = 3;
+const MAX_FEEDBACK_ROUNDS = 2;
 const MAX_DIFF_LINES = 20000;
 const REVIEW_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const ENGINEER_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes
@@ -516,7 +516,7 @@ export async function startWorkers(itemId: string): Promise<void> {
     }
   }
 
-  // ─── Phase 2: Review Loop (per repo, max 3 cycles) ───
+  // ─── Phase 2: Review Loop (per repo, max 2 feedback rounds) ───
   for (const repo of itemConfig.repositories) {
     const engineerResult = engineerResults.get(repo.name);
     if (!engineerResult) continue;
@@ -525,8 +525,8 @@ export async function startWorkers(itemId: string): Promise<void> {
 
     const { reviewBase, phaseBase, initialHead } = engineerResult;
 
-    for (let cycle = 0; cycle < MAX_REVIEW_ITERATIONS; cycle++) {
-      console.log(`[${itemId}/${repo.name}] Starting review cycle ${cycle + 1}/${MAX_REVIEW_ITERATIONS}`);
+    for (let cycle = 0; cycle < MAX_FEEDBACK_ROUNDS; cycle++) {
+      console.log(`[${itemId}/${repo.name}] Starting review cycle ${cycle + 1}/${MAX_FEEDBACK_ROUNDS}`);
 
       const currentHead = await getGitHead(agentWorkdir);
 
@@ -614,12 +614,6 @@ export async function startWorkers(itemId: string): Promise<void> {
         break;
       }
 
-      // Last cycle - don't send feedback
-      if (cycle === MAX_REVIEW_ITERATIONS - 1) {
-        console.warn(`[${itemId}/${repo.name}] Max review cycles reached`);
-        break;
-      }
-
       console.log(`[${itemId}/${repo.name}] Review found ${comments.length} issues`);
 
       // Get feedback diff (what engineer changed during this phase)
@@ -676,7 +670,7 @@ export async function startWorkers(itemId: string): Promise<void> {
         }
       }
       if (feedbackFailed) {
-        console.warn(`[${itemId}/${repo.name}] Skipping remaining review cycles due to feedback engineer failure`);
+        console.warn(`[${itemId}/${repo.name}] Skipping remaining feedback rounds due to feedback engineer failure`);
         break;
       }
 
