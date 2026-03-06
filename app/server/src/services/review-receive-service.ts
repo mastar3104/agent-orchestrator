@@ -3,11 +3,10 @@ import type {
   ItemEvent,
   PrCreatedEvent,
   ReviewReceiveCompletedEvent,
-  ItemStatus,
 } from '@agent-orch/shared';
 import { executeAgent, getAgentsByItem, generateAgentId } from './agent-service';
 import { getItemConfig } from './item-service';
-import { deriveItemStatus } from './state-service';
+import { deriveRepoStatuses } from './state-service';
 import { readJsonl, appendJsonl } from '../lib/jsonl';
 import { getItemEventsPath, getItemPlanPath, getWorkspaceRoot } from '../lib/paths';
 import { createReviewReceiveStartedEvent, createReviewReceiveCompletedEvent, createPlanCreatedEvent, createErrorEvent } from '../lib/events';
@@ -78,17 +77,39 @@ async function getCommentsCutoffAt(
   return null;
 }
 
-/**
- * Review Receive 開始可能なステータスかを検証
- */
-async function validateStatusForReviewReceive(itemId: string): Promise<void> {
-  const status = await deriveItemStatus(itemId);
+type RepoResolution =
+  | { kind: 'none' }
+  | { kind: 'single'; repoName: string }
+  | { kind: 'multiple'; repoNames: string[] };
 
-  const allowedStatuses: ItemStatus[] = ['completed', 'error'];
-  if (!allowedStatuses.includes(status)) {
+async function resolveTargetRepo(itemId: string, repoName?: string): Promise<RepoResolution> {
+  const events = await readJsonl<ItemEvent>(getItemEventsPath(itemId));
+  const prEvents = events.filter((e): e is PrCreatedEvent => e.type === 'pr_created');
+
+  if (repoName) {
+    const hasPr = prEvents.some(e => e.repoName === repoName);
+    return hasPr ? { kind: 'single', repoName } : { kind: 'none' };
+  }
+
+  const uniquePrRepos = [...new Set(prEvents.map(e => e.repoName))];
+  if (uniquePrRepos.length === 0) return { kind: 'none' };
+  if (uniquePrRepos.length === 1) return { kind: 'single', repoName: uniquePrRepos[0] };
+  return { kind: 'multiple', repoNames: uniquePrRepos };
+}
+
+/**
+ * Review Receive 開始可能なステータスかを検証 (常に repo-level)
+ */
+async function validateRepoStatusForReviewReceive(itemId: string, repoName: string): Promise<void> {
+  const repoStatuses = await deriveRepoStatuses(itemId);
+  const repoState = repoStatuses.get(repoName);
+  if (!repoState) {
+    throw new ReviewReceiveValidationError(`Repository '${repoName}' not found`);
+  }
+  const allowedStatuses: import('@agent-orch/shared').RepoStatus[] = ['completed', 'error'];
+  if (!allowedStatuses.includes(repoState.status)) {
     throw new ReviewReceiveValidationError(
-      `Cannot start Review Receive: item is in '${status}' status. ` +
-        `Allowed statuses: ${allowedStatuses.join(', ')}`
+      `Cannot start Review Receive: repo '${repoName}' is in '${repoState.status}' status.`
     );
   }
 }
@@ -186,16 +207,26 @@ export async function validateReviewReceivePreConditions(
   if (!config) {
     throw new ReviewReceiveValidationError(`Item ${itemId} not found`);
   }
-  await validateStatusForReviewReceive(itemId);
-  await checkDuplicateExecution(itemId);
 
-  const prInfo = await getPrInfo(itemId, repoName);
-  if (!prInfo) {
+  // 1. Repo resolution (before status validation)
+  const resolution = await resolveTargetRepo(itemId, repoName);
+  if (resolution.kind === 'none') {
     const repoMsg = repoName ? ` for repository '${repoName}'` : '';
     throw new ReviewReceiveValidationError(
       `No PR found${repoMsg} for item ${itemId}. Please create a PR first.`
     );
   }
+  if (resolution.kind === 'multiple') {
+    throw new ReviewReceiveValidationError(
+      `Multiple repos have PRs (${resolution.repoNames.join(', ')}). Please specify a repo name.`
+    );
+  }
+
+  // 2. Status validation (always repo-level)
+  await validateRepoStatusForReviewReceive(itemId, resolution.repoName);
+
+  // 3. Duplicate execution check
+  await checkDuplicateExecution(itemId);
 }
 
 /**
@@ -211,14 +242,27 @@ export async function startReviewReceive(
     throw new ReviewReceiveValidationError(`Item ${itemId} not found`);
   }
 
-  await validateStatusForReviewReceive(itemId);
-  await checkDuplicateExecution(itemId);
-
-  const prInfo = await getPrInfo(itemId, repoName);
-  if (!prInfo) {
+  // Repo resolution → status validation → duplicate check
+  const resolution = await resolveTargetRepo(itemId, repoName);
+  if (resolution.kind === 'none') {
     const repoMsg = repoName ? ` for repository '${repoName}'` : '';
     throw new ReviewReceiveValidationError(
       `No PR found${repoMsg} for item ${itemId}. Please create a PR first.`
+    );
+  }
+  if (resolution.kind === 'multiple') {
+    throw new ReviewReceiveValidationError(
+      `Multiple repos have PRs (${resolution.repoNames.join(', ')}). Please specify a repo name.`
+    );
+  }
+
+  await validateRepoStatusForReviewReceive(itemId, resolution.repoName);
+  await checkDuplicateExecution(itemId);
+
+  const prInfo = await getPrInfo(itemId, resolution.repoName);
+  if (!prInfo) {
+    throw new ReviewReceiveValidationError(
+      `No PR found for repository '${resolution.repoName}' in item ${itemId}.`
     );
   }
 
@@ -259,7 +303,7 @@ export async function startReviewReceive(
     allPrComments = await fetchPrComments(repoDir, prInfo.prNumber);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const errorEvent = createErrorEvent(itemId, message.slice(0, 500));
+    const errorEvent = createErrorEvent(itemId, message.slice(0, 500), { repoName: targetRepoName, phase: 'review_receive' });
     await appendJsonl(eventsPath, errorEvent);
     eventBus.emit('event', { itemId, event: errorEvent });
     throw error;

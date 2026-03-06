@@ -41,11 +41,25 @@ export interface ItemSummary {
   updatedAt: string;
 }
 
+export type RepoStatus =
+  | 'not_started'
+  | 'ready'
+  | 'running'
+  | 'review_receiving'
+  | 'completed'
+  | 'error';
+
+export type RepoPhase = 'clone' | 'workspace_setup' | 'engineer' | 'hooks' | 'review' | 'pr' | 'review_receive';
+
 export interface RepoSummary {
   repoName: string;
   prUrl?: string;
   prNumber?: number;
   noChanges: boolean;  // repo_no_changes イベントから派生
+  status: RepoStatus;
+  activePhase?: RepoPhase;
+  inCurrentPlan: boolean;
+  lastErrorMessage?: string;
 }
 
 export interface ItemDetail extends ItemConfig {

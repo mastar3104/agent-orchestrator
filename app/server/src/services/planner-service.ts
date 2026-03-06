@@ -159,7 +159,7 @@ export async function validatePlan(plan: Plan, itemConfig?: ItemConfig | null): 
   const validRepoNames = itemConfig
     ? new Set(itemConfig.repositories.map(r => r.name))
     : null;
-  const validAgents = new Set(['engineer', 'review']);
+  const validAgents = new Set(['engineer', 'developer', 'review']);
 
   const taskIds = new Set<string>();
 

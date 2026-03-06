@@ -38,7 +38,7 @@ const VALID_ROLES = {
     },
     engineer: {
       promptTemplate: 'You are an engineer.',
-      allowedTools: ['Read', 'Write', 'Edit', 'Bash(git status:*)', 'Bash(git add:*)', 'Bash(git commit -m:*)'],
+      allowedTools: ['Read', 'Write', 'Edit', 'Bash(git status:*)'],
       schemaRef: 'engineer',
     },
     reviewer: {

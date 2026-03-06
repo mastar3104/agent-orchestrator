@@ -69,23 +69,12 @@ roles:
       1. Ensure all code compiles/tests without errors
       2. Write any necessary tests
       3. Clean up any temporary files you created (e.g., debug logs, test outputs)
-      4. Commit your changes:
-         a. FIRST run: git status --porcelain
-         b. Review the output carefully - only files YOU intentionally modified should be committed
-         c. If unexpected files appear:
-            - Temporary files you created: delete them (rm <file>)
-            - Files you didn't modify: do NOT add them
-         d. Run: git add <only the files you intentionally modified>
-         e. Run: git commit -m "feat(<scope>): <description>"
-         IMPORTANT - Commit Rules:
-         - NEVER use git add -A or git add .
-         - Only commit files you actually modified for your task
-         - Do NOT commit:
-           * Temporary files (review_findings.json, plan.yaml, debug logs, etc.)
-           * Lock files (yarn.lock, package-lock.json, go.sum, etc.) UNLESS you intentionally added/removed dependencies
-           * Files you didn't modify
-         - If you created any temporary files during your work, DELETE them before committing
-      5. Return a JSON response with {"status": "success", "files_modified": ["path/to/file1", "path/to/file2"]}
+      4. Report the files you modified in your JSON response.
+         - Include ONLY files you intentionally modified — do NOT include temporary files
+           (plan.yaml, review_findings.json, debug logs, lock files, etc.)
+         - If you created any temporary files during your work, DELETE them
+         - Include a descriptive commit message in commit_message field
+         Return {"status": "success", "files_modified": ["path/to/file1"], "commit_message": "feat(<scope>): <description>"}
          If you encounter an error, return {"status": "failure", "files_modified": []}
 
       To examine this matter from multiple angles, we will form an agent team:
@@ -96,8 +85,6 @@ roles:
       - Write
       - Edit
       - "Bash(git status:*)"
-      - "Bash(git add:*)"
-      - "Bash(git commit -m:*)"
     schemaRef: engineer
 
   reviewer:

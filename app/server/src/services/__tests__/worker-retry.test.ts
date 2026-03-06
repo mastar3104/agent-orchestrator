@@ -76,7 +76,9 @@ vi.mock('child_process', () => {
         } else if (args[0] === 'merge-base') {
           proc.stdout.emit('data', 'base123');
         } else if (args[0] === 'diff') {
-          if (args.includes('--name-status')) {
+          if (args.includes('--cached') && args.includes('--name-only')) {
+            proc.stdout.emit('data', 'file.ts');
+          } else if (args.includes('--name-status')) {
             proc.stdout.emit('data', 'M\tfile.ts');
           } else if (args.includes('--numstat')) {
             proc.stdout.emit('data', '10\t5\tfile.ts');

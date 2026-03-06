@@ -97,6 +97,52 @@ function validateAgentWorkdir(agentWorkdir: string, workspaceRoot: string): void
   }
 }
 
+// ─── Orchestrator-side commit ───
+
+async function commitEngineerChanges(
+  cwd: string,
+  engineerResponse: EngineerResponse,
+  fallbackMessage: string,
+  itemId: string,
+  repoName: string
+): Promise<boolean> {
+  if (engineerResponse.status !== 'success') {
+    console.log(`[${itemId}/${repoName}] Engineer status=${engineerResponse.status}, skipping commit`);
+    return false;
+  }
+
+  const filesToAdd = engineerResponse.files_modified || [];
+  if (filesToAdd.length === 0) {
+    console.log(`[${itemId}/${repoName}] No files_modified reported, skipping commit`);
+    return false;
+  }
+
+  // 安全確認: 無関係な staged changes が残っていないか検査
+  const preExistingStaged = await execGit(['diff', '--cached', '--name-only'], cwd);
+  if (preExistingStaged.trim()) {
+    console.warn(
+      `[${itemId}/${repoName}] Pre-existing staged changes detected, unstaging: ${preExistingStaged.trim()}`
+    );
+    await execGit(['reset', 'HEAD'], cwd);
+  }
+
+  // files_modified のみ git add
+  await execGit(['add', '--', ...filesToAdd], cwd);
+
+  // 対象ファイルに限定して staged 差分を確認
+  const staged = await execGit(['diff', '--cached', '--name-only', '--', ...filesToAdd], cwd);
+  if (!staged.trim()) {
+    console.log(`[${itemId}/${repoName}] No staged changes for files_modified, skipping commit`);
+    return false;
+  }
+
+  const message = engineerResponse.commit_message?.trim() || fallbackMessage;
+  await execGit(['commit', '-m', message], cwd);
+
+  console.log(`[${itemId}/${repoName}] Committed: ${message}`);
+  return true;
+}
+
 // ─── Engineer Phase Result ───
 
 interface EngineerPhaseResult {
@@ -249,19 +295,15 @@ ${failedHooks}
 ## Instructions
 1. Read the log files above to understand what failed
 2. Fix all issues
-3. Commit your changes:
-   - NEVER use git add -A or git add .
-   - Only commit files you actually modified
-   - Run: git add <specific files>
-   - Run: git commit -m "fix(<scope>): address hook validation failures"
 
-Return a JSON response with {"status": "success", "files_modified": ["path/to/file1"]} when done.
+Please fix all issues and report the modified files.
+Return {"status": "success", "files_modified": [...], "commit_message": "fix(<scope>): address hook failures"} when done.
 If you encounter an error, return {"status": "failure", "files_modified": []}.`;
 }
 
 // ─── Main orchestration ───
 
-export async function startWorkers(itemId: string): Promise<void> {
+export async function startWorkers(itemId: string, targetRepos?: string[]): Promise<void> {
   const plan = await getPlan(itemId);
   if (!plan) {
     throw new Error(`No plan found for item ${itemId}`);
@@ -299,6 +341,8 @@ export async function startWorkers(itemId: string): Promise<void> {
   const devPromises: Promise<void>[] = [];
 
   for (const repo of itemConfig.repositories) {
+    // Filter by targetRepos if specified
+    if (targetRepos && !targetRepos.includes(repo.name)) continue;
     const repoTasks = tasksByRepo.get(repo.name);
     const devTasks = repoTasks?.filter(t => isDevRole(t.agent)) || [];
     if (devTasks.length === 0) continue;
@@ -339,6 +383,12 @@ export async function startWorkers(itemId: string): Promise<void> {
             jsonSchema: engineerRole.jsonSchema,
             timeoutMs: ENGINEER_TIMEOUT_MS,
           });
+          const committed = await commitEngineerChanges(agentWorkdir, result.output,
+            `feat(${repo.name}): implement ${devTasks.map(t => t.title).join(', ')}`,
+            itemId, repo.name);
+          if (!committed) {
+            throw new Error(`Engineer produced no committable changes for ${repo.name}`);
+          }
           let initialHead = phaseBase;
           try {
             initialHead = await getGitHead(agentWorkdir);
@@ -372,7 +422,7 @@ export async function startWorkers(itemId: string): Promise<void> {
                 // Re-run engineer with fix prompt
                 const fixPrompt = buildHooksFixPrompt(hookResults);
                 try {
-                  await executeAgent<EngineerResponse>({
+                  const { result: fixResult } = await executeAgent<EngineerResponse>({
                     itemId,
                     role: 'engineer',
                     repoName: repo.name,
@@ -382,6 +432,8 @@ export async function startWorkers(itemId: string): Promise<void> {
                     jsonSchema: engineerRole.jsonSchema,
                     timeoutMs: ENGINEER_TIMEOUT_MS,
                   });
+                  await commitEngineerChanges(agentWorkdir, fixResult.output,
+                    `fix(${repo.name}): address hook validation failures`, itemId, repo.name);
                 } catch (fixError) {
                   const fixMsg = fixError instanceof Error ? fixError.message : String(fixError);
                   console.error(`[${itemId}/${repo.name}] Hooks fix engineer failed: ${fixMsg}`);
@@ -394,7 +446,8 @@ export async function startWorkers(itemId: string): Promise<void> {
               hooksFailedRepos.add(repo.name);
               const errorEvent = createErrorEvent(
                 itemId,
-                `Hooks validation failed for ${repo.name} after ${MAX_HOOKS_RETRIES} attempts`
+                `Hooks validation failed for ${repo.name} after ${MAX_HOOKS_RETRIES} attempts`,
+                { repoName: repo.name, phase: 'hooks' }
               );
               await appendJsonl(getItemEventsPath(itemId), errorEvent);
               eventBus.publish(itemId, errorEvent);
@@ -466,6 +519,12 @@ export async function startWorkers(itemId: string): Promise<void> {
           workingDir: agentWorkdir, allowedTools: effectiveTools,
           jsonSchema: engineerRole.jsonSchema, timeoutMs: ENGINEER_TIMEOUT_MS,
         });
+        const committed = await commitEngineerChanges(agentWorkdir, result.output,
+          `feat(${repo.name}): implement ${devTasks.map(t => t.title).join(', ')}`,
+          itemId, repo.name);
+        if (!committed) {
+          throw new Error(`Engineer retry produced no committable changes for ${repo.name}`);
+        }
         let initialHead = phaseBase;
         try {
           initialHead = await getGitHead(agentWorkdir);
@@ -495,11 +554,13 @@ export async function startWorkers(itemId: string): Promise<void> {
             if (hookAttempt < MAX_HOOKS_RETRIES) {
               const fixPrompt = buildHooksFixPrompt(hookResults);
               try {
-                await executeAgent<EngineerResponse>({
+                const { result: fixResult } = await executeAgent<EngineerResponse>({
                   itemId, role: 'engineer', repoName: repo.name, prompt: fixPrompt,
                   workingDir: agentWorkdir, allowedTools: effectiveTools,
                   jsonSchema: engineerRole.jsonSchema, timeoutMs: ENGINEER_TIMEOUT_MS,
                 });
+                await commitEngineerChanges(agentWorkdir, fixResult.output,
+                  `fix(${repo.name}): address hook validation failures`, itemId, repo.name);
               } catch (fixError) {
                 const fixMsg = fixError instanceof Error ? fixError.message : String(fixError);
                 console.error(`[${itemId}/${repo.name}] Hooks fix engineer failed: ${fixMsg}`);
@@ -512,7 +573,8 @@ export async function startWorkers(itemId: string): Promise<void> {
             hooksFailedRepos.add(repo.name);
             const errorEvent = createErrorEvent(
               itemId,
-              `Hooks validation failed for ${repo.name} after ${MAX_HOOKS_RETRIES} attempts`
+              `Hooks validation failed for ${repo.name} after ${MAX_HOOKS_RETRIES} attempts`,
+              { repoName: repo.name, phase: 'hooks' }
             );
             await appendJsonl(getItemEventsPath(itemId), errorEvent);
             eventBus.publish(itemId, errorEvent);
@@ -671,7 +733,7 @@ export async function startWorkers(itemId: string): Promise<void> {
       let feedbackFailed = false;
       for (let feedbackAttempt = 0; feedbackAttempt <= AGENT_MAX_RETRIES; feedbackAttempt++) {
         try {
-          await executeAgent<EngineerResponse>({
+          const { result: fbResult } = await executeAgent<EngineerResponse>({
             itemId,
             role: 'engineer',
             repoName: repo.name,
@@ -681,6 +743,11 @@ export async function startWorkers(itemId: string): Promise<void> {
             jsonSchema: feedbackRole.jsonSchema,
             timeoutMs: ENGINEER_TIMEOUT_MS,
           });
+          const committed = await commitEngineerChanges(agentWorkdir, fbResult.output,
+            `fix(${repo.name}): address review feedback`, itemId, repo.name);
+          if (!committed) {
+            throw new Error(`Feedback engineer produced no committable changes for ${repo.name}`);
+          }
           break;
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error);
@@ -697,57 +764,64 @@ export async function startWorkers(itemId: string): Promise<void> {
         break;
       }
 
+      // ─── Post-feedback Hooks execution ───
+      const postFeedbackHooks = repo.hooks;
+      if (postFeedbackHooks && postFeedbackHooks.length > 0) {
+        const feedbackHookLogDir = join(getHookLogDir(itemId, repo.name), `feedback-cycle-${cycle + 1}`);
+        let hooksPassed = false;
+        for (let hookAttempt = 1; hookAttempt <= MAX_HOOKS_RETRIES; hookAttempt++) {
+          console.log(`[${itemId}/${repo.name}] Running post-feedback hooks cycle ${cycle + 1} (attempt ${hookAttempt}/${MAX_HOOKS_RETRIES})`);
+          const hookResults = await runHooks(postFeedbackHooks, agentWorkdir, feedbackHookLogDir, hookAttempt);
+          const allPassed = hookResults.every(r => r.exitCode === 0);
+
+          const hooksEvent = createHooksExecutedEvent(itemId, repo.name, hookResults, allPassed, hookAttempt);
+          await appendJsonl(getItemEventsPath(itemId), hooksEvent);
+          eventBus.publish(itemId, hooksEvent);
+
+          if (allPassed) {
+            console.log(`[${itemId}/${repo.name}] Post-feedback hooks passed on attempt ${hookAttempt}`);
+            hooksPassed = true;
+            break;
+          }
+
+          console.warn(`[${itemId}/${repo.name}] Post-feedback hooks failed on attempt ${hookAttempt}/${MAX_HOOKS_RETRIES}`);
+
+          if (hookAttempt < MAX_HOOKS_RETRIES) {
+            const fixPrompt = buildHooksFixPrompt(hookResults);
+            try {
+              const { result: hookFixResult } = await executeAgent<EngineerResponse>({
+                itemId, role: 'engineer', repoName: repo.name, prompt: fixPrompt,
+                workingDir: agentWorkdir, allowedTools: feedbackEffectiveTools,
+                jsonSchema: feedbackRole.jsonSchema, timeoutMs: ENGINEER_TIMEOUT_MS,
+              });
+              await commitEngineerChanges(agentWorkdir, hookFixResult.output,
+                `fix(${repo.name}): address post-feedback hook failures`, itemId, repo.name);
+            } catch (fixError) {
+              const fixMsg = fixError instanceof Error ? fixError.message : String(fixError);
+              console.error(`[${itemId}/${repo.name}] Post-feedback hooks fix engineer failed: ${fixMsg}`);
+            }
+          }
+        }
+
+        if (!hooksPassed) {
+          console.error(`[${itemId}/${repo.name}] Post-feedback hooks failed after ${MAX_HOOKS_RETRIES} attempts, proceeding to PR`);
+          const errorEvent = createErrorEvent(
+            itemId,
+            `Post-feedback hooks validation failed for ${repo.name} after ${MAX_HOOKS_RETRIES} attempts. Proceeding with PR creation.`,
+            { repoName: repo.name, phase: 'hooks' }
+          );
+          await appendJsonl(getItemEventsPath(itemId), errorEvent);
+          eventBus.publish(itemId, errorEvent);
+          break; // review loop を打ち切り、PR 作成へ進む
+        }
+      }
+
       // phaseBase stays the same — next cycle's diff still covers everything
     }
   }
 
   // ─── Phase 3: Push & PR ───
   await createDraftPrsForAllRepos(itemId, new Set(engineerResults.keys()));
-}
-
-export async function startWorkerForRepo(
-  itemId: string,
-  repoName: string,
-  role: AgentRole = 'engineer'
-): Promise<void> {
-  const plan = await getPlan(itemId);
-  if (!plan) {
-    throw new Error(`No plan found for item ${itemId}`);
-  }
-
-  const itemConfig = await getItemConfig(itemId);
-  if (!itemConfig) {
-    throw new Error(`Item config not found for ${itemId}`);
-  }
-
-  const workspaceRoot = resolve(getWorkspaceRoot(itemId));
-
-  const workerRole = getRole('engineer');
-
-  const tasks = plan.tasks.filter(t => t.agent === role && t.repository === repoName);
-  if (tasks.length === 0) {
-    throw new Error(`No tasks found for agent ${role} in repository ${repoName}`);
-  }
-
-  const repoConfig = itemConfig.repositories.find(r => r.name === repoName);
-  const effectiveTools = isDevRole(role)
-    ? mergeAllowedTools(workerRole.allowedTools, repoConfig?.allowedTools)
-    : workerRole.allowedTools;
-
-  const agentWorkdir = resolve(getRepoWorkspaceDir(itemId, repoName));
-  validateAgentWorkdir(agentWorkdir, workspaceRoot);
-
-  const context = buildWorkerContext(role, repoName, tasks, plan);
-  const prompt = `${workerRole.promptTemplate}\n\n${context}`;
-  await executeAgent<EngineerResponse>({
-    itemId,
-    role,
-    repoName,
-    prompt,
-    workingDir: agentWorkdir,
-    allowedTools: effectiveTools,
-    jsonSchema: workerRole.jsonSchema,
-  });
 }
 
 function buildWorkerContext(
@@ -1017,14 +1091,8 @@ ${diff}
 \`\`\`
 
 ## Instructions
-Please address all review comments and create a new commit.
-Follow the same commit rules as before:
-- NEVER use git add -A or git add .
-- Only commit files you actually modified
-- Run: git add <specific files>
-- Run: git commit -m "fix(<scope>): address review feedback"
-
-Return a JSON response with {"status": "success", "files_modified": ["path/to/file1"]} when done.
+Please address all review comments and report the modified files.
+Return {"status": "success", "files_modified": [...], "commit_message": "fix(<scope>): address review feedback"} when done.
 If you encounter an error, return {"status": "failure", "files_modified": []}.`;
 
   return `${role.promptTemplate}\n\n${context}`;

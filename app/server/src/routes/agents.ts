@@ -5,7 +5,6 @@ import type {
   ApiResponse,
   AgentInfo,
   AgentExecutionOutput,
-  AgentRole,
   Plan,
   PlanFeedbackItem,
 } from '@agent-orch/shared';
@@ -16,7 +15,7 @@ import {
 } from '../services/agent-service';
 import { startPlanner, getPlan, getPlanContent, updatePlanContent, planFeedback, validatePlanFeedback } from '../services/planner-service';
 import { parseYaml } from '../lib/yaml';
-import { startWorkers, startWorkerForRepo, getWorkerStatus } from '../services/worker-service';
+import { startWorkers, getWorkerStatus } from '../services/worker-service';
 import { getWorkspaceRoot, getAgentOutputPath, getItemPlanPath, getItemEventsPath } from '../lib/paths';
 import { withItemLock, isItemLocked } from '../lib/locks';
 import { createErrorEvent } from '../lib/events';
@@ -46,7 +45,7 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
       const message = err instanceof Error ? err.message : 'Unknown error';
       console.error(`[${itemId}] Planner failed:`, message);
       try {
-        const errorEvent = createErrorEvent(itemId, message);
+        const errorEvent = createErrorEvent(itemId, message, { phase: 'planner' });
         await appendJsonl(getItemEventsPath(itemId), errorEvent);
         eventBus.emit('event', { itemId, event: errorEvent });
       } catch { /* best-effort */ }
@@ -215,7 +214,7 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
       const message = err instanceof Error ? err.message : 'Unknown error';
       console.error(`[${itemId}] Plan feedback failed:`, message);
       try {
-        const errorEvent = createErrorEvent(itemId, message);
+        const errorEvent = createErrorEvent(itemId, message, { phase: 'planner' });
         await appendJsonl(getItemEventsPath(itemId), errorEvent);
         eventBus.emit('event', { itemId, event: errorEvent });
       } catch { /* best-effort */ }
@@ -230,9 +229,11 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
   // Start all workers (async — returns 202 immediately)
   fastify.post<{
     Params: { id: string };
+    Body: { repos?: string[] };
     Reply: ApiResponse<{ started: boolean }>;
   }>('/items/:id/workers/start', async (request, reply) => {
     const itemId = request.params.id;
+    const targetRepos = (request.body as { repos?: string[] })?.repos;
 
     if (isItemLocked(itemId)) {
       return reply.status(409).send({
@@ -246,7 +247,7 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
       let lastError: Error | null = null;
       for (let attempt = 0; attempt <= WORKERS_MAX_RETRIES; attempt++) {
         try {
-          await startWorkers(itemId);
+          await startWorkers(itemId, targetRepos);
           return;
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
@@ -304,60 +305,6 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.send({
         success: true,
         data: { agents },
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      return reply.status(500).send({
-        success: false,
-        error: message,
-      });
-    }
-  });
-
-  // Start a specific agent
-  fastify.post<{
-    Params: { id: string };
-    Body: { repoName: string; role?: string; prompt?: string };
-    Reply: ApiResponse<{ agent: AgentInfo }>;
-  }>('/items/:id/agents/start', async (request, reply) => {
-    try {
-      const { repoName, role } = request.body;
-      const effectiveRole = (role || 'engineer') as AgentRole;
-
-      if (!repoName) {
-        return reply.status(400).send({
-          success: false,
-          error: 'repoName is required',
-        });
-      }
-
-      // Reject system roles that have dedicated start flows
-      if (effectiveRole === 'planner') {
-        return reply.status(400).send({
-          success: false,
-          error: 'Use POST /items/:id/planner/start to start the planner',
-        });
-      }
-      if (effectiveRole === 'review-receiver') {
-        return reply.status(400).send({
-          success: false,
-          error: 'review-receiver requires PR context; use the review-receive endpoint',
-        });
-      }
-
-      // Dev roles (and 'review') → delegate to startWorkerForRepo
-      await startWorkerForRepo(request.params.id, repoName, effectiveRole);
-      const agents = await getAgentsByItem(request.params.id);
-      const agent = agents.find((a) => a.role === effectiveRole && a.repoName === repoName);
-      if (!agent) {
-        return reply.status(404).send({
-          success: false,
-          error: `Agent for role '${effectiveRole}' in repo '${repoName}' not found after start`,
-        });
-      }
-      return reply.status(201).send({
-        success: true,
-        data: { agent },
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';

@@ -1,6 +1,6 @@
 import type { ItemConfig, ItemSummary, ItemDetail } from './item';
 import type { Plan } from './plan';
-import type { AgentInfo, AgentRole } from './agent';
+import type { AgentInfo } from './agent';
 import type { ItemEvent } from './events';
 
 // Repository configuration for direct input
@@ -35,12 +35,6 @@ export interface CreateItemRequest {
   description: string;
   repositories: CreateItemRepositoryInput[];  // 変更: 配列
   designDoc?: string;
-}
-
-export interface StartAgentRequest {
-  repoName: string;
-  role?: AgentRole;
-  prompt?: string;
 }
 
 export interface SendInputRequest {
@@ -82,10 +76,6 @@ export interface ListItemsResponse {
 
 export interface GetItemResponse {
   item: ItemDetail;
-}
-
-export interface StartAgentResponse {
-  agent: AgentInfo;
 }
 
 export interface AgentStatusResponse {

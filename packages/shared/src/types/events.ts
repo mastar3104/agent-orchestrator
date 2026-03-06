@@ -153,10 +153,14 @@ export interface WorkspaceSetupCompletedEvent extends BaseEvent {
   error?: string;
 }
 
+export type ErrorPhase = 'planner' | 'clone' | 'workspace_setup' | 'engineer' | 'hooks' | 'review' | 'pr' | 'review_receive';
+
 export interface ErrorEvent extends BaseEvent {
   type: 'error';
   message: string;
   stack?: string;
+  repoName?: string;
+  phase?: ErrorPhase;
 }
 
 export interface PrCreatedEvent extends BaseEvent {

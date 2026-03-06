@@ -1,15 +1,5 @@
 export type AgentRole = string;
 
-const SYSTEM_ROLES = new Set(['planner', 'review', 'review-receiver']);
-
-export function isSystemRole(role: string): boolean {
-  return SYSTEM_ROLES.has(role);
-}
-
-export function isDevRole(role: string): boolean {
-  return role === 'engineer';
-}
-
 export type AgentStatus =
   | 'idle'
   | 'starting'

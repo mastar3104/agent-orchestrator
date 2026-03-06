@@ -114,6 +114,7 @@ import { startWorkers } from '../worker-service';
 import { appendJsonl } from '../../lib/jsonl';
 import { createHooksExecutedEvent, createErrorEvent } from '../../lib/events';
 import { eventBus } from '../event-bus';
+import { mkdir } from 'fs/promises';
 
 const mockExecuteAgent = vi.mocked(executeAgent);
 const mockGetPlan = vi.mocked(getPlan);
@@ -122,6 +123,7 @@ const mockCreateDraftPrsForAllRepos = vi.mocked(createDraftPrsForAllRepos);
 const mockAppendJsonl = vi.mocked(appendJsonl);
 const mockCreateHooksExecutedEvent = vi.mocked(createHooksExecutedEvent);
 const mockCreateErrorEvent = vi.mocked(createErrorEvent);
+const mockMkdir = vi.mocked(mkdir);
 
 // ─── Fixtures ───
 
@@ -201,12 +203,14 @@ function setupSpawnMock(hookResults: { exitCode: number; stdout?: string; stderr
       if (args[0] === 'rev-parse') return createGitProc('abc123');
       if (args[0] === 'merge-base') return createGitProc('base123');
       if (args[0] === 'diff') {
+        if (args.includes('--cached') && args.includes('--name-only')) return createGitProc('file.ts');
         if (args.includes('--name-status')) return createGitProc('M\tfile.ts');
         if (args.includes('--numstat')) return createGitProc('10\t5\tfile.ts');
         return createGitProc('diff content');
       }
       if (args[0] === 'show') return createGitProc('// file content');
       if (args[0] === 'cat-file') return createGitProc('1024');
+      if (args[0] === 'add' || args[0] === 'reset' || args[0] === 'commit') return createGitProc('');
       return createGitProc('');
     }
     if (cmd === 'sh') {
@@ -335,7 +339,8 @@ describe('Worker hooks', () => {
     // Error event should have been created
     expect(mockCreateErrorEvent).toHaveBeenCalledWith(
       ITEM_ID,
-      expect.stringContaining('Hooks validation failed for repo-a')
+      expect.stringContaining('Hooks validation failed for repo-a'),
+      { repoName: 'repo-a', phase: 'hooks' }
     );
 
     // No reviewer should have been called
@@ -384,12 +389,14 @@ describe('Worker hooks', () => {
         if (args[0] === 'rev-parse') return createGitProc('abc123');
         if (args[0] === 'merge-base') return createGitProc('base123');
         if (args[0] === 'diff') {
+          if (args.includes('--cached') && args.includes('--name-only')) return createGitProc('file.ts');
           if (args.includes('--name-status')) return createGitProc('M\tfile.ts');
           if (args.includes('--numstat')) return createGitProc('10\t5\tfile.ts');
           return createGitProc('diff content');
         }
         if (args[0] === 'show') return createGitProc('// file content');
         if (args[0] === 'cat-file') return createGitProc('1024');
+        if (args[0] === 'add' || args[0] === 'reset' || args[0] === 'commit') return createGitProc('');
         return createGitProc('');
       }
       if (cmd === 'sh') {
@@ -503,12 +510,14 @@ describe('Worker hooks', () => {
         if (args[0] === 'rev-parse') return createGitProc('abc123');
         if (args[0] === 'merge-base') return createGitProc('base123');
         if (args[0] === 'diff') {
+          if (args.includes('--cached') && args.includes('--name-only')) return createGitProc('file.ts');
           if (args.includes('--name-status')) return createGitProc('M\tfile.ts');
           if (args.includes('--numstat')) return createGitProc('10\t5\tfile.ts');
           return createGitProc('diff content');
         }
         if (args[0] === 'show') return createGitProc('// file content');
         if (args[0] === 'cat-file') return createGitProc('1024');
+        if (args[0] === 'add' || args[0] === 'reset' || args[0] === 'commit') return createGitProc('');
         return createGitProc('');
       }
       if (cmd === 'sh') {
@@ -535,5 +544,108 @@ describe('Worker hooks', () => {
     expect(mockCreateHooksExecutedEvent).toHaveBeenCalled();
     const firstCall = mockCreateHooksExecutedEvent.mock.calls[0];
     expect(firstCall[3]).toBe(false); // allPassed = false
+  });
+
+  it('should run hooks after feedback engineer in review loop and continue to next review cycle', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    // Phase 1 hook: pass, Post-feedback hook: pass
+    setupSpawnMock([
+      { exitCode: 0, stdout: 'tests pass' },   // Phase 1 hook
+      { exitCode: 0, stdout: 'tests pass' },   // Post-feedback hook
+    ]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any) // initial engineer
+      .mockResolvedValueOnce({                       // reviewer cycle 1: request_changes
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
+      } as any)
+      .mockResolvedValueOnce(successResult() as any) // feedback engineer
+      .mockResolvedValueOnce({                       // reviewer cycle 2: approve
+        result: { output: { review_status: 'approve', comments: [] } },
+      } as any);
+
+    await startWorkers(ITEM_ID);
+
+    // createHooksExecutedEvent should be called 2 times (Phase 1 + Post-feedback)
+    expect(mockCreateHooksExecutedEvent).toHaveBeenCalledTimes(2);
+
+    // Review should have been called twice (review loop continued after post-feedback hooks passed)
+    const reviewCalls = mockExecuteAgent.mock.calls.filter(call => call[0].role === 'review');
+    expect(reviewCalls).toHaveLength(2);
+  });
+
+  it('should emit error event and still create PR when post-feedback hooks exhaust retries', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    // Phase 1 hook: pass, Post-feedback hooks: fail x2
+    setupSpawnMock([
+      { exitCode: 0, stdout: 'tests pass' },           // Phase 1 hook
+      { exitCode: 1, stderr: 'test failed attempt 1' }, // Post-feedback hook attempt 1
+      { exitCode: 1, stderr: 'test failed attempt 2' }, // Post-feedback hook attempt 2
+    ]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any) // initial engineer
+      .mockResolvedValueOnce({                       // reviewer: request_changes
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
+      } as any)
+      .mockResolvedValueOnce(successResult() as any) // feedback engineer
+      .mockResolvedValueOnce(successResult() as any); // hook-fix engineer
+
+    await startWorkers(ITEM_ID);
+
+    // Error event should mention post-feedback hooks failure
+    expect(mockCreateErrorEvent).toHaveBeenCalledWith(
+      ITEM_ID,
+      expect.stringContaining('Post-feedback hooks validation failed'),
+      { repoName: 'repo-a', phase: 'hooks' }
+    );
+
+    // PR should still be created (repo-a should be in the set)
+    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(
+      ITEM_ID,
+      expect.any(Set)
+    );
+    const successSet = mockCreateDraftPrsForAllRepos.mock.calls[0][1] as Set<string>;
+    expect(successSet.has('repo-a')).toBe(true);
+  });
+
+  it('should use isolated log dir for post-feedback hooks', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    // Phase 1 hook: pass, Post-feedback hook: pass
+    setupSpawnMock([
+      { exitCode: 0, stdout: 'tests pass' }, // Phase 1 hook
+      { exitCode: 0, stdout: 'tests pass' }, // Post-feedback hook
+    ]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any) // initial engineer
+      .mockResolvedValueOnce({                       // reviewer: request_changes
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
+      } as any)
+      .mockResolvedValueOnce(successResult() as any) // feedback engineer
+      .mockResolvedValueOnce({                       // reviewer: approve
+        result: { output: { review_status: 'approve', comments: [] } },
+      } as any);
+
+    await startWorkers(ITEM_ID);
+
+    // Check that mkdir was called with a path containing feedback-cycle-1
+    const mkdirCalls = mockMkdir.mock.calls.map(call => call[0]);
+    const feedbackCycleDirs = mkdirCalls.filter(path =>
+      typeof path === 'string' && path.includes('feedback-cycle-1')
+    );
+    expect(feedbackCycleDirs.length).toBeGreaterThan(0);
   });
 });

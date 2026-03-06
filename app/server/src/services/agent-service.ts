@@ -163,7 +163,13 @@ export async function executeAgent<T>(options: {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
     // Log error event
-    const errorEvent = createErrorEvent(options.itemId, errorMessage, undefined, agentId);
+    const phase = options.role === 'review-receiver' ? 'review_receive' as const
+      : (['engineer', 'review', 'planner'] as const).find(r => r === options.role);
+    const errorEvent = createErrorEvent(options.itemId, errorMessage, {
+      agentId,
+      repoName: options.repoName,
+      phase,
+    });
     await logEvent(options.itemId, agentId, errorEvent);
 
     // Log agent exited with error

@@ -147,10 +147,17 @@ export function ItemDetailPage() {
     item.status === 'ready' ||
     (item.status === 'error' && !!item.plan);
 
-  // Review Receive can be started when completed or error
-  // NOTE: UI側は status のみで表示制御、PRがない場合はサーバからエラーメッセージが返る
-  const canStartReviewReceive =
-    item.status === 'completed' || item.status === 'error';
+  // Error repos for partial re-run
+  const failedRepos = item.repos?.filter(r => r.status === 'error').map(r => r.repoName) ?? [];
+
+  // Review Receive: check repo-level status for PR repos
+  const canStartReviewReceive = item.repos?.some(
+    repo => repo.prUrl && (repo.status === 'completed' || repo.status === 'error')
+  ) ?? false;
+
+  // "Review Receive (All)" only shown for single-PR items
+  const prRepos = item.repos?.filter(r => r.prUrl) ?? [];
+  const showReviewReceiveAll = canStartReviewReceive && prRepos.length === 1;
 
   return (
     <div className="space-y-6">
@@ -177,26 +184,37 @@ export function ItemDetailPage() {
             >
               {item.status}
             </span>
-            {item.repos?.map((repo) => (
-              repo.prUrl ? (
+            {item.repos?.map((repo) => {
+              const statusColor = repo.status === 'error' ? 'bg-red-500'
+                : repo.status === 'running' ? 'bg-yellow-500'
+                : repo.status === 'completed' ? 'bg-green-600'
+                : repo.status === 'review_receiving' ? 'bg-cyan-500'
+                : repo.status === 'ready' ? 'bg-blue-500'
+                : 'bg-gray-600';
+              const label = `${repo.repoName}${repo.prUrl ? ` PR #${repo.prNumber}` : repo.noChanges ? ': no changes' : ''}${repo.activePhase && repo.status === 'running' ? ` (${repo.activePhase})` : ''}`;
+              const tooltip = repo.lastErrorMessage || (repo.activePhase ? `Phase: ${repo.activePhase}` : undefined);
+
+              return repo.prUrl ? (
                 <a
                   key={repo.repoName}
                   href={repo.prUrl}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="px-2 py-0.5 text-xs rounded-full bg-purple-600 text-white hover:bg-purple-500"
+                  className={`px-2 py-0.5 text-xs rounded-full text-white hover:brightness-110 ${statusColor}`}
+                  title={tooltip}
                 >
-                  {repo.repoName} PR #{repo.prNumber}
+                  {label}
                 </a>
-              ) : repo.noChanges ? (
+              ) : (
                 <span
                   key={repo.repoName}
-                  className="px-2 py-0.5 text-xs rounded-full bg-gray-600 text-gray-300"
+                  className={`px-2 py-0.5 text-xs rounded-full text-white ${statusColor}`}
+                  title={tooltip}
                 >
-                  {repo.repoName}: no changes
+                  {label}
                 </span>
-              ) : null
-            ))}
+              );
+            })}
             {!isConnected && (
               <span className="text-xs text-red-400">Disconnected</span>
             )}
@@ -215,23 +233,33 @@ export function ItemDetailPage() {
           )}
           {canStartWorkers && (
             <button
-              onClick={startWorkers}
+              onClick={() => {
+                if (item.status === 'error' && failedRepos.length > 0) {
+                  startWorkers(failedRepos);
+                } else {
+                  startWorkers();
+                }
+              }}
               className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-500"
             >
-              Start Workers
+              {item.status === 'error' && failedRepos.length > 0
+                ? `Retry Failed (${failedRepos.join(', ')})`
+                : 'Start Workers'}
             </button>
           )}
           {canStartReviewReceive && (
             <div className="flex flex-col gap-1">
               <div className="flex gap-2">
-                <button
-                  onClick={() => startReviewReceive()}
-                  className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-500"
-                >
-                  Review Receive (All)
-                </button>
+                {showReviewReceiveAll && (
+                  <button
+                    onClick={() => startReviewReceive()}
+                    className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-500"
+                  >
+                    Review Receive (All)
+                  </button>
+                )}
                 {item.repos?.map((repo) =>
-                  repo.prUrl ? (
+                  repo.prUrl && (repo.status === 'completed' || repo.status === 'error') ? (
                     <button
                       key={repo.repoName}
                       onClick={() => startReviewReceive(repo.repoName)}

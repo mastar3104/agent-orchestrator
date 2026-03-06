@@ -36,7 +36,7 @@ import {
   createWorkspaceSetupCompletedEvent,
   createErrorEvent,
 } from '../lib/events';
-import { deriveItemStatus, getPendingApprovals } from './state-service';
+import { deriveItemStatus, deriveRepoStatuses, getPendingApprovals } from './state-service';
 import { getAgentsByItem, stopAgent } from './agent-service';
 import { stopAllGitSnapshots } from './git-snapshot-service';
 import { startPlanner } from './planner-service';
@@ -158,7 +158,7 @@ export async function setupWorkspace(itemId: string): Promise<void> {
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     console.error(`[${itemId}] Failed to auto-start planner: ${message}`);
-    await appendJsonl(eventsPath, createErrorEvent(itemId, 'planner_autostart_failed', message));
+    await appendJsonl(eventsPath, createErrorEvent(itemId, 'planner_autostart_failed', { stack: message, phase: 'planner' }));
   }
 }
 
@@ -368,19 +368,25 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
   const agents = await getAgentsByItem(itemId);
   const pendingApprovals = await getPendingApprovals(itemId);
 
-  // Build RepoSummary[] from events
+  // Build RepoSummary[] from events + derived repo statuses
   const events = await readJsonl<import('@agent-orch/shared').ItemEvent>(getItemEventsPath(itemId));
   const prEvents = events.filter((e): e is PrCreatedEvent => e.type === 'pr_created');
   const noChangesEvents = events.filter((e): e is RepoNoChangesEvent => e.type === 'repo_no_changes');
+  const repoStatusMap = await deriveRepoStatuses(itemId);
 
   const repos: RepoSummary[] = config.repositories.map(repo => {
     const prEvent = prEvents.filter(e => e.repoName === repo.name).pop();
     const hasNoChanges = noChangesEvents.some(e => e.repoName === repo.name);
+    const derived = repoStatusMap.get(repo.name);
     return {
       repoName: repo.name,
       prUrl: prEvent?.prUrl,
       prNumber: prEvent?.prNumber,
       noChanges: hasNoChanges,
+      status: derived?.status ?? 'not_started',
+      activePhase: derived?.activePhase,
+      inCurrentPlan: derived?.inCurrentPlan ?? false,
+      lastErrorMessage: derived?.lastErrorMessage,
     };
   });
 

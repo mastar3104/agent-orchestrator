@@ -78,9 +78,9 @@ export function useItem(id: string | undefined) {
     await refresh();
   };
 
-  const startWorkers = async () => {
+  const startWorkers = async (repos?: string[]) => {
     if (!id) return;
-    await api.startWorkers(id);
+    await api.startWorkers(id, repos);
     await refresh();
   };
 

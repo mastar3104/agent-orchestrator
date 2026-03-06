@@ -21,7 +21,6 @@ vi.mock('../../services/planner-service', () => ({
 
 vi.mock('../../services/worker-service', () => ({
   startWorkers: vi.fn(),
-  startWorkerForRepo: vi.fn(),
   getWorkerStatus: vi.fn(),
 }));
 
@@ -289,7 +288,7 @@ describe('POST /api/items/:id/plan/feedback', () => {
     // Wait for the async error handler
     await new Promise(resolve => setTimeout(resolve, 50));
 
-    expect(createErrorEvent).toHaveBeenCalledWith('item-1', 'Agent failed');
+    expect(createErrorEvent).toHaveBeenCalledWith('item-1', 'Agent failed', { phase: 'planner' });
     expect(appendJsonl).toHaveBeenCalled();
     expect(eventBus.emit).toHaveBeenCalledWith('event', expect.objectContaining({
       itemId: 'item-1',

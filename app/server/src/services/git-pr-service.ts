@@ -82,10 +82,11 @@ function getErrorMessage(error: unknown): string {
 async function safeLogErrorEvent(
   eventsPath: string,
   itemId: string,
-  message: string
+  message: string,
+  repoName?: string
 ): Promise<void> {
   try {
-    const errorEvent = createErrorEvent(itemId, truncateMessage(message));
+    const errorEvent = createErrorEvent(itemId, truncateMessage(message), { repoName, phase: 'pr' });
     await appendJsonl(eventsPath, errorEvent);
     eventBus.emit('event', { itemId, event: errorEvent });
   } catch (logError) {
@@ -142,13 +143,13 @@ export async function createDraftPrForRepo(
   // 安全チェック: 保護ブランチへのpushを禁止
   if (PROTECTED_BRANCHES.includes(currentBranch)) {
     const error = `Cannot push to protected branch: ${currentBranch} (repo: ${repo.name})`;
-    await appendJsonl(eventsPath, createErrorEvent(itemId, error));
+    await appendJsonl(eventsPath, createErrorEvent(itemId, error, { repoName: repo.name, phase: 'pr' }));
     throw new Error(error);
   }
 
   if (defaultBranch && currentBranch === defaultBranch) {
     const error = `Cannot push to default branch: ${currentBranch} (repo: ${repo.name})`;
-    await appendJsonl(eventsPath, createErrorEvent(itemId, error));
+    await appendJsonl(eventsPath, createErrorEvent(itemId, error, { repoName: repo.name, phase: 'pr' }));
     throw new Error(error);
   }
 
@@ -200,7 +201,7 @@ export async function createDraftPrForRepo(
       pushBranch = fixBranch;
       console.log(`[${itemId}/${repo.name}] Pushed to fix branch: ${fixBranch}`);
     } catch (fixError) {
-      await safeLogErrorEvent(eventsPath, itemId, `Git push failed for ${repo.name} (fix branch also failed): ${getErrorMessage(fixError)}`);
+      await safeLogErrorEvent(eventsPath, itemId, `Git push failed for ${repo.name} (fix branch also failed): ${getErrorMessage(fixError)}`, repo.name);
       throw fixError;
     }
   }
@@ -210,7 +211,7 @@ export async function createDraftPrForRepo(
   try {
     ghUsername = await getGhUsername(repoDir);
   } catch (error) {
-    await safeLogErrorEvent(eventsPath, itemId, `Failed to get GitHub username for ${repo.name}: ${getErrorMessage(error)}`);
+    await safeLogErrorEvent(eventsPath, itemId, `Failed to get GitHub username for ${repo.name}: ${getErrorMessage(error)}`, repo.name);
     throw error;
   }
 
@@ -246,7 +247,7 @@ export async function createDraftPrForRepo(
         );
         prInfo = JSON.parse(prJsonOutput);
       } catch (error) {
-        await safeLogErrorEvent(eventsPath, itemId, `PR creation failed for ${repo.name}: ${getErrorMessage(error)}`);
+        await safeLogErrorEvent(eventsPath, itemId, `PR creation failed for ${repo.name}: ${getErrorMessage(error)}`, repo.name);
         throw error;
       }
     }
@@ -263,7 +264,7 @@ export async function createDraftPrForRepo(
       );
       prInfo = JSON.parse(prJsonOutput);
     } catch (error) {
-      await safeLogErrorEvent(eventsPath, itemId, `PR creation failed for ${repo.name} (fix branch): ${getErrorMessage(error)}`);
+      await safeLogErrorEvent(eventsPath, itemId, `PR creation failed for ${repo.name} (fix branch): ${getErrorMessage(error)}`, repo.name);
       throw error;
     }
   }

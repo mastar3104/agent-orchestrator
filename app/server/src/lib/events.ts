@@ -19,6 +19,7 @@ import type {
   WorkspaceSetupStartedEvent,
   WorkspaceSetupCompletedEvent,
   ErrorEvent,
+  ErrorPhase,
   PrCreatedEvent,
   RepoNoChangesEvent,
   AgentRole,
@@ -271,17 +272,23 @@ export function createTasksCompletedEvent(
 export function createErrorEvent(
   itemId: string,
   message: string,
-  stack?: string,
-  agentId?: string
+  options?: {
+    stack?: string;
+    agentId?: string;
+    repoName?: string;
+    phase?: ErrorPhase;
+  }
 ): ErrorEvent {
   return {
     id: createEventId(),
     type: 'error',
     timestamp: timestamp(),
     itemId,
-    agentId,
+    agentId: options?.agentId,
     message,
-    stack,
+    stack: options?.stack,
+    repoName: options?.repoName,
+    phase: options?.phase,
   };
 }
 

@@ -1,20 +1,3 @@
-// ─── Allowed Tools per Role ───
-
-export const PLANNER_ALLOWED_TOOLS = ['Read', 'Write'];
-
-export const ENGINEER_ALLOWED_TOOLS = [
-  'Read',
-  'Write',
-  'Edit',
-  'Bash(git status:*)',
-  'Bash(git add:*)',
-  'Bash(git commit -m:*)',
-];
-
-export const REVIEWER_ALLOWED_TOOLS = ['Read', 'Glob', 'Grep'];
-
-export const REVIEW_RECEIVER_ALLOWED_TOOLS = ['Read', 'Write'];
-
 // ─── Response Interfaces ───
 
 export interface PlannerResponse {
@@ -25,6 +8,7 @@ export interface PlannerResponse {
 export interface EngineerResponse {
   status: 'success' | 'failure';
   files_modified: string[];
+  commit_message?: string;
 }
 
 export interface ReviewComment {
@@ -58,6 +42,7 @@ export const ENGINEER_RESPONSE_SCHEMA = {
   properties: {
     status: { type: 'string', enum: ['success', 'failure'] },
     files_modified: { type: 'array', items: { type: 'string' } },
+    commit_message: { type: 'string' },
   },
   required: ['status', 'files_modified'],
 };

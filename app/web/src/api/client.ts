@@ -5,8 +5,6 @@ import type {
   CreateItemResponse,
   ListItemsResponse,
   GetItemResponse,
-  StartAgentRequest,
-  StartAgentResponse,
   Plan,
   ItemConfig,
   UpdatePlanRequest,
@@ -112,10 +110,10 @@ export async function updatePlan(
 }
 
 // Workers
-export async function startWorkers(itemId: string): Promise<{ started: boolean }> {
+export async function startWorkers(itemId: string, repos?: string[]): Promise<{ started: boolean }> {
   return request<{ started: boolean }>(`/items/${itemId}/workers/start`, {
     method: 'POST',
-    body: JSON.stringify({}),
+    body: JSON.stringify({ repos }),
   });
 }
 
@@ -128,16 +126,6 @@ export async function getWorkerStatus(
 }
 
 // Agents
-export async function startAgent(
-  itemId: string,
-  data: StartAgentRequest
-): Promise<StartAgentResponse> {
-  return request<StartAgentResponse>(`/items/${itemId}/agents/start`, {
-    method: 'POST',
-    body: JSON.stringify(data),
-  });
-}
-
 export async function stopAgent(
   itemId: string,
   agentId: string
