@@ -23,8 +23,6 @@ import { appendJsonl } from '../lib/jsonl';
 import { eventBus } from '../services/event-bus';
 import { stopAllGitSnapshots } from '../services/git-snapshot-service';
 
-const WORKERS_MAX_RETRIES = 1; // Total 2 attempts
-
 export const agentRoutes: FastifyPluginAsync = async (fastify) => {
   // Start planner for an item (async — returns 202 immediately)
   fastify.post<{
@@ -104,8 +102,17 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
     Reply: ApiResponse<{ plan: import('@agent-orch/shared').Plan; content: string }>;
   }>('/items/:id/plan', async (request, reply) => {
     try {
+      if (isItemLocked(request.params.id)) {
+        return reply.status(409).send({
+          success: false,
+          error: 'Operation already in progress for this item',
+        });
+      }
+
       const { content } = request.body;
-      const updated = await updatePlanContent(request.params.id, content);
+      const updated = await withItemLock(request.params.id, () =>
+        updatePlanContent(request.params.id, content)
+      );
       return reply.send({
         success: true,
         data: updated,
@@ -242,23 +249,9 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
-    // Fire-and-forget with item lock + retry + error logging
+    // Fire-and-forget with item lock + error logging
     withItemLock(itemId, async () => {
-      let lastError: Error | null = null;
-      for (let attempt = 0; attempt <= WORKERS_MAX_RETRIES; attempt++) {
-        try {
-          await startWorkers(itemId, targetRepos);
-          return;
-        } catch (err) {
-          lastError = err instanceof Error ? err : new Error(String(err));
-          if (attempt < WORKERS_MAX_RETRIES) {
-            stopAllGitSnapshots(itemId);
-            console.warn(`[${itemId}] Workers attempt ${attempt + 1} failed: ${lastError.message}, retrying...`);
-            continue;
-          }
-        }
-      }
-      throw lastError!;
+      await startWorkers(itemId, targetRepos);
     }).catch(async (err) => {
       const message = err instanceof Error ? err.message : 'Unknown error';
       console.error(`[${itemId}] Workers failed:`, message);

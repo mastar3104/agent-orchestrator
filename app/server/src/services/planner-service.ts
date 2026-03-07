@@ -1,10 +1,14 @@
 import { existsSync } from 'fs';
 import { readFile, writeFile, mkdir, rename } from 'fs/promises';
 import { dirname, join } from 'path';
-import { randomBytes } from 'crypto';
-import type { ItemConfig, Plan, PlanFeedbackItem } from '@agent-orch/shared';
+import type { ItemConfig, Plan, PlanFeedbackItem, PlanTask } from '@agent-orch/shared';
 import { getAgentsByItem, executeAgent } from './agent-service';
 import { getItemConfig } from './item-service';
+import {
+  archiveCurrentTaskStates,
+  createArchiveTag,
+  regenerateTaskStatesForPlan,
+} from './task-state-service';
 import { readYamlSafe, parseYaml, stringifyYaml } from '../lib/yaml';
 import { appendJsonl } from '../lib/jsonl';
 import { createPlanCreatedEvent } from '../lib/events';
@@ -17,8 +21,109 @@ import { eventBus } from './event-bus';
 import { type PlannerResponse } from '../lib/claude-schemas';
 import { getRole } from '../lib/role-loader';
 
+type LegacyPlanTask = PlanTask & { agent?: string };
+type LegacyPlan = Omit<Plan, 'tasks'> & { tasks: LegacyPlanTask[] };
+
+function normalizeTask(task: LegacyPlanTask): PlanTask {
+  const { agent: _agent, ...rest } = task;
+  return {
+    id: rest.id,
+    title: rest.title,
+    description: rest.description,
+    repository: rest.repository,
+    dependencies: rest.dependencies,
+    files: rest.files,
+  };
+}
+
+export function normalizePlan(plan: LegacyPlan): Plan {
+  return {
+    ...plan,
+    tasks: Array.isArray(plan.tasks) ? plan.tasks.map(normalizeTask) : [],
+  };
+}
+
+async function emitPlanCreated(itemId: string): Promise<void> {
+  const planPath = getItemPlanPath(itemId);
+  const event = createPlanCreatedEvent(itemId, planPath);
+  await appendJsonl(getItemEventsPath(itemId), event);
+  eventBus.emit('event', { itemId, event });
+}
+
+async function persistCurrentPlan(
+  itemId: string,
+  plan: Plan,
+  itemConfig?: ItemConfig | null
+): Promise<{ plan: Plan; content: string }> {
+  const normalizedPlan = normalizePlan(plan as LegacyPlan);
+  const errors = await validatePlan(normalizedPlan, itemConfig);
+  if (errors.length > 0) {
+    throw new Error(`Plan validation errors: ${errors.join('; ')}`);
+  }
+
+  const normalizedContent = stringifyYaml(normalizedPlan);
+  const planPath = getItemPlanPath(itemId);
+  await mkdir(dirname(planPath), { recursive: true });
+  await writeFile(planPath, normalizedContent, 'utf-8');
+  await regenerateTaskStatesForPlan(itemId, normalizedPlan);
+  await emitPlanCreated(itemId);
+
+  return { plan: normalizedPlan, content: normalizedContent };
+}
+
+async function loadGeneratedPlan(itemId: string): Promise<Plan> {
+  const planPath = getItemPlanPath(itemId);
+  if (!existsSync(planPath)) {
+    throw new Error('Planner completed but plan.yaml was not created');
+  }
+
+  const content = await readFile(planPath, 'utf-8');
+  return normalizePlan(parseYaml<LegacyPlan>(content));
+}
+
+export async function archiveCurrentPlan(
+  itemId: string,
+  archiveTag: string = createArchiveTag()
+): Promise<string[]> {
+  const archivedPaths: string[] = [];
+  const planPath = getItemPlanPath(itemId);
+  if (!existsSync(planPath)) {
+    return archivedPaths;
+  }
+
+  const archiveFilename = `plan_${archiveTag}.yaml`;
+  const archivePath = join(dirname(planPath), archiveFilename);
+  await rename(planPath, archivePath);
+  archivedPaths.push(archivePath);
+  return archivedPaths;
+}
+
+export async function archiveCurrentExecutionArtifacts(
+  itemId: string,
+  archiveTag: string = createArchiveTag()
+): Promise<{ archiveTag: string; archivedPlanPaths: string[]; archivedTaskStatePaths: string[] }> {
+  const archivedPlanPaths = await archiveCurrentPlan(itemId, archiveTag);
+  const archivedTaskStatePaths = await archiveCurrentTaskStates(itemId, archiveTag);
+  return {
+    archiveTag,
+    archivedPlanPaths,
+    archivedTaskStatePaths,
+  };
+}
+
+export async function finalizeGeneratedPlan(
+  itemId: string,
+  itemConfig: ItemConfig,
+  options?: { allowEmptyTasks?: boolean }
+): Promise<void> {
+  const plan = await loadGeneratedPlan(itemId);
+  if (!options?.allowEmptyTasks && plan.tasks.length === 0) {
+    throw new Error('plan.yaml has no tasks');
+  }
+  await persistCurrentPlan(itemId, plan, itemConfig);
+}
+
 export async function startPlanner(itemId: string): Promise<void> {
-  // Check for existing planner (allow restart from error/stopped)
   const agents = await getAgentsByItem(itemId);
   const existingPlanner = agents.find(a => a.role === 'planner');
   if (existingPlanner) {
@@ -38,9 +143,8 @@ export async function startPlanner(itemId: string): Promise<void> {
   const context = buildPlannerContext(config);
   const prompt = `${role.promptTemplate}\n\n${context}`;
   const workspaceRoot = getWorkspaceRoot(itemId);
-  const planPath = getItemPlanPath(itemId);
 
-  // Execute planner agent — executeAgent handles event logging + process tracking
+  await archiveCurrentExecutionArtifacts(itemId);
   await executeAgent<PlannerResponse>({
     itemId,
     role: 'planner',
@@ -50,26 +154,7 @@ export async function startPlanner(itemId: string): Promise<void> {
     jsonSchema: role.jsonSchema,
   });
 
-  // Validate plan was created
-  if (!existsSync(planPath)) {
-    throw new Error('Planner completed but plan.yaml was not created');
-  }
-
-  const content = await readFile(planPath, 'utf-8');
-  const plan = parseYaml<Plan>(content);
-  if (!plan || !plan.tasks || plan.tasks.length === 0) {
-    throw new Error('plan.yaml has no tasks');
-  }
-
-  const errors = await validatePlan(plan, config);
-  if (errors.length > 0) {
-    throw new Error(`Plan validation errors: ${errors.join('; ')}`);
-  }
-
-  // Emit plan_created event
-  const event = createPlanCreatedEvent(itemId, planPath);
-  await appendJsonl(getItemEventsPath(itemId), event);
-  eventBus.emit('event', { itemId, event });
+  await finalizeGeneratedPlan(itemId, config);
 }
 
 function buildPlannerContext(config: ItemConfig): string {
@@ -90,54 +175,56 @@ ${config.designDoc || 'No design document provided.'}
 
 **Item ID:** ${config.id}
 
-## Task Agent Values
+## Task Rules
 
-For development tasks, use \`agent: "engineer"\`.
-For review tasks, use \`agent: "review"\`.
-Use the \`repository\` field to specify which repository each task belongs to.`;
+Use the \`repository\` field to specify which repository each task belongs to.
+Do not include review tasks or any \`agent\` field in plan.yaml.`;
 }
 
 export async function getPlan(itemId: string): Promise<Plan | null> {
-  return readYamlSafe<Plan>(getItemPlanPath(itemId));
+  const plan = await readYamlSafe<LegacyPlan>(getItemPlanPath(itemId));
+  return plan ? normalizePlan(plan) : null;
 }
 
 export async function getPlanContent(itemId: string): Promise<string | null> {
   const planPath = getItemPlanPath(itemId);
-  if (existsSync(planPath)) {
-    return readFile(planPath, 'utf-8');
+  if (!existsSync(planPath)) {
+    return null;
   }
-  return null;
+
+  const rawContent = await readFile(planPath, 'utf-8');
+  try {
+    return stringifyYaml(normalizePlan(parseYaml<LegacyPlan>(rawContent)));
+  } catch {
+    return rawContent;
+  }
 }
 
 export async function updatePlanContent(
   itemId: string,
   content: string
 ): Promise<{ plan: Plan; content: string }> {
-  let plan: Plan;
+  let parsedPlan: LegacyPlan;
   try {
-    plan = parseYaml<Plan>(content);
+    parsedPlan = parseYaml<LegacyPlan>(content);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Invalid YAML';
     throw new Error(`Invalid YAML: ${message}`);
   }
 
+  const normalizedPlan = normalizePlan(parsedPlan);
   const config = await getItemConfig(itemId);
-  const errors = await validatePlan(plan, config);
-  if (plan.itemId && plan.itemId !== itemId) {
-    errors.push(`itemId does not match (${plan.itemId} !== ${itemId})`);
+  const errors = await validatePlan(normalizedPlan, config);
+  if (normalizedPlan.itemId && normalizedPlan.itemId !== itemId) {
+    errors.push(`itemId does not match (${normalizedPlan.itemId} !== ${itemId})`);
   }
 
   if (errors.length > 0) {
     throw new Error(`Plan validation failed: ${errors.join('; ')}`);
   }
 
-  const normalized = stringifyYaml(plan);
-  const planPath = getItemPlanPath(itemId);
-
-  await mkdir(dirname(planPath), { recursive: true });
-  await writeFile(planPath, normalized, 'utf-8');
-
-  return { plan, content: normalized };
+  await archiveCurrentExecutionArtifacts(itemId);
+  return persistCurrentPlan(itemId, normalizedPlan, config);
 }
 
 export async function validatePlan(plan: Plan, itemConfig?: ItemConfig | null): Promise<string[]> {
@@ -159,7 +246,6 @@ export async function validatePlan(plan: Plan, itemConfig?: ItemConfig | null): 
   const validRepoNames = itemConfig
     ? new Set(itemConfig.repositories.map(r => r.name))
     : null;
-  const validAgents = new Set(['engineer', 'developer', 'review']);
 
   const taskIds = new Set<string>();
 
@@ -176,10 +262,8 @@ export async function validatePlan(plan: Plan, itemConfig?: ItemConfig | null): 
       errors.push(`Task ${task.id || 'unknown'} missing title`);
     }
 
-    if (!task.agent) {
-      errors.push(`Task ${task.id || 'unknown'} missing agent field`);
-    } else if (!validAgents.has(task.agent)) {
-      errors.push(`Task ${task.id || 'unknown'} has invalid agent: ${task.agent}. Valid: ${[...validAgents].join(', ')}`);
+    if (!task.description) {
+      errors.push(`Task ${task.id || 'unknown'} missing description`);
     }
 
     if (!task.repository) {
@@ -198,29 +282,6 @@ export async function validatePlan(plan: Plan, itemConfig?: ItemConfig | null): 
   }
 
   return errors;
-}
-
-export async function archiveCurrentPlan(itemId: string): Promise<string[]> {
-  const archivedPaths: string[] = [];
-
-  const now = new Date();
-  const timestamp = now
-    .toISOString()
-    .replace(/[-:]/g, '')
-    .replace('T', '_')
-    .replace(/\.\d{3}Z$/, `_${String(now.getMilliseconds()).padStart(3, '0')}`);
-
-  const randomSuffix = randomBytes(3).toString('hex');
-  const archiveFilename = `plan_${timestamp}_${randomSuffix}.yaml`;
-
-  const planPath = getItemPlanPath(itemId);
-  if (existsSync(planPath)) {
-    const archivePath = join(dirname(planPath), archiveFilename);
-    await rename(planPath, archivePath);
-    archivedPaths.push(archivePath);
-  }
-
-  return archivedPaths;
 }
 
 export function validatePlanFeedback(
@@ -298,20 +359,13 @@ export async function planFeedback(
   }
 
   const currentPlanContent = await readFile(planPath, 'utf-8');
-
-  // Archive current plan
-  const archivedPaths = await archiveCurrentPlan(itemId);
-  if (archivedPaths.length > 0) {
-    console.log(`[${itemId}] Archived previous plan to: ${archivedPaths.join(', ')}`);
-  }
-
   const role = getRole('planner');
   const context = buildPlannerContext(config);
   const feedbackSection = formatFeedbacks(feedbacks, currentPlanContent);
   const prompt = `${role.promptTemplate}\n\n${context}\n\n${feedbackSection}`;
   const workspaceRoot = getWorkspaceRoot(itemId);
 
-  // Execute planner agent
+  await archiveCurrentExecutionArtifacts(itemId);
   await executeAgent<PlannerResponse>({
     itemId,
     role: 'planner',
@@ -321,24 +375,5 @@ export async function planFeedback(
     jsonSchema: role.jsonSchema,
   });
 
-  // Validate plan was created
-  if (!existsSync(planPath)) {
-    throw new Error('Planner completed but plan.yaml was not created');
-  }
-
-  const content = await readFile(planPath, 'utf-8');
-  const plan = parseYaml<Plan>(content);
-  if (!plan || !plan.tasks || plan.tasks.length === 0) {
-    throw new Error('plan.yaml has no tasks');
-  }
-
-  const validationErrors = await validatePlan(plan, config);
-  if (validationErrors.length > 0) {
-    throw new Error(`Plan validation errors: ${validationErrors.join('; ')}`);
-  }
-
-  // Emit plan_created event
-  const event = createPlanCreatedEvent(itemId, planPath);
-  await appendJsonl(getItemEventsPath(itemId), event);
-  eventBus.emit('event', { itemId, event });
+  await finalizeGeneratedPlan(itemId, config);
 }

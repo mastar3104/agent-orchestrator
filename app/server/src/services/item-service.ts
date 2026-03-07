@@ -39,7 +39,7 @@ import {
 import { deriveItemStatus, deriveRepoStatuses, getPendingApprovals } from './state-service';
 import { getAgentsByItem, stopAgent } from './agent-service';
 import { stopAllGitSnapshots } from './git-snapshot-service';
-import { startPlanner } from './planner-service';
+import { startPlanner, getPlan } from './planner-service';
 
 export async function createItem(request: CreateItemRequest): Promise<ItemConfig> {
   const id = `ITEM-${nanoid(8)}`;
@@ -364,7 +364,7 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
   }
 
   const status = await deriveItemStatus(itemId);
-  const plan = await readYamlSafe<Plan>(getItemPlanPath(itemId));
+  const plan = await getPlan(itemId);
   const agents = await getAgentsByItem(itemId);
   const pendingApprovals = await getPendingApprovals(itemId);
 

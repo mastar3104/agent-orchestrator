@@ -192,7 +192,7 @@ export async function deriveRepoStatuses(itemId: string): Promise<Map<string, Re
           state.status = 'error';
           // Keep activePhase
         }
-        // exitCode=0: keep running (waiting for hooks/review/PR)
+        // exitCode=0: keep running (waiting for task-level review or PR)
         break;
       }
       case 'hooks_executed': {

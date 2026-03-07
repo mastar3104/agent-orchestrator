@@ -44,7 +44,7 @@ function makeEvent(type: string, extra: Record<string, unknown> = {}): ItemEvent
 function setPlanRepos(repos: string[]) {
   mockReadYamlSafe.mockResolvedValue({
     summary: 'test',
-    tasks: repos.map(r => ({ id: `T-${r}`, title: 'test', description: 'test', repository: r, agent: 'engineer' })),
+    tasks: repos.map(r => ({ id: `T-${r}`, title: 'test', description: 'test', repository: r })),
   } as any);
 }
 

@@ -9,7 +9,7 @@ roles:
       2. Examine ALL repository directories in the workspace to understand existing code patterns
       3. Break down the implementation into discrete tasks
       4. Assign each task to the appropriate repository with the `repository` field matching a repository name
-      5. Assign each task to the appropriate agent role
+      5. Create implementation tasks only. Do NOT include review or orchestration-only steps in plan.yaml
 
       ## Output
 
@@ -23,13 +23,13 @@ roles:
         - id: "task-1"
           title: "Task title"
           description: "Detailed description of what needs to be done"
-          agent: "<role>"          # One of the roles listed above
           repository: "<repoName>" # One of the repository names listed above
           dependencies: []  # Optional: list of task IDs this depends on
           files: []  # Optional: list of files to create/modify
       ```
 
       IMPORTANT: Every task MUST have a `repository` field matching one of the repository names listed above.
+      IMPORTANT: plan.yaml must contain implementation tasks only. Review steps are orchestrator-managed and must not be included.
 
       Focus on creating actionable, well-scoped tasks. Each task should be completable by a single agent in one session.
 
@@ -73,6 +73,7 @@ roles:
          - Include ONLY files you intentionally modified — do NOT include temporary files
            (plan.yaml, review_findings.json, debug logs, lock files, etc.)
          - If you created any temporary files during your work, DELETE them
+         - Do NOT run git add or git commit; the orchestrator will commit only the files you report
          - Include a descriptive commit message in commit_message field
          Return {"status": "success", "files_modified": ["path/to/file1"], "commit_message": "feat(<scope>): <description>"}
          If you encounter an error, return {"status": "failure", "files_modified": []}
@@ -145,12 +146,12 @@ roles:
 
             Original comment: "<paste the reviewer's comment here>"
             File: <file path if applicable>
-          agent: "<role>"
           repository: "<repoName>"
           files: []
       ```
 
       IMPORTANT: Every task MUST have a `repository` field matching one of the repository names.
+      IMPORTANT: plan.yaml must contain implementation tasks only. Do not include any `agent` field or review-only tasks.
 
       If there are no actionable comments, create a plan with an empty tasks array and summary explaining that all feedback has been addressed or requires no code changes.
 

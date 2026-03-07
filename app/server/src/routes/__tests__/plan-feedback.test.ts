@@ -72,8 +72,8 @@ vi.mock('../../lib/yaml', () => ({
     version: '1',
     itemId: 'item-1',
     tasks: [
-      { id: 'task-1', title: 'Task 1', agent: 'engineer', repository: 'repo' },
-      { id: 'task-2', title: 'Task 2', agent: 'engineer', repository: 'repo' },
+      { id: 'task-1', title: 'Task 1', repository: 'repo' },
+      { id: 'task-2', title: 'Task 2', repository: 'repo' },
     ],
   }),
 }));

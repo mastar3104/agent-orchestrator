@@ -71,6 +71,7 @@ export async function executeAgent<T>(options: {
   itemId: string;
   role: AgentRole;
   repoName?: string;
+  currentTask?: string;
   prompt: string;
   workingDir: string;
   allowedTools: string[];
@@ -94,6 +95,7 @@ export async function executeAgent<T>(options: {
     itemId: options.itemId,
     role: options.role,
     repoName: options.repoName,
+    currentTask: options.currentTask,
     status: 'starting',
     startedAt: new Date().toISOString(),
   };
