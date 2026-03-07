@@ -298,6 +298,25 @@ export async function deriveRepoStatuses(itemId: string): Promise<Map<string, Re
         }
         break;
       }
+      case 'status_changed': {
+        const ev = e as import('@agent-orch/shared').StatusChangedEvent;
+        // 条件: agent が running 中に stopped された場合のみ repo error に遷移
+        if (ev.newStatus !== 'stopped' || ev.previousStatus !== 'running' || !ev.agentId) break;
+        const repoName = agentRepoMap.get(ev.agentId);
+        const role = agentRoleMap.get(ev.agentId);
+        if (!repoName) break; // planner は repoName なし → スキップ
+        const state = repoStates.get(repoName);
+        if (!state) break;
+        // repo が既に terminal 状態（completed/error）なら上書きしない
+        if (state.status !== 'running' && state.status !== 'review_receiving') break;
+        if (role === 'engineer' || role === 'developer' || role === 'review' || role === 'review-receiver') {
+          state.status = 'error';
+          state.lastErrorMessage = 'Agent stopped before completion';
+          // review_receiving 中に停止した場合もセットから除去して error にする
+          reviewReceivingRepos.delete(repoName);
+        }
+        break;
+      }
     }
   }
 

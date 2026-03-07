@@ -411,3 +411,98 @@ describe('deriveItemStatus - worker partial re-run scenarios', () => {
     expect(await deriveItemStatus('item-1')).toBe('error');
   });
 });
+
+describe('deriveRepoStatuses - status_changed(stopped) recovery', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockReadYamlSafe.mockResolvedValue(null);
+  });
+
+  it('engineer stopped (running→stopped) → repo error', async () => {
+    setPlanRepos(['repoA']);
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'eng1', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('status_changed', { agentId: 'eng1', previousStatus: 'running', newStatus: 'stopped' }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')?.status).toBe('error');
+    expect(statuses.get('repoA')?.lastErrorMessage).toBe('Agent stopped before completion');
+
+    expect(await deriveItemStatus('item-1')).toBe('error');
+  });
+
+  it('review stopped (running→stopped) → repo error', async () => {
+    setPlanRepos(['repoA']);
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'eng1', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('agent_exited', { agentId: 'eng1', exitCode: 0 }),
+      makeEvent('pr_created', { repoName: 'repoA', prUrl: 'http://pr', prNumber: 1 }),
+      makeEvent('agent_started', { agentId: 'review1', role: 'review', repoName: 'repoA' }),
+      makeEvent('status_changed', { agentId: 'review1', previousStatus: 'running', newStatus: 'stopped' }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')?.status).toBe('error');
+  });
+
+  it('stopped then new agent starts → repo running again (recovery)', async () => {
+    setPlanRepos(['repoA']);
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'eng1', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('status_changed', { agentId: 'eng1', previousStatus: 'running', newStatus: 'stopped' }),
+      makeEvent('agent_started', { agentId: 'eng2', role: 'engineer', repoName: 'repoA' }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')?.status).toBe('running');
+    expect(await deriveItemStatus('item-1')).toBe('running');
+  });
+
+  it('planner stopped → repo status unaffected', async () => {
+    setPlanRepos(['repoA']);
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('agent_started', { agentId: 'planner1', role: 'planner' }),
+      makeEvent('status_changed', { agentId: 'planner1', previousStatus: 'running', newStatus: 'stopped' }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')?.status).toBe('ready');
+  });
+
+  it('review-receiver stopped (review_receiving→error) → repo error', async () => {
+    setPlanRepos(['repoA']);
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'eng1', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('agent_exited', { agentId: 'eng1', exitCode: 0 }),
+      makeEvent('pr_created', { repoName: 'repoA', prUrl: 'http://pr', prNumber: 1 }),
+      makeEvent('review_receive_started', { agentId: 'rr1', repoName: 'repoA', prNumber: 1, prUrl: 'http://pr' }),
+      makeEvent('agent_started', { agentId: 'rr1', role: 'review-receiver', repoName: 'repoA' }),
+      makeEvent('status_changed', { agentId: 'rr1', previousStatus: 'running', newStatus: 'stopped' }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')?.status).toBe('error');
+    expect(statuses.get('repoA')?.lastErrorMessage).toBe('Agent stopped before completion');
+    expect(await deriveItemStatus('item-1')).toBe('error');
+  });
+
+  it('does not override already-terminal repo status', async () => {
+    setPlanRepos(['repoA']);
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'eng1', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('agent_exited', { agentId: 'eng1', exitCode: 0 }),
+      makeEvent('pr_created', { repoName: 'repoA', prUrl: 'http://pr', prNumber: 1 }),
+      // repo is completed now
+      makeEvent('status_changed', { agentId: 'eng1', previousStatus: 'completed', newStatus: 'stopped' }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')?.status).toBe('completed');
+  });
+});

@@ -400,6 +400,49 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
     }
   }
 
+  // Detect repos stuck in review_receiving (review_receive_started with no agent_started, completion, OR error)
+  // Note: fetchPrComments failure writes an error event before throwing — that case is NOT a stuck repo
+  const rrStates = new Map<string, { startIdx: number; completed: boolean; agentStarted: boolean; hadError: boolean }>();
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i];
+    if (ev.type === 'review_receive_started') {
+      const e = ev as import('@agent-orch/shared').ReviewReceiveStartedEvent;
+      rrStates.set(e.repoName, { startIdx: i, completed: false, agentStarted: false, hadError: false });
+    } else if (ev.type === 'review_receive_completed') {
+      const e = ev as import('@agent-orch/shared').ReviewReceiveCompletedEvent;
+      const s = rrStates.get(e.repoName);
+      if (s) s.completed = true;
+    } else if (ev.type === 'agent_started' && ev.agentId) {
+      const e = ev as import('@agent-orch/shared').AgentStartedEvent;
+      if (e.role === 'review-receiver' && e.repoName) {
+        const s = rrStates.get(e.repoName);
+        if (s && i > s.startIdx) s.agentStarted = true;
+      }
+    } else if (ev.type === 'error') {
+      const e = ev as import('@agent-orch/shared').ErrorEvent;
+      if (e.repoName) {
+        const s = rrStates.get(e.repoName);
+        if (s) s.hadError = true;
+      }
+    }
+  }
+  for (const [repoName, s] of rrStates) {
+    if (!s.completed && !s.agentStarted && !s.hadError) {
+      console.log(`[${itemId}] Cleaning up stuck review_receiving repo: ${repoName}`);
+      const errorEvent = createErrorEvent(itemId, 'Server restarted before review receive agent started', {
+        repoName,
+        phase: 'review_receive',
+      });
+      try {
+        await appendJsonl(getItemEventsPath(itemId), errorEvent);
+        eventBus.emit('event', { itemId, event: errorEvent });
+        cleanedCount++;
+      } catch (err) {
+        console.error(`[${itemId}] Failed to log error for stuck review_receiving repo ${repoName}:`, err);
+      }
+    }
+  }
+
   return cleanedCount;
 }
 
