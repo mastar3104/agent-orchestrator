@@ -1,3 +1,5 @@
+import type { TaskExecutionStatus, TaskProgressPhase } from './item';
+
 export type EventType =
   | 'agent_started'
   | 'agent_exited'
@@ -22,7 +24,8 @@ export type EventType =
   | 'review_findings_extracted'
   | 'review_receive_started'
   | 'review_receive_completed'
-  | 'hooks_executed';
+  | 'hooks_executed'
+  | 'task_state_changed';
 
 export interface BaseEvent {
   id: string;
@@ -247,6 +250,14 @@ export interface HooksExecutedEvent extends BaseEvent {
   attempt: number;
 }
 
+export interface TaskStateChangedEvent extends BaseEvent {
+  type: 'task_state_changed';
+  repoName: string;
+  taskId: string;
+  status: TaskExecutionStatus;
+  currentPhase?: TaskProgressPhase;
+}
+
 export type AgentEvent =
   | AgentStartedEvent
   | AgentExitedEvent
@@ -276,4 +287,5 @@ export type ItemEvent =
   | ReviewReceiveCompletedEvent
   | ClaudeExecutionEvent
   | HooksExecutedEvent
+  | TaskStateChangedEvent
   | AgentEvent;

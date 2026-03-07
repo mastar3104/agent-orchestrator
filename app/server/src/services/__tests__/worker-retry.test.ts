@@ -92,6 +92,15 @@ vi.mock('../../lib/events', () => ({
   createReviewFindingsExtractedEvent: vi.fn().mockReturnValue({ type: 'review' }),
   createStatusChangedEvent: vi.fn().mockReturnValue({ type: 'status' }),
   createHooksExecutedEvent: vi.fn().mockReturnValue({ type: 'hooks_executed' }),
+  createTaskStateChangedEvent: vi.fn().mockImplementation(
+    (_itemId: string, repoName: string, taskId: string, status: string, currentPhase?: string) => ({
+      type: 'task_state_changed',
+      repoName,
+      taskId,
+      status,
+      currentPhase,
+    })
+  ),
   createErrorEvent: vi.fn().mockImplementation(
     (_itemId: string, message: string, meta?: Record<string, unknown>) => ({
       type: 'error',
@@ -162,12 +171,14 @@ import { executeAgent } from '../agent-service';
 import { createDraftPrsForAllRepos } from '../git-pr-service';
 import { getItemConfig } from '../item-service';
 import { getPlan } from '../planner-service';
+import { eventBus } from '../event-bus';
 import { startWorkers } from '../worker-service';
 
 const mockExecuteAgent = vi.mocked(executeAgent);
 const mockCreateDraftPrsForAllRepos = vi.mocked(createDraftPrsForAllRepos);
 const mockGetItemConfig = vi.mocked(getItemConfig);
 const mockGetPlan = vi.mocked(getPlan);
+const mockEventBus = vi.mocked(eventBus);
 
 const ITEM_ID = 'ITEM-test';
 
@@ -625,6 +636,31 @@ describe('Worker task-state execution', () => {
       attempts: 1,
       phaseBase: 'phase-base-123',
     });
+  });
+
+  it('broadcasts task_state_changed across engineer, hooks, review, and completion transitions', async () => {
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        return engineerSuccess();
+      }
+      if (params.role === 'review') {
+        return reviewApprove();
+      }
+      throw new Error(`Unexpected role: ${params.role}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    const taskStateEvents = mockEventBus.publish.mock.calls
+      .map(([, event]) => event)
+      .filter((event: any) => event.type === 'task_state_changed');
+
+    expect(taskStateEvents).toEqual([
+      expect.objectContaining({ repoName: 'repo-a', taskId: 'T1', status: 'in_progress', currentPhase: 'engineer' }),
+      expect.objectContaining({ repoName: 'repo-a', taskId: 'T1', status: 'in_review', currentPhase: 'hooks' }),
+      expect.objectContaining({ repoName: 'repo-a', taskId: 'T1', status: 'in_review', currentPhase: 'review' }),
+      expect.objectContaining({ repoName: 'repo-a', taskId: 'T1', status: 'completed', currentPhase: undefined }),
+    ]);
   });
 
   it('includes plan and changed files sections in reviewer prompts', async () => {

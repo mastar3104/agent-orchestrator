@@ -1,11 +1,99 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import type { ItemEvent, ReviewFindingsExtractedEvent } from '@agent-orch/shared';
+import type {
+  ItemEvent,
+  ItemWorkflowJob,
+  ItemWorkflowSummary,
+  ReviewFindingsExtractedEvent,
+  TaskProgressPhase,
+  WorkflowStageId,
+  WorkflowStageStatus,
+} from '@agent-orch/shared';
 import { useItem } from '../hooks/useItems';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { AgentCard } from '../components/AgentCard';
 import { AgentOutputPanel } from '../components/AgentOutputPanel';
 import * as api from '../api/client';
+
+const STAGE_STATUS_STYLES: Record<WorkflowStageStatus, string> = {
+  pending: 'border-gray-700 bg-gray-800 text-gray-400',
+  running: 'border-amber-500/50 bg-amber-500/10 text-amber-200',
+  completed: 'border-emerald-500/50 bg-emerald-500/10 text-emerald-200',
+  error: 'border-red-500/50 bg-red-500/10 text-red-200',
+};
+
+const JOB_STATUS_STYLES: Record<WorkflowStageStatus, string> = {
+  pending: 'bg-gray-700 text-gray-300',
+  running: 'bg-amber-500/20 text-amber-200',
+  completed: 'bg-emerald-500/20 text-emerald-200',
+  error: 'bg-red-500/20 text-red-200',
+};
+
+const STEP_STATUS_ICONS: Record<string, string> = {
+  pending: '○',
+  in_progress: '◐',
+  in_review: '◐',
+  completed: '●',
+  failed: '✕',
+};
+
+function formatPhase(phase?: TaskProgressPhase): string {
+  if (!phase) return '';
+  return phase.charAt(0).toUpperCase() + phase.slice(1);
+}
+
+function formatStageLabel(stage: WorkflowStageId): string {
+  switch (stage) {
+    case 'workspace':
+      return 'Preparing workspace';
+    case 'planning':
+      return 'Planning';
+    case 'execution':
+      return 'Executing tasks';
+    case 'publish':
+      return 'Creating PR';
+    case 'review_receive':
+      return 'Receiving review comments';
+  }
+  return 'Active';
+}
+
+function getCurrentActivityText(
+  activity: ItemWorkflowSummary['currentActivity'],
+  jobs: ItemWorkflowJob[]
+): string {
+  if (!activity) return 'No activity in progress';
+  if (activity.stage === 'execution') {
+    const job = jobs.find((candidate) => candidate.repoName === activity.repoName);
+    const step = job?.steps.find((candidate) => candidate.taskId === activity.taskId);
+    const detail = step ? `${step.taskId}: ${step.title}` : activity.taskId;
+    return `${activity.repoName}: ${detail}${activity.phase ? ` (${formatPhase(activity.phase)})` : ''}`;
+  }
+  if (activity.stage === 'planning') {
+    return 'Planner is building the current plan';
+  }
+  if (activity.stage === 'workspace') {
+    return `${activity.repoName}: preparing workspace`;
+  }
+  if (activity.stage === 'publish') {
+    return `${activity.repoName}: creating PR`;
+  }
+  return `${activity.repoName}: receiving review comments`;
+}
+
+function getJobSummary(job: ItemWorkflowJob): string {
+  if (job.activeStage === 'publish') {
+    return 'Creating PR';
+  }
+  if (job.activeStage === 'review_receive') {
+    return 'Receiving review comments';
+  }
+  const step = job.steps.find((candidate) => candidate.taskId === job.currentTaskId);
+  if (!step) {
+    return job.status === 'completed' ? 'All planned steps completed' : 'Waiting to start';
+  }
+  return `${step.taskId}: ${step.title}${job.currentPhase ? ` (${formatPhase(job.currentPhase)})` : ''}`;
+}
 
 export function ItemDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -67,17 +155,24 @@ export function ItemDetailPage() {
     setRecentEvents((prev) => [...prev.slice(-100), event]);
     // Refresh item state on significant events
     if (
+      event.type === 'clone_started' ||
+      event.type === 'clone_completed' ||
+      event.type === 'workspace_setup_started' ||
+      event.type === 'workspace_setup_completed' ||
       event.type === 'agent_started' ||
       event.type === 'agent_exited' ||
       event.type === 'status_changed' ||
       event.type === 'approval_requested' ||
       event.type === 'approval_decision' ||
       event.type === 'plan_created' ||
+      event.type === 'hooks_executed' ||
       event.type === 'review_receive_started' ||
       event.type === 'review_receive_completed' ||
       event.type === 'review_findings_extracted' ||
       event.type === 'pr_created' ||
-      event.type === 'repo_no_changes'
+      event.type === 'repo_no_changes' ||
+      event.type === 'error' ||
+      event.type === 'task_state_changed'
     ) {
       refresh();
     }
@@ -158,6 +253,11 @@ export function ItemDetailPage() {
   // "Review Receive (All)" only shown for single-PR items
   const prRepos = item.repos?.filter(r => r.prUrl) ?? [];
   const showReviewReceiveAll = canStartReviewReceive && prRepos.length === 1;
+  const repoMetaByName = new Map(item.repos.map((repo) => [repo.repoName, repo]));
+  const overallProgress = item.workflow.overall.totalSteps > 0
+    ? Math.round((item.workflow.overall.completedSteps / item.workflow.overall.totalSteps) * 100)
+    : 0;
+  const activityText = getCurrentActivityText(item.workflow.currentActivity, item.workflow.jobs);
 
   return (
     <div className="space-y-6">
@@ -276,6 +376,181 @@ export function ItemDetailPage() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* Workflow Strip */}
+      <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
+        <div className="flex items-center justify-between gap-4 mb-4">
+          <div>
+            <h3 className="text-sm font-medium text-gray-400 mb-1">Workflow</h3>
+            <p className="text-white">
+              {item.workflow.overall.completedSteps} / {item.workflow.overall.totalSteps} steps completed
+            </p>
+          </div>
+          {item.workflow.overall.totalSteps > 0 && (
+            <div className="min-w-[180px] w-full max-w-xs">
+              <div className="h-2 rounded-full bg-gray-900 overflow-hidden">
+                <div
+                  className="h-full bg-emerald-500 transition-all"
+                  style={{ width: `${overallProgress}%` }}
+                />
+              </div>
+              <p className="text-xs text-gray-500 mt-1 text-right">{overallProgress}%</p>
+            </div>
+          )}
+        </div>
+        <div className="flex items-center gap-2 overflow-x-auto pb-1">
+          {item.workflow.stages.map((stage, index) => (
+            <div key={stage.id} className="flex items-center gap-2 min-w-fit">
+              <div className={`rounded-lg border px-3 py-2 min-w-[150px] ${STAGE_STATUS_STYLES[stage.status]}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-medium">{stage.label}</span>
+                  {stage.optional && (
+                    <span className="text-[10px] uppercase tracking-wide text-gray-400">Optional</span>
+                  )}
+                </div>
+                <p className="text-xs mt-1 opacity-80">{stage.status}</p>
+              </div>
+              {index < item.workflow.stages.length - 1 && (
+                <div className="w-8 h-px bg-gray-700" />
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Current Activity */}
+      <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-sm font-medium text-gray-400 mb-2">Current Activity</h3>
+            <p className="text-white">{activityText}</p>
+            {item.workflow.currentActivity?.moreRunningCount ? (
+              <p className="text-xs text-gray-500 mt-1">
+                + {item.workflow.currentActivity.moreRunningCount} more running
+              </p>
+            ) : (
+              <p className="text-xs text-gray-500 mt-1">
+                {formatStageLabel(item.workflow.currentActivity?.stage || 'execution')}
+              </p>
+            )}
+          </div>
+          <span className="px-2 py-0.5 rounded-full text-xs bg-gray-900 text-gray-300">
+            {item.workflow.overall.failedSteps} failed
+          </span>
+        </div>
+      </div>
+
+      {/* Jobs */}
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-lg font-medium text-white">Jobs</h3>
+          {item.workflow.jobs.length > 0 && (
+            <span className="text-sm text-gray-400">{item.workflow.jobs.length} repos in current plan</span>
+          )}
+        </div>
+        {item.workflow.jobs.length === 0 ? (
+          <div className="bg-gray-800 rounded-lg p-4 border border-gray-700 text-gray-400">
+            No execution jobs yet. Create or load a plan to see task-level progress.
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {item.workflow.jobs.map((job) => {
+              const repoMeta = repoMetaByName.get(job.repoName);
+              return (
+                <div
+                  key={job.repoName}
+                  className="bg-gray-800 rounded-lg border border-gray-700 p-4"
+                >
+                  <div className="flex items-start justify-between gap-4 mb-3">
+                    <div>
+                      <div className="flex items-center gap-3">
+                        <h4 className="text-base font-medium text-white">{job.repoName}</h4>
+                        <span className={`px-2 py-0.5 rounded-full text-xs ${JOB_STATUS_STYLES[job.status]}`}>
+                          {job.status}
+                        </span>
+                        <span className="text-xs text-gray-500">
+                          {job.completedSteps} / {job.totalSteps} steps
+                        </span>
+                      </div>
+                      <p className="text-sm text-gray-400 mt-1">{getJobSummary(job)}</p>
+                    </div>
+                    {repoMeta?.prUrl ? (
+                      <a
+                        href={repoMeta.prUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-sm text-cyan-300 hover:text-cyan-200"
+                      >
+                        PR #{repoMeta.prNumber}
+                      </a>
+                    ) : null}
+                  </div>
+
+                  <div className="space-y-2">
+                    {job.steps.map((step) => {
+                      const isRunning = step.status === 'in_progress' || step.status === 'in_review';
+                      return (
+                        <div
+                          key={step.taskId}
+                          className={`rounded-lg border px-3 py-2 ${
+                            step.status === 'failed'
+                              ? 'border-red-500/40 bg-red-500/5'
+                              : isRunning
+                              ? 'border-amber-500/40 bg-amber-500/5'
+                              : step.status === 'completed'
+                              ? 'border-emerald-500/30 bg-emerald-500/5'
+                              : 'border-gray-700 bg-gray-900/60'
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span
+                                  className={`text-sm ${
+                                    step.status === 'failed'
+                                      ? 'text-red-300'
+                                      : isRunning
+                                      ? 'text-amber-200'
+                                      : step.status === 'completed'
+                                      ? 'text-emerald-300'
+                                      : 'text-gray-500'
+                                  }`}
+                                >
+                                  {STEP_STATUS_ICONS[step.status]}
+                                </span>
+                                <span className="text-sm font-medium text-white">{step.taskId}</span>
+                                <span className="text-sm text-gray-300 truncate">{step.title}</span>
+                              </div>
+                              {step.lastError && (
+                                <p className="text-xs text-red-300 mt-2">{step.lastError}</p>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0">
+                              {isRunning && step.currentPhase && (
+                                <span className="px-2 py-0.5 rounded-full text-[11px] bg-amber-500/20 text-amber-200">
+                                  {formatPhase(step.currentPhase)}
+                                </span>
+                              )}
+                              <span className="text-xs text-gray-500">
+                                attempts {step.attempts}
+                              </span>
+                              {step.reviewRounds ? (
+                                <span className="text-xs text-gray-500">
+                                  reviews {step.reviewRounds}
+                                </span>
+                              ) : null}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Description */}

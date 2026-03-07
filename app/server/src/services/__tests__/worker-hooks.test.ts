@@ -85,6 +85,15 @@ vi.mock('../../lib/jsonl', () => ({
 vi.mock('../../lib/events', () => ({
   createReviewFindingsExtractedEvent: vi.fn().mockReturnValue({ type: 'review' }),
   createStatusChangedEvent: vi.fn().mockReturnValue({ type: 'status' }),
+  createTaskStateChangedEvent: vi.fn().mockImplementation(
+    (_itemId: string, repoName: string, taskId: string, status: string, currentPhase?: string) => ({
+      type: 'task_state_changed',
+      repoName,
+      taskId,
+      status,
+      currentPhase,
+    })
+  ),
   createHooksExecutedEvent: vi.fn().mockImplementation(
     (_itemId: string, repoName: string, results: any[], allPassed: boolean, attempt: number) => ({
       type: 'hooks_executed',
@@ -363,6 +372,23 @@ describe('Worker hooks', () => {
 
     // Fix engineer should have been called
     expect(mockExecuteAgent).toHaveBeenCalledTimes(3);
+
+    const repoState = taskStateStore.get('repo-a');
+    expect(repoState.tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+    });
+    expect(repoState.tasks[0].currentPhase).toBeUndefined();
+
+    const taskStateEvents = vi.mocked(eventBus).publish.mock.calls
+      .map(([, event]) => event)
+      .filter((event: any) => event.type === 'task_state_changed');
+    expect(taskStateEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ repoName: 'repo-a', taskId: 'T1', status: 'in_review', currentPhase: 'hooks' }),
+        expect.objectContaining({ repoName: 'repo-a', taskId: 'T1', status: 'in_review', currentPhase: 'review' }),
+      ])
+    );
   });
 
   it('should fail the current task when hooks fail after max retries', async () => {

@@ -3,7 +3,14 @@ import { createWriteStream } from 'fs';
 import { readFile, mkdir, writeFile } from 'fs/promises';
 import { finished } from 'stream/promises';
 import { resolve, join } from 'path';
-import type { Plan, PlanTask, AgentRole, ItemRepositoryConfig } from '@agent-orch/shared';
+import type {
+  Plan,
+  PlanTask,
+  AgentRole,
+  ItemRepositoryConfig,
+  TaskExecutionStatus,
+  TaskProgressPhase,
+} from '@agent-orch/shared';
 
 import { executeAgent, getAgentsByItem, stopAgent } from './agent-service';
 import { getPlan } from './planner-service';
@@ -16,7 +23,13 @@ import { createDraftPrsForAllRepos } from './git-pr-service';
 import { getWorkspaceRoot, getRepoWorkspaceDir, getItemEventsPath, getItemPlanPath, getHookLogDir } from '../lib/paths';
 import { eventBus } from './event-bus';
 import { appendJsonl } from '../lib/jsonl';
-import { createReviewFindingsExtractedEvent, createStatusChangedEvent, createHooksExecutedEvent, createErrorEvent } from '../lib/events';
+import {
+  createReviewFindingsExtractedEvent,
+  createStatusChangedEvent,
+  createHooksExecutedEvent,
+  createErrorEvent,
+  createTaskStateChangedEvent,
+} from '../lib/events';
 import type { HookResult } from '@agent-orch/shared';
 import {
   type EngineerResponse,
@@ -170,7 +183,6 @@ interface RunEngineerAttemptOptions {
   jsonSchema: object;
   timeoutMs: number;
   fallbackMessage: string;
-  noChangesMessage: string;
 }
 
 async function runEngineerAttemptWithCleanup(
@@ -200,10 +212,7 @@ async function runEngineerAttemptWithCleanup(
       options.repoName,
       preAttemptHead
     );
-    if (!committed) {
-      throw new Error(options.noChangesMessage);
-    }
-    return committed;
+    return committed ?? { commitHash: preAttemptHead, filesModified: [] };
   } catch (error) {
     attemptError = error;
     throw error;
@@ -265,11 +274,43 @@ async function mutateRepoTaskState(
   return next;
 }
 
+async function mutateVisibleTaskState(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  mutateTask: (task: RepoTaskStateTask) => void
+): Promise<RepoTaskStateFile> {
+  const current = await readRepoTaskState(itemId, repoName);
+  if (!current) {
+    throw new Error(`Task state not found for repo ${repoName}`);
+  }
+
+  const previousTask = getRepoTaskEntry(current, taskId);
+  const next = cloneRepoTaskState(current);
+  const task = getRepoTaskEntry(next, taskId);
+  mutateTask(task);
+  next.updatedAt = new Date().toISOString();
+  await writeRepoTaskState(itemId, next);
+
+  if (
+    previousTask.status !== task.status ||
+    previousTask.currentPhase !== task.currentPhase
+  ) {
+    eventBus.publish(
+      itemId,
+      createTaskStateChangedEvent(itemId, repoName, task.id, task.status, task.currentPhase)
+    );
+  }
+
+  return next;
+}
+
 async function normalizeStaleInProgressTasks(itemId: string, repoName: string): Promise<RepoTaskStateFile> {
   return mutateRepoTaskState(itemId, repoName, (state) => {
     for (const task of state.tasks) {
       if (task.status === 'in_progress') {
         task.status = 'failed';
+        task.currentPhase = task.currentPhase || 'engineer';
         task.lastError = task.lastError || 'Interrupted before completion';
       }
     }
@@ -368,9 +409,9 @@ async function markTaskInProgress(
   taskId: string,
   phaseBase: string
 ): Promise<RepoTaskStateFile> {
-  return mutateRepoTaskState(itemId, repoName, (state) => {
-    const task = getRepoTaskEntry(state, taskId);
+  return mutateVisibleTaskState(itemId, repoName, taskId, (task) => {
     task.status = 'in_progress';
+    task.currentPhase = 'engineer';
     task.attempts += 1;
     task.phaseBase = phaseBase;
     task.reviewRounds = 0;
@@ -386,11 +427,12 @@ async function markTaskInReview(
   itemId: string,
   repoName: string,
   taskId: string,
+  currentPhase: TaskProgressPhase,
   filesModified?: string[]
 ): Promise<RepoTaskStateFile> {
-  return mutateRepoTaskState(itemId, repoName, (state) => {
-    const task = getRepoTaskEntry(state, taskId);
+  return mutateVisibleTaskState(itemId, repoName, taskId, (task) => {
     task.status = 'in_review';
+    task.currentPhase = currentPhase;
     task.lastError = undefined;
     task.filesModified = mergeFilesModified(task.filesModified, filesModified);
   });
@@ -402,9 +444,9 @@ async function markTaskCompleted(
   taskId: string,
   commitHash: string
 ): Promise<RepoTaskStateFile> {
-  return mutateRepoTaskState(itemId, repoName, (state) => {
-    const task = getRepoTaskEntry(state, taskId);
+  return mutateVisibleTaskState(itemId, repoName, taskId, (task) => {
     task.status = 'completed';
+    task.currentPhase = undefined;
     task.completedAt = new Date().toISOString();
     task.lastError = undefined;
     task.commitHash = commitHash;
@@ -438,11 +480,12 @@ async function markTaskFailed(
   itemId: string,
   repoName: string,
   taskId: string,
-  errorMessage: string
+  errorMessage: string,
+  currentPhase?: TaskProgressPhase
 ): Promise<RepoTaskStateFile> {
-  return mutateRepoTaskState(itemId, repoName, (state) => {
-    const task = getRepoTaskEntry(state, taskId);
+  return mutateVisibleTaskState(itemId, repoName, taskId, (task) => {
     task.status = 'failed';
+    task.currentPhase = currentPhase ?? task.currentPhase;
     task.lastError = errorMessage;
   });
 }
@@ -607,7 +650,7 @@ async function failTaskWithError(
   phase: 'engineer' | 'hooks' | 'review',
   message: string
 ): Promise<{ state: RepoTaskStateFile; errorMessage: string }> {
-  const failedState = await markTaskFailed(itemId, repoName, taskId, message);
+  const failedState = await markTaskFailed(itemId, repoName, taskId, message, phase);
   const errorEvent = createErrorEvent(itemId, message, { repoName, phase });
   await appendJsonl(getItemEventsPath(itemId), errorEvent);
   eventBus.publish(itemId, errorEvent);
@@ -666,7 +709,6 @@ async function runTaskHooksPhase(
           jsonSchema: engineerRole.jsonSchema,
           timeoutMs: ENGINEER_TIMEOUT_MS,
           fallbackMessage: `fix(${repo.name}): address hook validation failures for ${task.id}`,
-          noChangesMessage: `Hooks-fix engineer produced no committable changes for ${repo.name}/${task.id}`,
         });
         latestState = await mergeTaskFilesModified(
           itemId,
@@ -727,6 +769,8 @@ async function runTaskReviewPhase(
       const message = error instanceof Error ? error.message : String(error);
       return failTaskWithError(itemId, repo.name, task.id, 'hooks', message);
     }
+
+    currentState = await markTaskInReview(itemId, repo.name, task.id, 'review');
 
     const taskStateAfterHooks = getRepoTaskEntry(currentState, task.id);
     const phaseBase = taskStateAfterHooks.phaseBase!;
@@ -844,7 +888,6 @@ async function runTaskReviewPhase(
           jsonSchema: engineerRole.jsonSchema,
           timeoutMs: ENGINEER_TIMEOUT_MS,
           fallbackMessage: `fix(${repo.name}): address review feedback for ${task.id}`,
-          noChangesMessage: `Review-fix engineer produced no committable changes for ${repo.name}/${task.id}`,
         });
         currentState = await mergeTaskFilesModified(
           itemId,
@@ -987,13 +1030,13 @@ export async function startWorkers(itemId: string, targetRepos?: string[]): Prom
             jsonSchema: engineerRole.jsonSchema,
             timeoutMs: ENGINEER_TIMEOUT_MS,
             fallbackMessage: `feat(${repo.name}): implement ${nextTask.title}`,
-            noChangesMessage: `Engineer produced no committable changes for ${repo.name}/${nextTask.id}`,
           });
 
           const inReviewState = await markTaskInReview(
             itemId,
             repo.name,
             nextTask.id,
+            'hooks',
             committed.filesModified
           );
           statesByRepo.set(repo.name, inReviewState);

@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'crypto';
 import { existsSync } from 'fs';
 import { mkdir, readdir, rename } from 'fs/promises';
 import { join } from 'path';
-import type { Plan, PlanTask } from '@agent-orch/shared';
+import type { Plan, PlanTask, TaskExecutionStatus, TaskProgressPhase } from '@agent-orch/shared';
 import {
   getRepoTaskStatePath,
   getTaskStateArchiveDir,
@@ -10,13 +10,12 @@ import {
 } from '../lib/paths';
 import { readYamlSafe, stringifyYaml, writeYaml } from '../lib/yaml';
 
-export type TaskExecutionStatus = 'pending' | 'in_progress' | 'in_review' | 'completed' | 'failed';
-
 export interface RepoTaskStateTask {
   id: string;
   title: string;
   dependencies: string[];
   status: TaskExecutionStatus;
+  currentPhase?: TaskProgressPhase;
   attempts: number;
   phaseBase?: string;
   reviewRounds?: number;
