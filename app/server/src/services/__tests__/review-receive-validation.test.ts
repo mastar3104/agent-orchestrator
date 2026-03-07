@@ -63,7 +63,12 @@ vi.mock('../../lib/role-loader', () => ({
 }));
 
 vi.mock('../planner-service', () => ({
-  archiveCurrentPlan: vi.fn().mockResolvedValue([]),
+  archiveCurrentExecutionArtifacts: vi.fn().mockResolvedValue({
+    archiveTag: '20260307_000000_abc123',
+    archivedPlanPaths: [],
+    archivedTaskStatePaths: [],
+  }),
+  finalizeGeneratedPlan: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { validateReviewReceivePreConditions, ReviewReceiveValidationError } from '../review-receive-service';
@@ -86,7 +91,7 @@ function makeEvent(type: string, extra: Record<string, unknown> = {}): ItemEvent
 function setPlanRepos(repos: string[]) {
   mockReadYamlSafe.mockResolvedValue({
     summary: 'test',
-    tasks: repos.map(r => ({ id: `T-${r}`, title: 'test', description: 'test', repository: r, agent: 'engineer' })),
+    tasks: repos.map(r => ({ id: `T-${r}`, title: 'test', description: 'test', repository: r })),
   } as any);
 }
 

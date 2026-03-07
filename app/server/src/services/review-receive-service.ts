@@ -9,16 +9,13 @@ import { getItemConfig } from './item-service';
 import { deriveRepoStatuses } from './state-service';
 import { readJsonl, appendJsonl } from '../lib/jsonl';
 import { getItemEventsPath, getItemPlanPath, getWorkspaceRoot } from '../lib/paths';
-import { createReviewReceiveStartedEvent, createReviewReceiveCompletedEvent, createPlanCreatedEvent, createErrorEvent } from '../lib/events';
+import { createReviewReceiveStartedEvent, createReviewReceiveCompletedEvent, createErrorEvent } from '../lib/events';
 import { eventBus } from './event-bus';
 import { fetchPrComments, execGitInRepo } from './git-pr-service';
 import { getRepoWorkspaceDir } from '../lib/paths';
-import { parseYaml } from '../lib/yaml';
-import type { Plan } from '@agent-orch/shared';
-import { readFile } from 'fs/promises';
 import { type ReviewReceiverResponse } from '../lib/claude-schemas';
 import { getRole } from '../lib/role-loader';
-import { archiveCurrentPlan } from './planner-service';
+import { archiveCurrentExecutionArtifacts, finalizeGeneratedPlan } from './planner-service';
 
 /**
  * 指定されたItemのPR情報を取得する（repoName でフィルタ可能）
@@ -332,9 +329,14 @@ export async function startReviewReceive(
   }
 
   // Archive current plan (only when we have new comments to process)
-  const archivedPaths = await archiveCurrentPlan(itemId);
-  if (archivedPaths.length > 0) {
-    console.log(`[${itemId}] Archived previous plans to: ${archivedPaths.join(', ')}`);
+  const archived = await archiveCurrentExecutionArtifacts(itemId);
+  if (archived.archivedPlanPaths.length > 0 || archived.archivedTaskStatePaths.length > 0) {
+    console.log(
+      `[${itemId}] Archived previous execution artifacts: ${[
+        ...archived.archivedPlanPaths,
+        ...archived.archivedTaskStatePaths,
+      ].join(', ')}`
+    );
   }
 
   const formattedComments = formatPrComments(newPrComments);
@@ -364,20 +366,8 @@ export async function startReviewReceive(
     jsonSchema: role.jsonSchema,
   });
 
-  // Verify plan.yaml was created
-  const planPath = getItemPlanPath(itemId);
-  if (existsSync(planPath)) {
-    try {
-      const content = await readFile(planPath, 'utf-8');
-      const plan = parseYaml<Plan>(content);
-      if (plan && plan.tasks) {
-        const planEvent = createPlanCreatedEvent(itemId, planPath);
-        await appendJsonl(eventsPath, planEvent);
-        eventBus.emit('event', { itemId, event: planEvent });
-      }
-    } catch {
-      // plan.yaml exists but may not be valid — not fatal
-    }
+  if (existsSync(getItemPlanPath(itemId))) {
+    await finalizeGeneratedPlan(itemId, config, { allowEmptyTasks: true });
   }
 
   // Record review_receive_completed after successful agent execution

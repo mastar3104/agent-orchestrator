@@ -23,7 +23,10 @@ function createMockProc(): ChildProcess {
   const stdin = new Writable({ write(_chunk, _enc, cb) { cb(); } });
   (proc as { stdin: Writable }).stdin = stdin;
   proc.kill = vi.fn();
-  proc.pid = 12345;
+  Object.defineProperty(proc, 'pid', {
+    value: 12345,
+    configurable: true,
+  });
   return proc;
 }
 

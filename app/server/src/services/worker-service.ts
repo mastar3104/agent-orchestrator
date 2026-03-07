@@ -3,22 +3,33 @@ import { createWriteStream } from 'fs';
 import { readFile, mkdir, writeFile } from 'fs/promises';
 import { finished } from 'stream/promises';
 import { resolve, join } from 'path';
-import type { Plan, PlanTask, AgentRole, ItemRepositoryConfig } from '@agent-orch/shared';
-import { isDevRole } from '@agent-orch/shared';
+import type {
+  Plan,
+  PlanTask,
+  AgentRole,
+  ItemRepositoryConfig,
+  TaskExecutionStatus,
+  TaskProgressPhase,
+} from '@agent-orch/shared';
 
 import { executeAgent, getAgentsByItem, stopAgent } from './agent-service';
 import { getPlan } from './planner-service';
 import { getItemConfig } from './item-service';
 import {
   startGitSnapshot,
-  stopGitSnapshot,
   stopAllGitSnapshots,
 } from './git-snapshot-service';
 import { createDraftPrsForAllRepos } from './git-pr-service';
 import { getWorkspaceRoot, getRepoWorkspaceDir, getItemEventsPath, getItemPlanPath, getHookLogDir } from '../lib/paths';
 import { eventBus } from './event-bus';
 import { appendJsonl } from '../lib/jsonl';
-import { createReviewFindingsExtractedEvent, createStatusChangedEvent, createHooksExecutedEvent, createErrorEvent } from '../lib/events';
+import {
+  createReviewFindingsExtractedEvent,
+  createStatusChangedEvent,
+  createHooksExecutedEvent,
+  createErrorEvent,
+  createTaskStateChangedEvent,
+} from '../lib/events';
 import type { HookResult } from '@agent-orch/shared';
 import {
   type EngineerResponse,
@@ -26,6 +37,14 @@ import {
   type ReviewComment,
 } from '../lib/claude-schemas';
 import { getRole, mergeAllowedTools } from '../lib/role-loader';
+import {
+  ensureTaskStatesForPlan,
+  readRepoTaskState,
+  writeRepoTaskState,
+  type RepoTaskStateFile,
+  type RepoTaskStateTask,
+} from './task-state-service';
+import { deriveRepoStatuses } from './state-service';
 
 const MAX_FEEDBACK_ROUNDS = 2;
 const MAX_DIFF_LINES = 20000;
@@ -84,6 +103,19 @@ async function getGitDiff(cwd: string, base: string, head: string, files?: strin
   return diff;
 }
 
+async function getGitDiffNameOnly(cwd: string, base: string, head: string): Promise<string[]> {
+  const output = await execGit(['diff', '--name-only', base, head], cwd);
+  if (!output.trim()) {
+    return [];
+  }
+  return [...new Set(output.trim().split('\n').filter(Boolean))];
+}
+
+async function resetRepoForAttempt(cwd: string): Promise<void> {
+  await execGit(['reset', '--hard', 'HEAD'], cwd);
+  await execGit(['clean', '-fd'], cwd);
+}
+
 // パストラバーサル防止
 function validateAgentWorkdir(agentWorkdir: string, workspaceRoot: string): void {
   const normalizedWorkdir = resolve(agentWorkdir);
@@ -99,57 +131,363 @@ function validateAgentWorkdir(agentWorkdir: string, workspaceRoot: string): void
 
 // ─── Orchestrator-side commit ───
 
+interface CommitEngineerChangesResult {
+  commitHash: string;
+  filesModified: string[];
+}
+
 async function commitEngineerChanges(
   cwd: string,
   engineerResponse: EngineerResponse,
   fallbackMessage: string,
   itemId: string,
-  repoName: string
-): Promise<boolean> {
+  repoName: string,
+  preAttemptHead: string
+): Promise<CommitEngineerChangesResult | null> {
   if (engineerResponse.status !== 'success') {
     console.log(`[${itemId}/${repoName}] Engineer status=${engineerResponse.status}, skipping commit`);
-    return false;
+    return null;
   }
 
   const filesToAdd = engineerResponse.files_modified || [];
   if (filesToAdd.length === 0) {
     console.log(`[${itemId}/${repoName}] No files_modified reported, skipping commit`);
-    return false;
+    return null;
   }
 
-  // 安全確認: 無関係な staged changes が残っていないか検査
-  const preExistingStaged = await execGit(['diff', '--cached', '--name-only'], cwd);
-  if (preExistingStaged.trim()) {
-    console.warn(
-      `[${itemId}/${repoName}] Pre-existing staged changes detected, unstaging: ${preExistingStaged.trim()}`
-    );
-    await execGit(['reset', 'HEAD'], cwd);
-  }
+  // files_modified に報告された path だけを、追加・更新・削除込みで stage する
+  await execGit(['add', '-A', '--', ...filesToAdd], cwd);
 
-  // files_modified のみ git add
-  await execGit(['add', '--', ...filesToAdd], cwd);
-
-  // 対象ファイルに限定して staged 差分を確認
-  const staged = await execGit(['diff', '--cached', '--name-only', '--', ...filesToAdd], cwd);
+  const staged = await execGit(['diff', '--cached', '--name-only'], cwd);
   if (!staged.trim()) {
     console.log(`[${itemId}/${repoName}] No staged changes for files_modified, skipping commit`);
-    return false;
+    return null;
   }
 
   const message = engineerResponse.commit_message?.trim() || fallbackMessage;
   await execGit(['commit', '-m', message], cwd);
+  const commitHash = await getGitHead(cwd);
+  const committedFiles = await getGitDiffNameOnly(cwd, preAttemptHead, commitHash);
 
   console.log(`[${itemId}/${repoName}] Committed: ${message}`);
-  return true;
+  return { commitHash, filesModified: committedFiles };
 }
 
-// ─── Engineer Phase Result ───
+interface RunEngineerAttemptOptions {
+  itemId: string;
+  repoName: string;
+  currentTask: string;
+  prompt: string;
+  workingDir: string;
+  allowedTools: string[];
+  jsonSchema: object;
+  timeoutMs: number;
+  fallbackMessage: string;
+}
 
-interface EngineerPhaseResult {
-  response: EngineerResponse;
-  reviewBase: string;
-  phaseBase: string;
-  initialHead: string;
+async function runEngineerAttemptWithCleanup(
+  options: RunEngineerAttemptOptions
+): Promise<CommitEngineerChangesResult> {
+  await resetRepoForAttempt(options.workingDir);
+  const preAttemptHead = await getGitHead(options.workingDir);
+
+  let attemptError: unknown;
+  try {
+    const { result } = await executeAgent<EngineerResponse>({
+      itemId: options.itemId,
+      role: 'engineer',
+      repoName: options.repoName,
+      currentTask: options.currentTask,
+      prompt: options.prompt,
+      workingDir: options.workingDir,
+      allowedTools: options.allowedTools,
+      jsonSchema: options.jsonSchema,
+      timeoutMs: options.timeoutMs,
+    });
+    const committed = await commitEngineerChanges(
+      options.workingDir,
+      result.output,
+      options.fallbackMessage,
+      options.itemId,
+      options.repoName,
+      preAttemptHead
+    );
+    return committed ?? { commitHash: preAttemptHead, filesModified: [] };
+  } catch (error) {
+    attemptError = error;
+    throw error;
+  } finally {
+    try {
+      await resetRepoForAttempt(options.workingDir);
+    } catch (cleanupError) {
+      const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      if (attemptError) {
+        console.warn(
+          `[${options.itemId}/${options.repoName}] Cleanup after ${options.currentTask} failed: ${cleanupMessage}`
+        );
+      } else {
+        throw cleanupError;
+      }
+    }
+  }
+}
+
+function cloneRepoTaskState(state: RepoTaskStateFile): RepoTaskStateFile {
+  return {
+    ...state,
+    tasks: state.tasks.map((task) => ({ ...task, dependencies: [...task.dependencies], filesModified: task.filesModified ? [...task.filesModified] : undefined })),
+  };
+}
+
+function mergeFilesModified(...lists: Array<string[] | undefined>): string[] {
+  const merged = new Set<string>();
+  for (const list of lists) {
+    for (const file of list || []) {
+      merged.add(file);
+    }
+  }
+  return [...merged];
+}
+
+function getRepoTaskEntry(state: RepoTaskStateFile, taskId: string): RepoTaskStateTask {
+  const task = state.tasks.find((entry) => entry.id === taskId);
+  if (!task) {
+    throw new Error(`Task state not found for task ${taskId} in repo ${state.repository}`);
+  }
+  return task;
+}
+
+async function mutateRepoTaskState(
+  itemId: string,
+  repoName: string,
+  mutate: (state: RepoTaskStateFile) => void
+): Promise<RepoTaskStateFile> {
+  const current = await readRepoTaskState(itemId, repoName);
+  if (!current) {
+    throw new Error(`Task state not found for repo ${repoName}`);
+  }
+
+  const next = cloneRepoTaskState(current);
+  mutate(next);
+  next.updatedAt = new Date().toISOString();
+  await writeRepoTaskState(itemId, next);
+  return next;
+}
+
+async function mutateVisibleTaskState(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  mutateTask: (task: RepoTaskStateTask) => void
+): Promise<RepoTaskStateFile> {
+  const current = await readRepoTaskState(itemId, repoName);
+  if (!current) {
+    throw new Error(`Task state not found for repo ${repoName}`);
+  }
+
+  const previousTask = getRepoTaskEntry(current, taskId);
+  const next = cloneRepoTaskState(current);
+  const task = getRepoTaskEntry(next, taskId);
+  mutateTask(task);
+  next.updatedAt = new Date().toISOString();
+  await writeRepoTaskState(itemId, next);
+
+  if (
+    previousTask.status !== task.status ||
+    previousTask.currentPhase !== task.currentPhase
+  ) {
+    eventBus.publish(
+      itemId,
+      createTaskStateChangedEvent(itemId, repoName, task.id, task.status, task.currentPhase)
+    );
+  }
+
+  return next;
+}
+
+async function normalizeStaleInProgressTasks(itemId: string, repoName: string): Promise<RepoTaskStateFile> {
+  return mutateRepoTaskState(itemId, repoName, (state) => {
+    for (const task of state.tasks) {
+      if (task.status === 'in_progress') {
+        task.status = 'failed';
+        task.currentPhase = task.currentPhase || 'engineer';
+        task.lastError = task.lastError || 'Interrupted before completion';
+      }
+    }
+  });
+}
+
+function areRepoTasksCompleted(state: RepoTaskStateFile): boolean {
+  return state.tasks.every((task) => task.status === 'completed');
+}
+
+function buildTaskStateIndex(statesByRepo: Map<string, RepoTaskStateFile>): Map<string, RepoTaskStateTask> {
+  const index = new Map<string, RepoTaskStateTask>();
+  for (const state of statesByRepo.values()) {
+    for (const task of state.tasks) {
+      index.set(task.id, task);
+    }
+  }
+  return index;
+}
+
+function areDependenciesCompleted(
+  task: PlanTask,
+  taskStateIndex: Map<string, RepoTaskStateTask>
+): boolean {
+  const dependencies = task.dependencies || [];
+  return dependencies.every((dependencyId) => taskStateIndex.get(dependencyId)?.status === 'completed');
+}
+
+function selectInReviewTask(
+  plan: Plan,
+  statesByRepo: Map<string, RepoTaskStateFile>,
+  targetRepos?: string[]
+): PlanTask | null {
+  for (const task of plan.tasks) {
+    if (targetRepos && !targetRepos.includes(task.repository)) {
+      continue;
+    }
+
+    const repoState = statesByRepo.get(task.repository);
+    if (!repoState) {
+      continue;
+    }
+
+    const taskState = repoState.tasks.find((entry) => entry.id === task.id);
+    if (taskState?.status === 'in_review') {
+      return task;
+    }
+  }
+
+  return null;
+}
+
+function selectNextRunnableTask(
+  plan: Plan,
+  statesByRepo: Map<string, RepoTaskStateFile>,
+  targetRepos?: string[]
+): PlanTask | null {
+  const taskStateIndex = buildTaskStateIndex(statesByRepo);
+  for (const task of plan.tasks) {
+    if (targetRepos && !targetRepos.includes(task.repository)) {
+      continue;
+    }
+
+    const repoState = statesByRepo.get(task.repository);
+    if (!repoState) {
+      continue;
+    }
+
+    const taskState = repoState.tasks.find((entry) => entry.id === task.id);
+    if (!taskState) {
+      continue;
+    }
+
+    if (
+      taskState.status === 'completed' ||
+      taskState.status === 'failed' ||
+      taskState.status === 'in_progress' ||
+      taskState.status === 'in_review'
+    ) {
+      continue;
+    }
+
+    if (!areDependenciesCompleted(task, taskStateIndex)) {
+      continue;
+    }
+
+    return task;
+  }
+
+  return null;
+}
+
+async function markTaskInProgress(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  phaseBase: string
+): Promise<RepoTaskStateFile> {
+  return mutateVisibleTaskState(itemId, repoName, taskId, (task) => {
+    task.status = 'in_progress';
+    task.currentPhase = 'engineer';
+    task.attempts += 1;
+    task.phaseBase = phaseBase;
+    task.reviewRounds = 0;
+    task.lastStartedAt = new Date().toISOString();
+    task.completedAt = undefined;
+    task.lastError = undefined;
+    task.commitHash = undefined;
+    task.filesModified = undefined;
+  });
+}
+
+async function markTaskInReview(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  currentPhase: TaskProgressPhase,
+  filesModified?: string[]
+): Promise<RepoTaskStateFile> {
+  return mutateVisibleTaskState(itemId, repoName, taskId, (task) => {
+    task.status = 'in_review';
+    task.currentPhase = currentPhase;
+    task.lastError = undefined;
+    task.filesModified = mergeFilesModified(task.filesModified, filesModified);
+  });
+}
+
+async function markTaskCompleted(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  commitHash: string
+): Promise<RepoTaskStateFile> {
+  return mutateVisibleTaskState(itemId, repoName, taskId, (task) => {
+    task.status = 'completed';
+    task.currentPhase = undefined;
+    task.completedAt = new Date().toISOString();
+    task.lastError = undefined;
+    task.commitHash = commitHash;
+  });
+}
+
+async function mergeTaskFilesModified(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  filesModified: string[]
+): Promise<RepoTaskStateFile> {
+  return mutateRepoTaskState(itemId, repoName, (state) => {
+    const task = getRepoTaskEntry(state, taskId);
+    task.filesModified = mergeFilesModified(task.filesModified, filesModified);
+  });
+}
+
+async function incrementTaskReviewRounds(
+  itemId: string,
+  repoName: string,
+  taskId: string
+): Promise<RepoTaskStateFile> {
+  return mutateRepoTaskState(itemId, repoName, (state) => {
+    const task = getRepoTaskEntry(state, taskId);
+    task.reviewRounds = (task.reviewRounds || 0) + 1;
+  });
+}
+
+async function markTaskFailed(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  errorMessage: string,
+  currentPhase?: TaskProgressPhase
+): Promise<RepoTaskStateFile> {
+  return mutateVisibleTaskState(itemId, repoName, taskId, (task) => {
+    task.status = 'failed';
+    task.currentPhase = currentPhase ?? task.currentPhase;
+    task.lastError = errorMessage;
+  });
 }
 
 // ─── Hooks execution ───
@@ -301,6 +639,287 @@ Return {"status": "success", "files_modified": [...], "commit_message": "fix(<sc
 If you encounter an error, return {"status": "failure", "files_modified": []}.`;
 }
 
+async function finalizeCompletedRepo(itemId: string, repoName: string): Promise<void> {
+  await createDraftPrsForAllRepos(itemId, new Set([repoName]));
+}
+
+async function failTaskWithError(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  phase: 'engineer' | 'hooks' | 'review',
+  message: string
+): Promise<{ state: RepoTaskStateFile; errorMessage: string }> {
+  const failedState = await markTaskFailed(itemId, repoName, taskId, message, phase);
+  const errorEvent = createErrorEvent(itemId, message, { repoName, phase });
+  await appendJsonl(getItemEventsPath(itemId), errorEvent);
+  eventBus.publish(itemId, errorEvent);
+  return { state: failedState, errorMessage: errorEvent.message };
+}
+
+async function runTaskHooksPhase(
+  itemId: string,
+  repo: ItemRepositoryConfig,
+  task: PlanTask,
+  agentWorkdir: string,
+  effectiveTools: string[],
+  reviewRound: number
+): Promise<RepoTaskStateFile> {
+  const hooks = repo.hooks;
+  if (!hooks || hooks.length === 0) {
+    const currentState = await readRepoTaskState(itemId, repo.name);
+    if (!currentState) {
+      throw new Error(`Task state missing for repo ${repo.name}`);
+    }
+    return currentState;
+  }
+
+  const engineerRole = getRole('engineer');
+  const hookLogDir = join(getHookLogDir(itemId, repo.name), task.id, `review-round-${reviewRound + 1}`);
+  let latestState = await readRepoTaskState(itemId, repo.name);
+  if (!latestState) {
+    throw new Error(`Task state missing for repo ${repo.name}`);
+  }
+
+  for (let hookAttempt = 1; hookAttempt <= MAX_HOOKS_RETRIES; hookAttempt++) {
+    console.log(
+      `[${itemId}/${repo.name}] Running hooks for ${task.id} (attempt ${hookAttempt}/${MAX_HOOKS_RETRIES})`
+    );
+    const hookResults = await runHooks(hooks, agentWorkdir, hookLogDir, hookAttempt);
+    const allPassed = hookResults.every((result) => result.exitCode === 0);
+
+    const hooksEvent = createHooksExecutedEvent(itemId, repo.name, hookResults, allPassed, hookAttempt);
+    await appendJsonl(getItemEventsPath(itemId), hooksEvent);
+    eventBus.publish(itemId, hooksEvent);
+
+    if (allPassed) {
+      return latestState;
+    }
+
+    if (hookAttempt < MAX_HOOKS_RETRIES) {
+      const fixPrompt = buildHooksFixPrompt(hookResults);
+      try {
+        const committed = await runEngineerAttemptWithCleanup({
+          itemId,
+          repoName: repo.name,
+          currentTask: `${task.id}: hooks-fix`,
+          prompt: fixPrompt,
+          workingDir: agentWorkdir,
+          allowedTools: effectiveTools,
+          jsonSchema: engineerRole.jsonSchema,
+          timeoutMs: ENGINEER_TIMEOUT_MS,
+          fallbackMessage: `fix(${repo.name}): address hook validation failures for ${task.id}`,
+        });
+        latestState = await mergeTaskFilesModified(
+          itemId,
+          repo.name,
+          task.id,
+          committed.filesModified
+        );
+      } catch (fixError) {
+        const fixMsg = fixError instanceof Error ? fixError.message : String(fixError);
+        console.error(`[${itemId}/${repo.name}] Hooks fix engineer failed for ${task.id}: ${fixMsg}`);
+      }
+    }
+  }
+
+  throw new Error(
+    `Hooks validation failed for ${repo.name} during task ${task.id} after ${MAX_HOOKS_RETRIES} attempts`
+  );
+}
+
+async function runTaskReviewPhase(
+  itemId: string,
+  plan: Plan,
+  repo: ItemRepositoryConfig,
+  task: PlanTask,
+  agentWorkdir: string
+): Promise<{ state: RepoTaskStateFile; errorMessage?: string }> {
+  const reviewerRole = getRole('reviewer');
+  const engineerRole = getRole('engineer');
+  const effectiveTools = mergeAllowedTools(engineerRole.allowedTools, repo.allowedTools);
+
+  let currentState = await readRepoTaskState(itemId, repo.name);
+  if (!currentState) {
+    throw new Error(`Task state missing for repo ${repo.name}`);
+  }
+
+  while (true) {
+    const currentTaskState = getRepoTaskEntry(currentState, task.id);
+    if (!currentTaskState.phaseBase) {
+      return failTaskWithError(
+        itemId,
+        repo.name,
+        task.id,
+        'review',
+        `Task ${task.id} is missing phaseBase for review resume in ${repo.name}`
+      );
+    }
+
+    try {
+      currentState = await runTaskHooksPhase(
+        itemId,
+        repo,
+        task,
+        agentWorkdir,
+        effectiveTools,
+        currentTaskState.reviewRounds || 0
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return failTaskWithError(itemId, repo.name, task.id, 'hooks', message);
+    }
+
+    currentState = await markTaskInReview(itemId, repo.name, task.id, 'review');
+
+    const taskStateAfterHooks = getRepoTaskEntry(currentState, task.id);
+    const phaseBase = taskStateAfterHooks.phaseBase!;
+    const currentHead = await getGitHead(agentWorkdir);
+
+    const reviewContext = await buildReviewContext(
+      itemId,
+      repo.name,
+      agentWorkdir,
+      phaseBase,
+      currentHead,
+      task
+    );
+    const reviewPrompt = `${reviewerRole.promptTemplate}\n\n${reviewContext}`;
+
+    let reviewResponse: ReviewerResponse | null = null;
+    let reviewError = 'Reviewer failed';
+    for (let attempt = 0; attempt <= AGENT_MAX_RETRIES; attempt++) {
+      try {
+        const { result: reviewResult } = await executeAgent<ReviewerResponse>({
+          itemId,
+          role: 'review',
+          repoName: repo.name,
+          currentTask: `${task.id}: review`,
+          prompt: reviewPrompt,
+          workingDir: agentWorkdir,
+          allowedTools: reviewerRole.allowedTools,
+          jsonSchema: reviewerRole.jsonSchema,
+          timeoutMs: REVIEW_TIMEOUT_MS,
+        });
+        reviewResponse = reviewResult.output;
+        break;
+      } catch (error) {
+        reviewError = error instanceof Error ? error.message : String(error);
+        if (attempt < AGENT_MAX_RETRIES) {
+          console.warn(
+            `[${itemId}/${repo.name}] Review attempt ${attempt + 1} failed for ${task.id}: ${reviewError}, retrying...`
+          );
+          continue;
+        }
+      }
+    }
+
+    if (!reviewResponse) {
+      return failTaskWithError(
+        itemId,
+        repo.name,
+        task.id,
+        'review',
+        `Review failed for ${repo.name} during task ${task.id}: ${reviewError}`
+      );
+    }
+
+    const comments = reviewResponse.comments ?? [];
+    const findings = comments.map((comment) => ({
+      severity: (comment.severity || 'minor') as 'critical' | 'major' | 'minor',
+      file: comment.file,
+      line: comment.line,
+      description: comment.comment,
+      suggestedFix: comment.suggestedFix || '',
+      targetAgent: repo.name,
+    }));
+
+    const findingsEvent = createReviewFindingsExtractedEvent(
+      itemId,
+      `review-${repo.name}-${task.id}-cycle${(taskStateAfterHooks.reviewRounds || 0) + 1}`,
+      repo.name,
+      findings,
+      reviewResponse.review_status === 'approve' ? 'pass' : 'needs_fixes',
+      reviewResponse.review_status === 'approve'
+        ? `Code review passed for ${task.id}`
+        : `${comments.length} issues found for ${task.id}`
+    );
+    await appendJsonl(getItemEventsPath(itemId), findingsEvent);
+    eventBus.publish(itemId, findingsEvent);
+
+    if (reviewResponse.review_status === 'approve') {
+      currentState = await markTaskCompleted(itemId, repo.name, task.id, currentHead);
+      return { state: currentState };
+    }
+
+    currentState = await incrementTaskReviewRounds(itemId, repo.name, task.id);
+    const taskStateAfterReview = getRepoTaskEntry(currentState, task.id);
+    if ((taskStateAfterReview.reviewRounds || 0) >= MAX_FEEDBACK_ROUNDS) {
+      currentState = await markTaskCompleted(itemId, repo.name, task.id, currentHead);
+      return { state: currentState };
+    }
+
+    let feedbackDiff: string;
+    try {
+      const commentFiles = comments.map((comment) => comment.file).filter(Boolean);
+      feedbackDiff = await getGitDiff(
+        agentWorkdir,
+        phaseBase,
+        currentHead,
+        commentFiles.length > 0 ? commentFiles : undefined
+      );
+    } catch {
+      feedbackDiff = '<unable to generate diff>';
+    }
+
+    const feedbackPrompt = buildFeedbackPrompt(plan, repo, comments, feedbackDiff, [task]);
+
+    let feedbackError = 'Feedback engineer failed';
+    let feedbackSucceeded = false;
+    for (let feedbackAttempt = 0; feedbackAttempt <= AGENT_MAX_RETRIES; feedbackAttempt++) {
+      try {
+        const committed = await runEngineerAttemptWithCleanup({
+          itemId,
+          repoName: repo.name,
+          currentTask: `${task.id}: review-fix`,
+          prompt: feedbackPrompt,
+          workingDir: agentWorkdir,
+          allowedTools: effectiveTools,
+          jsonSchema: engineerRole.jsonSchema,
+          timeoutMs: ENGINEER_TIMEOUT_MS,
+          fallbackMessage: `fix(${repo.name}): address review feedback for ${task.id}`,
+        });
+        currentState = await mergeTaskFilesModified(
+          itemId,
+          repo.name,
+          task.id,
+          committed.filesModified
+        );
+        feedbackSucceeded = true;
+        break;
+      } catch (error) {
+        feedbackError = error instanceof Error ? error.message : String(error);
+        if (feedbackAttempt < AGENT_MAX_RETRIES) {
+          console.warn(
+            `[${itemId}/${repo.name}] Review-fix attempt ${feedbackAttempt + 1} failed for ${task.id}: ${feedbackError}, retrying...`
+          );
+          continue;
+        }
+      }
+    }
+
+    if (!feedbackSucceeded) {
+      return failTaskWithError(
+        itemId,
+        repo.name,
+        task.id,
+        'review',
+        `Review feedback handling failed for ${repo.name} during task ${task.id}: ${feedbackError}`
+      );
+    }
+  }
+}
+
 // ─── Main orchestration ───
 
 export async function startWorkers(itemId: string, targetRepos?: string[]): Promise<void> {
@@ -316,512 +935,175 @@ export async function startWorkers(itemId: string, targetRepos?: string[]): Prom
 
   const workspaceRoot = resolve(getWorkspaceRoot(itemId));
 
-  // Start parent workspace root git snapshot
   await startGitSnapshot(itemId, workspaceRoot);
-
-  // Group tasks by repository
   const tasksByRepo = new Map<string, PlanTask[]>();
-
   for (const task of plan.tasks) {
-    const repoName = task.repository;
-    if (!repoName) {
-      console.warn(`[${itemId}] Task ${task.id} has no repository field, skipping`);
-      continue;
-    }
-    const tasks = tasksByRepo.get(repoName) || [];
+    const tasks = tasksByRepo.get(task.repository) || [];
     tasks.push(task);
-    tasksByRepo.set(repoName, tasks);
+    tasksByRepo.set(task.repository, tasks);
   }
 
-  // ─── Phase 1: Dev Workers (parallel per repo) ───
-  const engineerResults = new Map<string, EngineerPhaseResult>();
-  const hooksFailedRepos = new Set<string>();
+  await ensureTaskStatesForPlan(itemId, plan);
 
-  const savedPhaseBases = new Map<string, string>();
-  const devPromises: Promise<void>[] = [];
-
+  const statesByRepo = new Map<string, RepoTaskStateFile>();
   for (const repo of itemConfig.repositories) {
-    // Filter by targetRepos if specified
-    if (targetRepos && !targetRepos.includes(repo.name)) continue;
-    const repoTasks = tasksByRepo.get(repo.name);
-    const devTasks = repoTasks?.filter(t => isDevRole(t.agent)) || [];
-    if (devTasks.length === 0) continue;
+    if (targetRepos && !targetRepos.includes(repo.name)) {
+      continue;
+    }
+    if (!tasksByRepo.has(repo.name)) {
+      continue;
+    }
+    const normalizedState = await normalizeStaleInProgressTasks(itemId, repo.name);
+    statesByRepo.set(repo.name, normalizedState);
+  }
 
+  const repoStatuses = await deriveRepoStatuses(itemId);
+  const finalizedRepos = new Set(
+    [...repoStatuses.entries()]
+      .filter(([, state]) => state.inCurrentPlan && state.status === 'completed')
+      .map(([repoName]) => repoName)
+  );
+
+  const tryFinalizeCompletedRepos = async (): Promise<void> => {
+    for (const repo of itemConfig.repositories) {
+      if (targetRepos && !targetRepos.includes(repo.name)) {
+        continue;
+      }
+      if (finalizedRepos.has(repo.name)) {
+        continue;
+      }
+      const repoTasks = tasksByRepo.get(repo.name);
+      const repoState = statesByRepo.get(repo.name);
+      if (!repoTasks || !repoState || !areRepoTasksCompleted(repoState)) {
+        continue;
+      }
+      await finalizeCompletedRepo(itemId, repo.name);
+      finalizedRepos.add(repo.name);
+    }
+  };
+
+  await tryFinalizeCompletedRepos();
+
+  let failedTaskMessage: string | null = null;
+  while (true) {
+    const reviewTask = selectInReviewTask(plan, statesByRepo, targetRepos);
+    const nextTask = reviewTask || selectNextRunnableTask(plan, statesByRepo, targetRepos);
+    if (!nextTask) {
+      break;
+    }
+
+    const repo = itemConfig.repositories.find((candidate) => candidate.name === nextTask.repository);
+    if (!repo) {
+      throw new Error(`Repository config not found for ${nextTask.repository}`);
+    }
+
+    const repoTasks = tasksByRepo.get(repo.name) || [];
+    const taskIndex = repoTasks.findIndex((task) => task.id === nextTask.id);
     const agentWorkdir = resolve(getRepoWorkspaceDir(itemId, repo.name));
     validateAgentWorkdir(agentWorkdir, workspaceRoot);
+    await startGitSnapshot(itemId, agentWorkdir);
 
-    const promise = (async () => {
-      const baseBranch = repo.branch || 'main';
+    const engineerRole = getRole('engineer');
+    const effectiveTools = mergeAllowedTools(engineerRole.allowedTools, repo.allowedTools);
+    if (!reviewTask) {
+      console.log(
+        `[${itemId}/${repo.name}] Starting task ${taskIndex + 1}/${repoTasks.length}: ${nextTask.id} - ${nextTask.title}`
+      );
+      await resetRepoForAttempt(agentWorkdir);
       const phaseBase = await getGitHead(agentWorkdir);
-      savedPhaseBases.set(repo.name, phaseBase);
+      const inProgressState = await markTaskInProgress(itemId, repo.name, nextTask.id, phaseBase);
+      statesByRepo.set(repo.name, inProgressState);
 
-      // reviewBase: try merge-base first, fallback to phaseBase
-      let reviewBase: string;
-      try {
-        reviewBase = await getGitMergeBase(agentWorkdir, baseBranch);
-      } catch {
-        reviewBase = phaseBase;
-      }
+      const prompt = `${engineerRole.promptTemplate}\n\n${buildWorkerContext('engineer', repo.name, [nextTask], plan)}`;
 
-      // Start git snapshot
-      await startGitSnapshot(itemId, agentWorkdir);
-
-      const engineerRole = getRole('engineer');
-      const effectiveTools = mergeAllowedTools(engineerRole.allowedTools, repo.allowedTools);
-      const context = buildWorkerContext('engineer', repo.name, devTasks, plan);
-      const prompt = `${engineerRole.promptTemplate}\n\n${context}`;
-
+      let taskSucceeded = false;
+      let lastError = 'Engineer failed';
       for (let attempt = 0; attempt <= AGENT_MAX_RETRIES; attempt++) {
         try {
-          const { result } = await executeAgent<EngineerResponse>({
+          const committed = await runEngineerAttemptWithCleanup({
             itemId,
-            role: 'engineer',
             repoName: repo.name,
+            currentTask: `${nextTask.id}: ${nextTask.title}`,
             prompt,
             workingDir: agentWorkdir,
             allowedTools: effectiveTools,
             jsonSchema: engineerRole.jsonSchema,
             timeoutMs: ENGINEER_TIMEOUT_MS,
+            fallbackMessage: `feat(${repo.name}): implement ${nextTask.title}`,
           });
-          const committed = await commitEngineerChanges(agentWorkdir, result.output,
-            `feat(${repo.name}): implement ${devTasks.map(t => t.title).join(', ')}`,
-            itemId, repo.name);
-          if (!committed) {
-            throw new Error(`Engineer produced no committable changes for ${repo.name}`);
-          }
-          let initialHead = phaseBase;
-          try {
-            initialHead = await getGitHead(agentWorkdir);
-          } catch {
-            // Keep phaseBase as a safe fallback.
-          }
 
-          // ─── Hooks execution ───
-          const hooks = repo.hooks;
-          if (hooks && hooks.length > 0) {
-            const hookLogDir = getHookLogDir(itemId, repo.name);
-            let hooksPassed = false;
-            for (let hookAttempt = 1; hookAttempt <= MAX_HOOKS_RETRIES; hookAttempt++) {
-              console.log(`[${itemId}/${repo.name}] Running hooks (attempt ${hookAttempt}/${MAX_HOOKS_RETRIES})`);
-              const hookResults = await runHooks(hooks, agentWorkdir, hookLogDir, hookAttempt);
-              const allPassed = hookResults.every(r => r.exitCode === 0);
-
-              const hooksEvent = createHooksExecutedEvent(itemId, repo.name, hookResults, allPassed, hookAttempt);
-              await appendJsonl(getItemEventsPath(itemId), hooksEvent);
-              eventBus.publish(itemId, hooksEvent);
-
-              if (allPassed) {
-                console.log(`[${itemId}/${repo.name}] All hooks passed on attempt ${hookAttempt}`);
-                hooksPassed = true;
-                break;
-              }
-
-              console.warn(`[${itemId}/${repo.name}] Hooks failed on attempt ${hookAttempt}/${MAX_HOOKS_RETRIES}`);
-
-              if (hookAttempt < MAX_HOOKS_RETRIES) {
-                // Re-run engineer with fix prompt
-                const fixPrompt = buildHooksFixPrompt(hookResults);
-                try {
-                  const { result: fixResult } = await executeAgent<EngineerResponse>({
-                    itemId,
-                    role: 'engineer',
-                    repoName: repo.name,
-                    prompt: fixPrompt,
-                    workingDir: agentWorkdir,
-                    allowedTools: effectiveTools,
-                    jsonSchema: engineerRole.jsonSchema,
-                    timeoutMs: ENGINEER_TIMEOUT_MS,
-                  });
-                  await commitEngineerChanges(agentWorkdir, fixResult.output,
-                    `fix(${repo.name}): address hook validation failures`, itemId, repo.name);
-                } catch (fixError) {
-                  const fixMsg = fixError instanceof Error ? fixError.message : String(fixError);
-                  console.error(`[${itemId}/${repo.name}] Hooks fix engineer failed: ${fixMsg}`);
-                }
-              }
-            }
-
-            if (!hooksPassed) {
-              console.error(`[${itemId}/${repo.name}] Hooks failed after ${MAX_HOOKS_RETRIES} attempts, skipping repo`);
-              hooksFailedRepos.add(repo.name);
-              const errorEvent = createErrorEvent(
-                itemId,
-                `Hooks validation failed for ${repo.name} after ${MAX_HOOKS_RETRIES} attempts`,
-                { repoName: repo.name, phase: 'hooks' }
-              );
-              await appendJsonl(getItemEventsPath(itemId), errorEvent);
-              eventBus.publish(itemId, errorEvent);
-              break; // Don't set engineerResults → skip review/PR
-            }
-
-            // Update initialHead after hooks fixes
-            try {
-              initialHead = await getGitHead(agentWorkdir);
-            } catch {
-              // Keep previous value
-            }
-          }
-
-          engineerResults.set(repo.name, {
-            response: result.output,
-            reviewBase,
-            phaseBase,
-            initialHead,
-          });
-          break;
-        } catch (error) {
-          const msg = error instanceof Error ? error.message : String(error);
-          if (attempt < AGENT_MAX_RETRIES) {
-            console.warn(`[${itemId}/${repo.name}] Engineer attempt ${attempt + 1} failed: ${msg}, retrying...`);
-            continue;
-          }
-          console.error(`[${itemId}/${repo.name}] Engineer failed after ${attempt + 1} attempts: ${msg}, skipping repo`);
-        }
-      }
-    })();
-
-    devPromises.push(promise);
-  }
-
-  // Wait for all dev workers to complete (allSettled to tolerate individual failures)
-  if (devPromises.length > 0) {
-    await Promise.allSettled(devPromises);
-
-    // Retry failed repos (repos where engineer itself failed, NOT hooks-exhausted repos)
-    const failedRepos = itemConfig.repositories.filter(
-      repo => tasksByRepo.has(repo.name) &&
-              (tasksByRepo.get(repo.name)?.some(t => isDevRole(t.agent)) ?? false) &&
-              !engineerResults.has(repo.name) &&
-              !hooksFailedRepos.has(repo.name)
-    );
-
-    for (const repo of failedRepos) {
-      const agentWorkdir = resolve(getRepoWorkspaceDir(itemId, repo.name));
-      // Cleanup stale state and restart snapshot
-      stopGitSnapshot(itemId, agentWorkdir);
-      await startGitSnapshot(itemId, agentWorkdir);
-
-      const baseBranch = repo.branch || 'main';
-      const phaseBase = savedPhaseBases.get(repo.name)!;
-      let reviewBase: string;
-      try { reviewBase = await getGitMergeBase(agentWorkdir, baseBranch); }
-      catch { reviewBase = phaseBase; }
-
-      const engineerRole = getRole('engineer');
-      const effectiveTools = mergeAllowedTools(engineerRole.allowedTools, repo.allowedTools);
-      const devTasks = tasksByRepo.get(repo.name)?.filter(t => isDevRole(t.agent)) || [];
-      const context = buildWorkerContext('engineer', repo.name, devTasks, plan);
-      const prompt = `${engineerRole.promptTemplate}\n\n${context}`;
-
-      try {
-        const { result } = await executeAgent<EngineerResponse>({
-          itemId, role: 'engineer', repoName: repo.name, prompt,
-          workingDir: agentWorkdir, allowedTools: effectiveTools,
-          jsonSchema: engineerRole.jsonSchema, timeoutMs: ENGINEER_TIMEOUT_MS,
-        });
-        const committed = await commitEngineerChanges(agentWorkdir, result.output,
-          `feat(${repo.name}): implement ${devTasks.map(t => t.title).join(', ')}`,
-          itemId, repo.name);
-        if (!committed) {
-          throw new Error(`Engineer retry produced no committable changes for ${repo.name}`);
-        }
-        let initialHead = phaseBase;
-        try {
-          initialHead = await getGitHead(agentWorkdir);
-        } catch {
-          // Keep phaseBase as a safe fallback.
-        }
-        // Run hooks if configured (this repo only enters retry because engineer itself failed,
-        // not because hooks were exhausted — hooksFailedRepos are excluded above)
-        const hooks = repo.hooks;
-        if (hooks && hooks.length > 0) {
-          const hookLogDir = getHookLogDir(itemId, repo.name);
-          let hooksPassed = false;
-          for (let hookAttempt = 1; hookAttempt <= MAX_HOOKS_RETRIES; hookAttempt++) {
-            console.log(`[${itemId}/${repo.name}] Running hooks after engineer retry (attempt ${hookAttempt}/${MAX_HOOKS_RETRIES})`);
-            const hookResults = await runHooks(hooks, agentWorkdir, hookLogDir, hookAttempt);
-            const allPassed = hookResults.every(r => r.exitCode === 0);
-
-            const hooksEvent = createHooksExecutedEvent(itemId, repo.name, hookResults, allPassed, hookAttempt);
-            await appendJsonl(getItemEventsPath(itemId), hooksEvent);
-            eventBus.publish(itemId, hooksEvent);
-
-            if (allPassed) {
-              hooksPassed = true;
-              break;
-            }
-
-            if (hookAttempt < MAX_HOOKS_RETRIES) {
-              const fixPrompt = buildHooksFixPrompt(hookResults);
-              try {
-                const { result: fixResult } = await executeAgent<EngineerResponse>({
-                  itemId, role: 'engineer', repoName: repo.name, prompt: fixPrompt,
-                  workingDir: agentWorkdir, allowedTools: effectiveTools,
-                  jsonSchema: engineerRole.jsonSchema, timeoutMs: ENGINEER_TIMEOUT_MS,
-                });
-                await commitEngineerChanges(agentWorkdir, fixResult.output,
-                  `fix(${repo.name}): address hook validation failures`, itemId, repo.name);
-              } catch (fixError) {
-                const fixMsg = fixError instanceof Error ? fixError.message : String(fixError);
-                console.error(`[${itemId}/${repo.name}] Hooks fix engineer failed: ${fixMsg}`);
-              }
-            }
-          }
-
-          if (!hooksPassed) {
-            console.error(`[${itemId}/${repo.name}] Hooks failed after engineer retry, skipping repo`);
-            hooksFailedRepos.add(repo.name);
-            const errorEvent = createErrorEvent(
-              itemId,
-              `Hooks validation failed for ${repo.name} after ${MAX_HOOKS_RETRIES} attempts`,
-              { repoName: repo.name, phase: 'hooks' }
-            );
-            await appendJsonl(getItemEventsPath(itemId), errorEvent);
-            eventBus.publish(itemId, errorEvent);
-            continue; // Skip this repo
-          }
-
-          try {
-            initialHead = await getGitHead(agentWorkdir);
-          } catch {
-            // Keep previous value
-          }
-        }
-
-        engineerResults.set(repo.name, { response: result.output, reviewBase, phaseBase, initialHead });
-        console.log(`[${itemId}/${repo.name}] Engineer retry succeeded`);
-      } catch (retryError) {
-        const msg = retryError instanceof Error ? retryError.message : String(retryError);
-        console.error(`[${itemId}/${repo.name}] Engineer retry also failed: ${msg}`);
-      }
-    }
-
-    if (engineerResults.size === 0) {
-      throw new Error(`All engineer agents failed for item ${itemId}`);
-    }
-  }
-
-  // ─── Phase 2: Review Loop (per repo, max 2 feedback rounds) ───
-  for (const repo of itemConfig.repositories) {
-    const engineerResult = engineerResults.get(repo.name);
-    if (!engineerResult) continue;
-
-    const agentWorkdir = resolve(getRepoWorkspaceDir(itemId, repo.name));
-
-    const { reviewBase, phaseBase, initialHead } = engineerResult;
-
-    for (let cycle = 0; cycle < MAX_FEEDBACK_ROUNDS; cycle++) {
-      console.log(`[${itemId}/${repo.name}] Starting review cycle ${cycle + 1}/${MAX_FEEDBACK_ROUNDS}`);
-
-      const currentHead = await getGitHead(agentWorkdir);
-
-      // Build review diff (what the PR will show)
-      let reviewDiff: string;
-      try {
-        reviewDiff = await getGitDiff(agentWorkdir, reviewBase, currentHead);
-      } catch {
-        reviewDiff = '<unable to generate diff>';
-      }
-
-      if (!reviewDiff || reviewDiff.trim() === '') {
-        console.log(`[${itemId}/${repo.name}] No diff to review, skipping`);
-        break;
-      }
-
-      // Run reviewer with retry + graceful skip
-      const devTasks = tasksByRepo.get(repo.name)?.filter(t => isDevRole(t.agent)) || [];
-      const reviewerRole = getRole('reviewer');
-
-      const reviewContext = await buildReviewContext(
-        itemId,
-        repo.name,
-        agentWorkdir,
-        reviewBase,
-        currentHead,
-        devTasks
-      );
-      const reviewPrompt = `${reviewerRole.promptTemplate}\n\n${reviewContext}`;
-
-      let reviewResponse: ReviewerResponse | null = null;
-      for (let attempt = 0; attempt <= AGENT_MAX_RETRIES; attempt++) {
-        try {
-          const { result: reviewResult } = await executeAgent<ReviewerResponse>({
+          const inReviewState = await markTaskInReview(
             itemId,
-            role: 'review',
-            repoName: repo.name,
-            prompt: reviewPrompt,
-            workingDir: agentWorkdir,
-            allowedTools: reviewerRole.allowedTools,
-            jsonSchema: reviewerRole.jsonSchema,
-            timeoutMs: REVIEW_TIMEOUT_MS,
-          });
-          reviewResponse = reviewResult.output;
-          break;
-        } catch (error) {
-          const msg = error instanceof Error ? error.message : String(error);
-          if (attempt < AGENT_MAX_RETRIES) {
-            console.warn(`[${itemId}/${repo.name}] Review attempt ${attempt + 1} failed: ${msg}, retrying...`);
-            continue;
-          }
-          console.warn(`[${itemId}/${repo.name}] Review failed after ${attempt + 1} attempts: ${msg}, skipping review`);
-        }
-      }
-
-      if (!reviewResponse) {
-        console.log(`[${itemId}/${repo.name}] Skipping review due to failure, proceeding to PR`);
-        break;
-      }
-      const comments = reviewResponse.comments ?? [];
-      const findings = comments.map(c => ({
-        severity: (c.severity || 'minor') as 'critical' | 'major' | 'minor',
-        file: c.file,
-        line: c.line,
-        description: c.comment,
-        suggestedFix: c.suggestedFix || '',
-        targetAgent: repo.name,
-      }));
-
-      const findingsEvent = createReviewFindingsExtractedEvent(
-        itemId,
-        `review-${repo.name}-cycle${cycle + 1}`,
-        repo.name,
-        findings,
-        reviewResponse.review_status === 'approve' ? 'pass' : 'needs_fixes',
-        reviewResponse.review_status === 'approve'
-          ? 'Code review passed'
-          : `${comments.length} issues found`
-      );
-      await appendJsonl(getItemEventsPath(itemId), findingsEvent);
-      eventBus.publish(itemId, findingsEvent);
-
-      if (reviewResponse.review_status === 'approve') {
-        console.log(`[${itemId}/${repo.name}] Review approved on cycle ${cycle + 1}`);
-        break;
-      }
-
-      console.log(`[${itemId}/${repo.name}] Review found ${comments.length} issues`);
-
-      // Get feedback diff (what engineer changed during this phase)
-      let feedbackDiff: string;
-      try {
-        // Prefer targeted diff when reviewer comments specify files
-        const commentFiles = comments
-          .map(c => c.file)
-          .filter(Boolean);
-        feedbackDiff = await getGitDiff(
-          agentWorkdir,
-          phaseBase,
-          currentHead,
-          commentFiles.length > 0 ? commentFiles : undefined
-        );
-      } catch {
-        feedbackDiff = '<unable to generate diff>';
-      }
-
-      // Build feedback prompt
-      const feedbackRole = getRole('engineer');
-      const feedbackEffectiveTools = mergeAllowedTools(feedbackRole.allowedTools, repo.allowedTools);
-      const feedbackPrompt = buildFeedbackPrompt(
-        plan,
-        repo,
-        comments,
-        feedbackDiff,
-        tasksByRepo.get(repo.name)?.filter(t => isDevRole(t.agent)) || []
-      );
-
-      // New engineer execution for fixes (with retry)
-      let feedbackFailed = false;
-      for (let feedbackAttempt = 0; feedbackAttempt <= AGENT_MAX_RETRIES; feedbackAttempt++) {
-        try {
-          const { result: fbResult } = await executeAgent<EngineerResponse>({
-            itemId,
-            role: 'engineer',
-            repoName: repo.name,
-            prompt: feedbackPrompt,
-            workingDir: agentWorkdir,
-            allowedTools: feedbackEffectiveTools,
-            jsonSchema: feedbackRole.jsonSchema,
-            timeoutMs: ENGINEER_TIMEOUT_MS,
-          });
-          const committed = await commitEngineerChanges(agentWorkdir, fbResult.output,
-            `fix(${repo.name}): address review feedback`, itemId, repo.name);
-          if (!committed) {
-            throw new Error(`Feedback engineer produced no committable changes for ${repo.name}`);
-          }
-          break;
-        } catch (error) {
-          const msg = error instanceof Error ? error.message : String(error);
-          if (feedbackAttempt < AGENT_MAX_RETRIES) {
-            console.warn(`[${itemId}/${repo.name}] Feedback engineer attempt ${feedbackAttempt + 1} failed: ${msg}, retrying...`);
-            continue;
-          }
-          console.error(`[${itemId}/${repo.name}] Feedback engineer failed after ${feedbackAttempt + 1} attempts: ${msg}`);
-          feedbackFailed = true;
-        }
-      }
-      if (feedbackFailed) {
-        console.warn(`[${itemId}/${repo.name}] Skipping remaining feedback rounds due to feedback engineer failure`);
-        break;
-      }
-
-      // ─── Post-feedback Hooks execution ───
-      const postFeedbackHooks = repo.hooks;
-      if (postFeedbackHooks && postFeedbackHooks.length > 0) {
-        const feedbackHookLogDir = join(getHookLogDir(itemId, repo.name), `feedback-cycle-${cycle + 1}`);
-        let hooksPassed = false;
-        for (let hookAttempt = 1; hookAttempt <= MAX_HOOKS_RETRIES; hookAttempt++) {
-          console.log(`[${itemId}/${repo.name}] Running post-feedback hooks cycle ${cycle + 1} (attempt ${hookAttempt}/${MAX_HOOKS_RETRIES})`);
-          const hookResults = await runHooks(postFeedbackHooks, agentWorkdir, feedbackHookLogDir, hookAttempt);
-          const allPassed = hookResults.every(r => r.exitCode === 0);
-
-          const hooksEvent = createHooksExecutedEvent(itemId, repo.name, hookResults, allPassed, hookAttempt);
-          await appendJsonl(getItemEventsPath(itemId), hooksEvent);
-          eventBus.publish(itemId, hooksEvent);
-
-          if (allPassed) {
-            console.log(`[${itemId}/${repo.name}] Post-feedback hooks passed on attempt ${hookAttempt}`);
-            hooksPassed = true;
-            break;
-          }
-
-          console.warn(`[${itemId}/${repo.name}] Post-feedback hooks failed on attempt ${hookAttempt}/${MAX_HOOKS_RETRIES}`);
-
-          if (hookAttempt < MAX_HOOKS_RETRIES) {
-            const fixPrompt = buildHooksFixPrompt(hookResults);
-            try {
-              const { result: hookFixResult } = await executeAgent<EngineerResponse>({
-                itemId, role: 'engineer', repoName: repo.name, prompt: fixPrompt,
-                workingDir: agentWorkdir, allowedTools: feedbackEffectiveTools,
-                jsonSchema: feedbackRole.jsonSchema, timeoutMs: ENGINEER_TIMEOUT_MS,
-              });
-              await commitEngineerChanges(agentWorkdir, hookFixResult.output,
-                `fix(${repo.name}): address post-feedback hook failures`, itemId, repo.name);
-            } catch (fixError) {
-              const fixMsg = fixError instanceof Error ? fixError.message : String(fixError);
-              console.error(`[${itemId}/${repo.name}] Post-feedback hooks fix engineer failed: ${fixMsg}`);
-            }
-          }
-        }
-
-        if (!hooksPassed) {
-          console.error(`[${itemId}/${repo.name}] Post-feedback hooks failed after ${MAX_HOOKS_RETRIES} attempts, proceeding to PR`);
-          const errorEvent = createErrorEvent(
-            itemId,
-            `Post-feedback hooks validation failed for ${repo.name} after ${MAX_HOOKS_RETRIES} attempts. Proceeding with PR creation.`,
-            { repoName: repo.name, phase: 'hooks' }
+            repo.name,
+            nextTask.id,
+            'hooks',
+            committed.filesModified
           );
-          await appendJsonl(getItemEventsPath(itemId), errorEvent);
-          eventBus.publish(itemId, errorEvent);
-          break; // review loop を打ち切り、PR 作成へ進む
+          statesByRepo.set(repo.name, inReviewState);
+          taskSucceeded = true;
+          break;
+        } catch (error) {
+          lastError = error instanceof Error ? error.message : String(error);
+          if (attempt < AGENT_MAX_RETRIES) {
+            console.warn(
+              `[${itemId}/${repo.name}] Task ${nextTask.id} attempt ${attempt + 1} failed: ${lastError}, retrying...`
+            );
+            continue;
+          }
         }
       }
 
-      // phaseBase stays the same — next cycle's diff still covers everything
+      if (!taskSucceeded) {
+        const failure = await failTaskWithError(
+          itemId,
+          repo.name,
+          nextTask.id,
+          'engineer',
+          `Task ${nextTask.id} failed for ${repo.name}: ${lastError}`
+        );
+        statesByRepo.set(repo.name, failure.state);
+        failedTaskMessage = failure.errorMessage;
+        break;
+      }
+    } else {
+      console.log(
+        `[${itemId}/${repo.name}] Resuming review for task ${nextTask.id} (${taskIndex + 1}/${repoTasks.length})`
+      );
+    }
+
+    const reviewResult = await runTaskReviewPhase(itemId, plan, repo, nextTask, agentWorkdir);
+    statesByRepo.set(repo.name, reviewResult.state);
+    if (reviewResult.errorMessage) {
+      failedTaskMessage = reviewResult.errorMessage;
+      break;
+    }
+
+    const repoState = statesByRepo.get(repo.name);
+    if (repoState && areRepoTasksCompleted(repoState) && !finalizedRepos.has(repo.name)) {
+      await finalizeCompletedRepo(itemId, repo.name);
+      finalizedRepos.add(repo.name);
     }
   }
 
-  // ─── Phase 3: Push & PR ───
-  await createDraftPrsForAllRepos(itemId, new Set(engineerResults.keys()));
+  if (failedTaskMessage) {
+    throw new Error(failedTaskMessage);
+  }
+
+  await tryFinalizeCompletedRepos();
+
+  const remainingTasks = plan.tasks.filter((task) => {
+    if (targetRepos && !targetRepos.includes(task.repository)) {
+      return false;
+    }
+    const repoState = statesByRepo.get(task.repository);
+    return repoState ? getRepoTaskEntry(repoState, task.id).status !== 'completed' : false;
+  });
+
+  if (remainingTasks.length > 0) {
+    throw new Error(
+      `No runnable tasks remain for item ${itemId}: ${remainingTasks.map((task) => task.id).join(', ')}`
+    );
+  }
 }
 
 function buildWorkerContext(
@@ -951,13 +1233,12 @@ async function buildReviewContext(
   itemId: string,
   repoName: string,
   agentWorkdir: string,
-  reviewBase: string,
+  phaseBase: string,
   currentHead: string,
-  reviewTasks: PlanTask[]
+  reviewTask: PlanTask
 ): Promise<string> {
-  const taskDescriptions = reviewTasks
-    .map((task) => `### Task: ${task.id} - ${task.title}\n${task.description}`)
-    .join('\n\n');
+  const taskDescriptions = `### Task: ${reviewTask.id} - ${reviewTask.title}
+${reviewTask.description}`;
 
   // Read plan.yaml
   let planContent = '';
@@ -971,8 +1252,8 @@ async function buildReviewContext(
   let changedFiles: ChangedFileInfo[] = [];
   let binaryFiles = new Set<string>();
   try {
-    changedFiles = await getChangedFiles(agentWorkdir, reviewBase, currentHead);
-    binaryFiles = await getBinaryFiles(agentWorkdir, reviewBase, currentHead);
+    changedFiles = await getChangedFiles(agentWorkdir, phaseBase, currentHead);
+    binaryFiles = await getBinaryFiles(agentWorkdir, phaseBase, currentHead);
   } catch {
     // Fallback: return minimal context
     return `## Repository: ${repoName}
@@ -1058,7 +1339,7 @@ ${taskDescriptions}`;
 }
 
 function buildFeedbackPrompt(
-  plan: Plan,
+  _plan: Plan,
   repo: ItemRepositoryConfig,
   comments: ReviewComment[],
   diff: string,
@@ -1109,21 +1390,21 @@ export async function getWorkerStatus(
 
   if (itemConfig) {
     for (const repo of itemConfig.repositories) {
-      const devTaskCount = plan?.tasks.filter(t => t.repository === repo.name && isDevRole(t.agent)).length || 0;
-      const devAgent = agents.find(a => a.repoName === repo.name && isDevRole(a.role));
+      const repoTaskCount = plan?.tasks.filter(t => t.repository === repo.name).length || 0;
+      const devAgent = agents.find(a => a.repoName === repo.name && a.role === 'engineer');
       result.push({
         role: 'engineer',
         repoName: repo.name,
-        taskCount: devTaskCount,
+        taskCount: repoTaskCount,
         status: devAgent?.status || 'not_started',
       });
 
-      if (devTaskCount > 0) {
+      if (repoTaskCount > 0) {
         const reviewAgent = agents.find(a => a.repoName === repo.name && a.role === 'review');
         result.push({
           role: 'review',
           repoName: repo.name,
-          taskCount: devTaskCount,
+          taskCount: repoTaskCount,
           status: reviewAgent?.status || 'not_started',
         });
       }

@@ -56,6 +56,18 @@ export function getHookLogDir(itemId: string, repoName: string): string {
   return join(getItemDir(itemId), 'hooks', repoName);
 }
 
+export function getTaskStateDir(itemId: string): string {
+  return join(getWorkspaceRoot(itemId), 'task-state');
+}
+
+export function getRepoTaskStatePath(itemId: string, repoName: string): string {
+  return join(getTaskStateDir(itemId), `${repoName}.yaml`);
+}
+
+export function getTaskStateArchiveDir(itemId: string): string {
+  return join(getTaskStateDir(itemId), 'archive');
+}
+
 export function getRepositoriesPath(): string {
   return join(DATA_DIR, 'repositories.yaml');
 }

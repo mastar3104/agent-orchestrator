@@ -3,10 +3,17 @@ import { createReadStream, existsSync } from 'fs';
 import { createInterface } from 'readline';
 import { dirname } from 'path';
 
+const writeQueues = new Map<string, Promise<void>>();
+
 export async function appendJsonl<T>(filePath: string, data: T): Promise<void> {
-  await mkdir(dirname(filePath), { recursive: true });
-  const line = JSON.stringify(data) + '\n';
-  await appendFile(filePath, line, 'utf-8');
+  const prev = writeQueues.get(filePath) ?? Promise.resolve();
+  const next = prev.then(async () => {
+    await mkdir(dirname(filePath), { recursive: true });
+    const line = JSON.stringify(data) + '\n';
+    await appendFile(filePath, line, 'utf-8');
+  });
+  writeQueues.set(filePath, next.catch(() => {}));
+  return next;
 }
 
 export async function readJsonl<T>(filePath: string): Promise<T[]> {
@@ -16,7 +23,15 @@ export async function readJsonl<T>(filePath: string): Promise<T[]> {
       .trim()
       .split('\n')
       .filter((line) => line.length > 0)
-      .map((line) => JSON.parse(line) as T);
+      .map((line) => {
+        try {
+          return JSON.parse(line) as T;
+        } catch {
+          console.warn(`[jsonl] Skipping corrupt line: ${line.slice(0, 100)}`);
+          return null;
+        }
+      })
+      .filter((item): item is T => item !== null);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return [];
@@ -38,7 +53,11 @@ export async function* streamJsonl<T>(filePath: string): AsyncGenerator<T> {
 
   for await (const line of rl) {
     if (line.trim().length > 0) {
-      yield JSON.parse(line) as T;
+      try {
+        yield JSON.parse(line) as T;
+      } catch {
+        console.warn(`[jsonl] Skipping corrupt line: ${line.slice(0, 100)}`);
+      }
     }
   }
 }

@@ -29,6 +29,9 @@ import type {
   ReviewReceiveCompletedEvent,
   HooksExecutedEvent,
   HookResult,
+  TaskStateChangedEvent,
+  TaskExecutionStatus,
+  TaskProgressPhase,
 } from '@agent-orch/shared';
 
 function createEventId(): string {
@@ -448,6 +451,25 @@ export function createHooksExecutedEvent(
     results,
     allPassed,
     attempt,
+  };
+}
+
+export function createTaskStateChangedEvent(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  status: TaskExecutionStatus,
+  currentPhase?: TaskProgressPhase
+): TaskStateChangedEvent {
+  return {
+    id: createEventId(),
+    type: 'task_state_changed',
+    timestamp: timestamp(),
+    itemId,
+    repoName,
+    taskId,
+    status,
+    currentPhase,
   };
 }
 

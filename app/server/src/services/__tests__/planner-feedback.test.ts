@@ -23,7 +23,9 @@ vi.mock('fs', () => ({
 
 vi.mock('fs/promises', () => ({
   readFile: vi.fn(),
+  mkdir: vi.fn().mockResolvedValue(undefined),
   rename: vi.fn().mockResolvedValue(undefined),
+  writeFile: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../event-bus', () => ({
@@ -53,6 +55,12 @@ vi.mock('../../lib/yaml', () => ({
   stringifyYaml: vi.fn(),
 }));
 
+vi.mock('../task-state-service', () => ({
+  createArchiveTag: vi.fn().mockReturnValue('20260307_000000_abc123'),
+  archiveCurrentTaskStates: vi.fn().mockResolvedValue([]),
+  regenerateTaskStatesForPlan: vi.fn().mockResolvedValue([]),
+}));
+
 import { validatePlanFeedback, planFeedback, formatFeedbacks } from '../planner-service';
 import { executeAgent } from '../agent-service';
 import { getItemConfig } from '../item-service';
@@ -69,9 +77,9 @@ const VALID_PLAN: Plan = {
   summary: 'Test plan',
   createdAt: '2026-01-01T00:00:00Z',
   tasks: [
-    { id: 'task-1', title: 'Task 1', agent: 'engineer', repository: 'repo-a', description: 'desc' },
-    { id: 'task-2', title: 'Task 2', agent: 'engineer', repository: 'repo-a', description: 'desc' },
-    { id: 'task-3', title: 'Task 3', agent: 'review', repository: 'repo-a', description: 'desc' },
+    { id: 'task-1', title: 'Task 1', repository: 'repo-a', description: 'desc' },
+    { id: 'task-2', title: 'Task 2', repository: 'repo-a', description: 'desc' },
+    { id: 'task-3', title: 'Task 3', repository: 'repo-a', description: 'desc' },
   ],
 };
 

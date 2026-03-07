@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+const taskStateStore = vi.hoisted(() => new Map<string, any>());
+
 // ─── Mocks ───
 
 vi.mock('../agent-service', () => ({
@@ -10,6 +12,44 @@ vi.mock('../agent-service', () => ({
 
 vi.mock('../planner-service', () => ({
   getPlan: vi.fn(),
+}));
+
+vi.mock('../task-state-service', () => ({
+  ensureTaskStatesForPlan: vi.fn().mockImplementation(async (itemId: string, plan: any) => {
+    for (const task of plan.tasks || []) {
+      if (!taskStateStore.has(task.repository)) {
+        taskStateStore.set(task.repository, {
+          version: '1',
+          itemId,
+          repository: task.repository,
+          planFingerprint: 'fingerprint',
+          createdAt: '2026-01-01T00:00:00Z',
+          updatedAt: '2026-01-01T00:00:00Z',
+          tasks: (plan.tasks || [])
+            .filter((candidate: any) => candidate.repository === task.repository)
+            .map((candidate: any) => ({
+              id: candidate.id,
+              title: candidate.title,
+              dependencies: candidate.dependencies || [],
+              status: 'pending',
+              attempts: 0,
+            })),
+        });
+      }
+    }
+    return [...taskStateStore.values()];
+  }),
+  readRepoTaskState: vi.fn().mockImplementation(async (_itemId: string, repoName: string) => {
+    const state = taskStateStore.get(repoName);
+    return state ? JSON.parse(JSON.stringify(state)) : null;
+  }),
+  writeRepoTaskState: vi.fn().mockImplementation(async (_itemId: string, state: any) => {
+    taskStateStore.set(state.repository, JSON.parse(JSON.stringify(state)));
+  }),
+}));
+
+vi.mock('../state-service', () => ({
+  deriveRepoStatuses: vi.fn().mockResolvedValue(new Map()),
 }));
 
 vi.mock('../item-service', () => ({
@@ -45,6 +85,15 @@ vi.mock('../../lib/jsonl', () => ({
 vi.mock('../../lib/events', () => ({
   createReviewFindingsExtractedEvent: vi.fn().mockReturnValue({ type: 'review' }),
   createStatusChangedEvent: vi.fn().mockReturnValue({ type: 'status' }),
+  createTaskStateChangedEvent: vi.fn().mockImplementation(
+    (_itemId: string, repoName: string, taskId: string, status: string, currentPhase?: string) => ({
+      type: 'task_state_changed',
+      repoName,
+      taskId,
+      status,
+      currentPhase,
+    })
+  ),
   createHooksExecutedEvent: vi.fn().mockImplementation(
     (_itemId: string, repoName: string, results: any[], allPassed: boolean, attempt: number) => ({
       type: 'hooks_executed',
@@ -135,7 +184,6 @@ function makePlan(repos: string[]) {
       id: `T${i + 1}`,
       title: `Task for ${r}`,
       description: 'desc',
-      agent: 'engineer' as const,
       repository: r,
       files: [],
       dependencies: [],
@@ -197,20 +245,27 @@ function createHookProc(exitCode: number, stdout: string = '', stderr: string = 
 
 function setupSpawnMock(hookResults: { exitCode: number; stdout?: string; stderr?: string }[]) {
   let hookCallIndex = 0;
+  let lastAddedPaths = ['file.ts'];
 
   mockSpawn.mockImplementation((cmd: string, args: string[], _opts?: any) => {
     if (cmd === 'git') {
       if (args[0] === 'rev-parse') return createGitProc('abc123');
       if (args[0] === 'merge-base') return createGitProc('base123');
       if (args[0] === 'diff') {
-        if (args.includes('--cached') && args.includes('--name-only')) return createGitProc('file.ts');
+        if (args.includes('--cached') && args.includes('--name-only')) return createGitProc(lastAddedPaths.join('\n'));
+        if (args.includes('--name-only')) return createGitProc(lastAddedPaths.join('\n'));
         if (args.includes('--name-status')) return createGitProc('M\tfile.ts');
         if (args.includes('--numstat')) return createGitProc('10\t5\tfile.ts');
         return createGitProc('diff content');
       }
       if (args[0] === 'show') return createGitProc('// file content');
       if (args[0] === 'cat-file') return createGitProc('1024');
-      if (args[0] === 'add' || args[0] === 'reset' || args[0] === 'commit') return createGitProc('');
+      if (args[0] === 'add') {
+        const separatorIndex = args.indexOf('--');
+        lastAddedPaths = separatorIndex >= 0 ? args.slice(separatorIndex + 1) : ['file.ts'];
+        return createGitProc('');
+      }
+      if (args[0] === 'reset' || args[0] === 'clean' || args[0] === 'commit') return createGitProc('');
       return createGitProc('');
     }
     if (cmd === 'sh') {
@@ -227,6 +282,7 @@ function setupSpawnMock(hookResults: { exitCode: number; stdout?: string; stderr
 describe('Worker hooks', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    taskStateStore.clear();
   });
 
   it('should proceed to review when no hooks are configured', async () => {
@@ -316,9 +372,26 @@ describe('Worker hooks', () => {
 
     // Fix engineer should have been called
     expect(mockExecuteAgent).toHaveBeenCalledTimes(3);
+
+    const repoState = taskStateStore.get('repo-a');
+    expect(repoState.tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+    });
+    expect(repoState.tasks[0].currentPhase).toBeUndefined();
+
+    const taskStateEvents = vi.mocked(eventBus).publish.mock.calls
+      .map(([, event]) => event)
+      .filter((event: any) => event.type === 'task_state_changed');
+    expect(taskStateEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ repoName: 'repo-a', taskId: 'T1', status: 'in_review', currentPhase: 'hooks' }),
+        expect.objectContaining({ repoName: 'repo-a', taskId: 'T1', status: 'in_review', currentPhase: 'review' }),
+      ])
+    );
   });
 
-  it('should fire error event and skip review/PR when hooks fail after max retries', async () => {
+  it('should fail the current task when hooks fail after max retries', async () => {
     mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
     mockGetItemConfig.mockResolvedValue(
       makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
@@ -334,7 +407,9 @@ describe('Worker hooks', () => {
       .mockResolvedValueOnce(successResult() as any) // initial engineer
       .mockResolvedValueOnce(successResult() as any); // fix engineer
 
-    await expect(startWorkers(ITEM_ID)).rejects.toThrow('All engineer agents failed');
+    await expect(startWorkers(ITEM_ID)).rejects.toThrow(
+      'Hooks validation failed for repo-a during task T1 after 2 attempts'
+    );
 
     // Error event should have been created
     expect(mockCreateErrorEvent).toHaveBeenCalledWith(
@@ -378,25 +453,32 @@ describe('Worker hooks', () => {
     );
   });
 
-  it('should skip PR creation for hooks-failed repos in multi-repo setup', async () => {
+  it('should stop the run before later repos when an earlier task fails hooks', async () => {
     mockGetPlan.mockResolvedValue(makePlan(['repo-a', 'repo-b']) as any);
     mockGetItemConfig.mockResolvedValue(
       makeItemConfig(['repo-a', 'repo-b'], { 'repo-a': ['exit 1'] }) as any
     );
 
+    let lastAddedPaths = ['file.ts'];
     mockSpawn.mockImplementation((cmd: string, args: string[], _opts?: any) => {
       if (cmd === 'git') {
         if (args[0] === 'rev-parse') return createGitProc('abc123');
         if (args[0] === 'merge-base') return createGitProc('base123');
         if (args[0] === 'diff') {
-          if (args.includes('--cached') && args.includes('--name-only')) return createGitProc('file.ts');
+          if (args.includes('--cached') && args.includes('--name-only')) return createGitProc(lastAddedPaths.join('\n'));
+          if (args.includes('--name-only')) return createGitProc(lastAddedPaths.join('\n'));
           if (args.includes('--name-status')) return createGitProc('M\tfile.ts');
           if (args.includes('--numstat')) return createGitProc('10\t5\tfile.ts');
           return createGitProc('diff content');
         }
         if (args[0] === 'show') return createGitProc('// file content');
         if (args[0] === 'cat-file') return createGitProc('1024');
-        if (args[0] === 'add' || args[0] === 'reset' || args[0] === 'commit') return createGitProc('');
+        if (args[0] === 'add') {
+          const separatorIndex = args.indexOf('--');
+          lastAddedPaths = separatorIndex >= 0 ? args.slice(separatorIndex + 1) : ['file.ts'];
+          return createGitProc('');
+        }
+        if (args[0] === 'reset' || args[0] === 'clean' || args[0] === 'commit') return createGitProc('');
         return createGitProc('');
       }
       if (cmd === 'sh') {
@@ -408,18 +490,16 @@ describe('Worker hooks', () => {
 
     mockExecuteAgent.mockResolvedValue(successResult() as any);
 
-    // Should not throw because repo-b succeeds
-    await startWorkers(ITEM_ID);
-
-    // createDraftPrsForAllRepos should be called with only repo-b as successful
-    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(
-      ITEM_ID,
-      expect.any(Set)
+    await expect(startWorkers(ITEM_ID)).rejects.toThrow(
+      'Hooks validation failed for repo-a during task T1 after 2 attempts'
     );
 
-    const successSet = mockCreateDraftPrsForAllRepos.mock.calls[0][1] as Set<string>;
-    expect(successSet.has('repo-b')).toBe(true);
-    expect(successSet.has('repo-a')).toBe(false);
+    expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
+    const engineerTaskCalls = mockExecuteAgent.mock.calls
+      .filter((call) => call[0].role === 'engineer')
+      .map((call) => call[0].currentTask);
+    expect(engineerTaskCalls).toContain('T1: Task for repo-a');
+    expect(engineerTaskCalls).not.toContain('T2: Task for repo-b');
   });
 
   it('fix prompt should not contain role promptTemplate', async () => {
@@ -505,19 +585,26 @@ describe('Worker hooks', () => {
     );
 
     // Create a spawn mock that simulates process killed by signal
+    let lastAddedPaths = ['file.ts'];
     mockSpawn.mockImplementation((cmd: string, args: string[], _opts?: any) => {
       if (cmd === 'git') {
         if (args[0] === 'rev-parse') return createGitProc('abc123');
         if (args[0] === 'merge-base') return createGitProc('base123');
         if (args[0] === 'diff') {
-          if (args.includes('--cached') && args.includes('--name-only')) return createGitProc('file.ts');
+          if (args.includes('--cached') && args.includes('--name-only')) return createGitProc(lastAddedPaths.join('\n'));
+          if (args.includes('--name-only')) return createGitProc(lastAddedPaths.join('\n'));
           if (args.includes('--name-status')) return createGitProc('M\tfile.ts');
           if (args.includes('--numstat')) return createGitProc('10\t5\tfile.ts');
           return createGitProc('diff content');
         }
         if (args[0] === 'show') return createGitProc('// file content');
         if (args[0] === 'cat-file') return createGitProc('1024');
-        if (args[0] === 'add' || args[0] === 'reset' || args[0] === 'commit') return createGitProc('');
+        if (args[0] === 'add') {
+          const separatorIndex = args.indexOf('--');
+          lastAddedPaths = separatorIndex >= 0 ? args.slice(separatorIndex + 1) : ['file.ts'];
+          return createGitProc('');
+        }
+        if (args[0] === 'reset' || args[0] === 'clean' || args[0] === 'commit') return createGitProc('');
         return createGitProc('');
       }
       if (cmd === 'sh') {
@@ -538,7 +625,9 @@ describe('Worker hooks', () => {
 
     mockExecuteAgent.mockResolvedValue(successResult() as any);
 
-    await expect(startWorkers(ITEM_ID)).rejects.toThrow('All engineer agents failed');
+    await expect(startWorkers(ITEM_ID)).rejects.toThrow(
+      'Hooks validation failed for repo-a during task T1 after 2 attempts'
+    );
 
     // Should have created hooks executed events with failures (null exitCode !== 0)
     expect(mockCreateHooksExecutedEvent).toHaveBeenCalled();
@@ -578,7 +667,68 @@ describe('Worker hooks', () => {
     expect(reviewCalls).toHaveLength(2);
   });
 
-  it('should emit error event and still create PR when post-feedback hooks exhaust retries', async () => {
+  it('should persist the union of files modified by engineer, hooks-fix, and review-fix', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    setupSpawnMock([
+      { exitCode: 1, stderr: 'hook failed' },  // initial hooks
+      { exitCode: 0, stdout: 'hook ok' },      // after hooks-fix
+      { exitCode: 0, stdout: 'hook ok' },      // after review-fix
+    ]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce({
+        result: {
+          output: {
+            status: 'success' as const,
+            files_modified: ['engineer.ts'],
+            commit_message: 'feat(repo-a): engineer',
+          },
+        },
+      } as any)
+      .mockResolvedValueOnce({
+        result: {
+          output: {
+            status: 'success' as const,
+            files_modified: ['hooks-fix.ts'],
+            commit_message: 'fix(repo-a): hooks',
+          },
+        },
+      } as any)
+      .mockResolvedValueOnce({
+        result: {
+          output: {
+            review_status: 'request_changes',
+            comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }],
+          },
+        },
+      } as any)
+      .mockResolvedValueOnce({
+        result: {
+          output: {
+            status: 'success' as const,
+            files_modified: ['review-fix.ts'],
+            commit_message: 'fix(repo-a): review',
+          },
+        },
+      } as any)
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'approve', comments: [] } },
+      } as any);
+
+    await startWorkers(ITEM_ID);
+
+    expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      filesModified: expect.arrayContaining(['engineer.ts', 'hooks-fix.ts', 'review-fix.ts']),
+    });
+  });
+
+  it('should fail the run when hooks exhaust retries after review-fix', async () => {
     mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
     mockGetItemConfig.mockResolvedValue(
       makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
@@ -599,25 +749,72 @@ describe('Worker hooks', () => {
       .mockResolvedValueOnce(successResult() as any) // feedback engineer
       .mockResolvedValueOnce(successResult() as any); // hook-fix engineer
 
-    await startWorkers(ITEM_ID);
+    await expect(startWorkers(ITEM_ID)).rejects.toThrow(
+      'Hooks validation failed for repo-a during task T1 after 2 attempts'
+    );
 
-    // Error event should mention post-feedback hooks failure
+    // Error event should mention task-level hooks failure
     expect(mockCreateErrorEvent).toHaveBeenCalledWith(
       ITEM_ID,
-      expect.stringContaining('Post-feedback hooks validation failed'),
+      expect.stringContaining('Hooks validation failed for repo-a during task T1'),
       { repoName: 'repo-a', phase: 'hooks' }
     );
 
-    // PR should still be created (repo-a should be in the set)
-    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(
-      ITEM_ID,
-      expect.any(Set)
-    );
-    const successSet = mockCreateDraftPrsForAllRepos.mock.calls[0][1] as Set<string>;
-    expect(successSet.has('repo-a')).toBe(true);
+    expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
   });
 
-  it('should use isolated log dir for post-feedback hooks', async () => {
+  it('should resume an in-review task without rerunning engineer', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+    setupSpawnMock([{ exitCode: 0, stdout: 'tests pass' }]);
+
+    taskStateStore.set('repo-a', {
+      version: '1',
+      itemId: ITEM_ID,
+      repository: 'repo-a',
+      planFingerprint: 'fingerprint',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+      tasks: [
+        {
+          id: 'T1',
+          title: 'Task for repo-a',
+          dependencies: [],
+          status: 'in_review',
+          attempts: 1,
+          phaseBase: 'phase-base-123',
+          reviewRounds: 0,
+          filesModified: ['file.ts'],
+        },
+      ],
+    });
+
+    mockExecuteAgent.mockResolvedValueOnce({
+      result: { output: { review_status: 'approve', comments: [] } },
+    } as any);
+
+    await startWorkers(ITEM_ID);
+
+    const engineerTaskCalls = mockExecuteAgent.mock.calls.filter(
+      (call) => call[0].role === 'engineer' && String(call[0].currentTask || '').startsWith('T')
+    );
+    expect(engineerTaskCalls).toHaveLength(0);
+    expect(mockExecuteAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        role: 'review',
+        repoName: 'repo-a',
+        currentTask: 'T1: review',
+      })
+    );
+    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(
+      ITEM_ID,
+      new Set(['repo-a'])
+    );
+  });
+
+  it('should use isolated log dir per review round', async () => {
     mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
     mockGetItemConfig.mockResolvedValue(
       makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
@@ -641,10 +838,10 @@ describe('Worker hooks', () => {
 
     await startWorkers(ITEM_ID);
 
-    // Check that mkdir was called with a path containing feedback-cycle-1
+    // Check that mkdir was called with a path containing review-round-2
     const mkdirCalls = mockMkdir.mock.calls.map(call => call[0]);
     const feedbackCycleDirs = mkdirCalls.filter(path =>
-      typeof path === 'string' && path.includes('feedback-cycle-1')
+      typeof path === 'string' && path.includes('review-round-2')
     );
     expect(feedbackCycleDirs.length).toBeGreaterThan(0);
   });
