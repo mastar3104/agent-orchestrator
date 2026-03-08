@@ -1,6 +1,7 @@
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
+import type { ItemDetail } from '@agent-orch/shared';
 import { ItemDetailPage } from '../ItemDetailPage';
 
 vi.mock('../../hooks/useItems', () => ({
@@ -16,9 +17,10 @@ import { useWebSocket } from '../../hooks/useWebSocket';
 
 const mockUseItem = vi.mocked(useItem);
 const mockUseWebSocket = vi.mocked(useWebSocket);
+const startWorkers = vi.fn();
 
-function makeItem() {
-  return {
+function makeItem(overrides: Partial<ItemDetail> = {}): ItemDetail {
+  const base: ItemDetail = {
     id: 'ITEM-1',
     name: 'Workflow Item',
     description: 'desc',
@@ -102,6 +104,14 @@ function makeItem() {
       },
     },
   };
+  return {
+    ...base,
+    ...overrides,
+    repositories: overrides.repositories ?? base.repositories,
+    plan: overrides.plan ?? base.plan,
+    repos: overrides.repos ?? base.repos,
+    workflow: overrides.workflow ?? base.workflow,
+  };
 }
 
 function renderPage() {
@@ -119,13 +129,14 @@ describe('ItemDetailPage workflow UI', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    startWorkers.mockReset();
     mockUseItem.mockReturnValue({
       item: makeItem(),
       loading: false,
       error: null,
       refresh,
       startPlanner: vi.fn(),
-      startWorkers: vi.fn(),
+      startWorkers,
       stopAgent: vi.fn(),
       startReviewReceive: vi.fn(),
       reviewReceiveError: null,
@@ -173,5 +184,70 @@ describe('ItemDetailPage workflow UI', () => {
     });
 
     expect(refresh).toHaveBeenCalled();
+  });
+
+  it('sends retry_failed mode when Retry Failed is clicked', () => {
+    mockUseItem.mockReturnValue({
+      item: makeItem({
+        status: 'error',
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'error',
+            activePhase: 'hooks',
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+      loading: false,
+      error: null,
+      refresh,
+      startPlanner: vi.fn(),
+      startWorkers,
+      stopAgent: vi.fn(),
+      startReviewReceive: vi.fn(),
+      reviewReceiveError: null,
+      submitPlanFeedback: vi.fn(),
+      planFeedbackSubmitting: false,
+      planFeedbackError: null,
+    });
+
+    renderPage();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry Failed (repo-a)' }));
+
+    expect(startWorkers).toHaveBeenCalledWith({ repos: ['repo-a'], mode: 'retry_failed' });
+  });
+
+  it('starts workers without retry mode for ready items', () => {
+    mockUseItem.mockReturnValue({
+      item: makeItem({
+        status: 'ready',
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'ready',
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+      loading: false,
+      error: null,
+      refresh,
+      startPlanner: vi.fn(),
+      startWorkers,
+      stopAgent: vi.fn(),
+      startReviewReceive: vi.fn(),
+      reviewReceiveError: null,
+      submitPlanFeedback: vi.fn(),
+      planFeedbackSubmitting: false,
+      planFeedbackError: null,
+    });
+
+    renderPage();
+    fireEvent.click(screen.getByRole('button', { name: 'Start Workers' }));
+
+    expect(startWorkers).toHaveBeenCalledWith();
   });
 });

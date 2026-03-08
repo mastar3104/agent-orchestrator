@@ -335,7 +335,7 @@ export function ItemDetailPage() {
             <button
               onClick={() => {
                 if (item.status === 'error' && failedRepos.length > 0) {
-                  startWorkers(failedRepos);
+                  startWorkers({ repos: failedRepos, mode: 'retry_failed' });
                 } else {
                   startWorkers();
                 }

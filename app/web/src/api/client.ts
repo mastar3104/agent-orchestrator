@@ -6,6 +6,7 @@ import type {
   ListItemsResponse,
   GetItemResponse,
   Plan,
+  StartWorkersRequest,
   ItemConfig,
   UpdatePlanRequest,
   UpdatePlanResponse,
@@ -110,10 +111,13 @@ export async function updatePlan(
 }
 
 // Workers
-export async function startWorkers(itemId: string, repos?: string[]): Promise<{ started: boolean }> {
+export async function startWorkers(
+  itemId: string,
+  data: StartWorkersRequest = {}
+): Promise<{ started: boolean }> {
   return request<{ started: boolean }>(`/items/${itemId}/workers/start`, {
     method: 'POST',
-    body: JSON.stringify({ repos }),
+    body: JSON.stringify(data),
   });
 }
 

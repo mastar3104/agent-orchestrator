@@ -8,6 +8,7 @@ import type {
   PlanTask,
   AgentRole,
   ItemRepositoryConfig,
+  StartWorkersMode,
   TaskExecutionStatus,
   TaskProgressPhase,
 } from '@agent-orch/shared';
@@ -390,6 +391,37 @@ function selectNextRunnableTask(
       taskState.status === 'in_progress' ||
       taskState.status === 'in_review'
     ) {
+      continue;
+    }
+
+    if (!areDependenciesCompleted(task, taskStateIndex)) {
+      continue;
+    }
+
+    return task;
+  }
+
+  return null;
+}
+
+function selectNextFailedTask(
+  plan: Plan,
+  statesByRepo: Map<string, RepoTaskStateFile>,
+  targetRepos?: string[]
+): PlanTask | null {
+  const taskStateIndex = buildTaskStateIndex(statesByRepo);
+  for (const task of plan.tasks) {
+    if (targetRepos && !targetRepos.includes(task.repository)) {
+      continue;
+    }
+
+    const repoState = statesByRepo.get(task.repository);
+    if (!repoState) {
+      continue;
+    }
+
+    const taskState = repoState.tasks.find((entry) => entry.id === task.id);
+    if (taskState?.status !== 'failed') {
       continue;
     }
 
@@ -922,7 +954,12 @@ async function runTaskReviewPhase(
 
 // ─── Main orchestration ───
 
-export async function startWorkers(itemId: string, targetRepos?: string[]): Promise<void> {
+interface StartWorkersOptions {
+  targetRepos?: string[];
+  mode?: StartWorkersMode;
+}
+
+export async function startWorkers(itemId: string, options: StartWorkersOptions = {}): Promise<void> {
   const plan = await getPlan(itemId);
   if (!plan) {
     throw new Error(`No plan found for item ${itemId}`);
@@ -932,6 +969,9 @@ export async function startWorkers(itemId: string, targetRepos?: string[]): Prom
   if (!itemConfig) {
     throw new Error(`Item config not found for ${itemId}`);
   }
+
+  const targetRepos = options.targetRepos;
+  const mode = options.mode || 'all';
 
   const workspaceRoot = resolve(getWorkspaceRoot(itemId));
 
@@ -986,8 +1026,12 @@ export async function startWorkers(itemId: string, targetRepos?: string[]): Prom
 
   let failedTaskMessage: string | null = null;
   while (true) {
-    const reviewTask = selectInReviewTask(plan, statesByRepo, targetRepos);
-    const nextTask = reviewTask || selectNextRunnableTask(plan, statesByRepo, targetRepos);
+    const reviewTask = mode === 'all' ? selectInReviewTask(plan, statesByRepo, targetRepos) : null;
+    const nextTask = reviewTask || (
+      mode === 'retry_failed'
+        ? selectNextFailedTask(plan, statesByRepo, targetRepos)
+        : selectNextRunnableTask(plan, statesByRepo, targetRepos)
+    );
     if (!nextTask) {
       break;
     }
@@ -1090,6 +1134,24 @@ export async function startWorkers(itemId: string, targetRepos?: string[]): Prom
   }
 
   await tryFinalizeCompletedRepos();
+
+  if (mode === 'retry_failed') {
+    const remainingFailedTasks = plan.tasks.filter((task) => {
+      if (targetRepos && !targetRepos.includes(task.repository)) {
+        return false;
+      }
+      const repoState = statesByRepo.get(task.repository);
+      return repoState ? getRepoTaskEntry(repoState, task.id).status === 'failed' : false;
+    });
+
+    if (remainingFailedTasks.length > 0) {
+      throw new Error(
+        `No retryable failed tasks remain for item ${itemId}: ${remainingFailedTasks.map((task) => task.id).join(', ')}`
+      );
+    }
+
+    return;
+  }
 
   const remainingTasks = plan.tasks.filter((task) => {
     if (targetRepos && !targetRepos.includes(task.repository)) {

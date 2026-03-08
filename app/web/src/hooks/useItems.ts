@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import type { ItemSummary, ItemDetail, CreateItemRequest } from '@agent-orch/shared';
+import type { ItemSummary, ItemDetail, CreateItemRequest, StartWorkersRequest } from '@agent-orch/shared';
 import * as api from '../api/client';
 
 export function useItemList() {
@@ -78,9 +78,9 @@ export function useItem(id: string | undefined) {
     await refresh();
   };
 
-  const startWorkers = async (repos?: string[]) => {
+  const startWorkers = async (request?: StartWorkersRequest) => {
     if (!id) return;
-    await api.startWorkers(id, repos);
+    await api.startWorkers(id, request);
     await refresh();
   };
 

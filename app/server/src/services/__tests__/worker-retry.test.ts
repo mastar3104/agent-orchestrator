@@ -431,17 +431,22 @@ describe('Worker task-state execution', () => {
     expect(cleanCalls.length).toBeGreaterThanOrEqual(5);
   });
 
-  it('does not auto-retry failed tasks on subsequent startWorkers calls', async () => {
+  it('mode=all skips failed tasks and continues with later runnable tasks', async () => {
     mockGetPlan.mockResolvedValue(
       makePlan([
         { id: 'T1', title: 'Task 1', repository: 'repo-a' },
-        { id: 'T2', title: 'Task 2', repository: 'repo-a' },
+        { id: 'T2', title: 'Task 2', repository: 'repo-a', dependencies: ['T1'] },
+        { id: 'T3', title: 'Task 3', repository: 'repo-a' },
       ]) as any
     );
 
+    let t1Attempts = 0;
+    const currentTasks: string[] = [];
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer') {
-        if (params.currentTask === 'T2: Task 2') {
+        currentTasks.push(params.currentTask);
+        if (params.currentTask === 'T1: Task 1' && t1Attempts < 2) {
+          t1Attempts += 1;
           throw new Error('boom');
         }
         return engineerSuccess();
@@ -452,21 +457,62 @@ describe('Worker task-state execution', () => {
       throw new Error(`Unexpected role: ${params.role}`);
     });
 
-    // First run: T1 completes, T2 fails
-    await expect(startWorkers(ITEM_ID)).rejects.toThrow('Task T2 failed for repo-a: boom');
+    await expect(startWorkers(ITEM_ID)).rejects.toThrow('Task T1 failed for repo-a: boom');
 
     expect(getRepoTaskState('repo-a').tasks).toEqual([
-      expect.objectContaining({ id: 'T1', status: 'completed' }),
-      expect.objectContaining({ id: 'T2', status: 'failed', attempts: 1 }),
+      expect.objectContaining({ id: 'T1', status: 'failed', attempts: 1 }),
+      expect.objectContaining({ id: 'T2', status: 'pending', attempts: 0 }),
+      expect.objectContaining({ id: 'T3', status: 'pending', attempts: 0 }),
     ]);
 
-    // Second run: No more runnable tasks (T2 is failed and skipped, T1 is completed)
-    await expect(startWorkers(ITEM_ID)).rejects.toThrow('No runnable tasks remain for item');
+    currentTasks.length = 0;
+    await expect(startWorkers(ITEM_ID, { mode: 'all' })).rejects.toThrow('No runnable tasks remain for item');
 
     expect(getRepoTaskState('repo-a').tasks).toEqual([
-      expect.objectContaining({ id: 'T1', status: 'completed' }),
-      expect.objectContaining({ id: 'T2', status: 'failed', attempts: 1 }),
+      expect.objectContaining({ id: 'T1', status: 'failed', attempts: 1 }),
+      expect.objectContaining({ id: 'T2', status: 'pending', attempts: 0 }),
+      expect.objectContaining({ id: 'T3', status: 'completed', attempts: 1 }),
     ]);
+    expect(currentTasks).toEqual(['T3: Task 3']);
+  });
+
+  it('retry_failed reruns only failed tasks and leaves unrelated pending tasks untouched', async () => {
+    mockGetPlan.mockResolvedValue(
+      makePlan([
+        { id: 'T1', title: 'Task 1', repository: 'repo-a' },
+        { id: 'T2', title: 'Task 2', repository: 'repo-a', dependencies: ['T1'] },
+        { id: 'T3', title: 'Task 3', repository: 'repo-a' },
+      ]) as any
+    );
+
+    let t1Attempts = 0;
+    const currentTasks: string[] = [];
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        currentTasks.push(params.currentTask);
+        if (params.currentTask === 'T1: Task 1' && t1Attempts < 2) {
+          t1Attempts += 1;
+          throw new Error('boom');
+        }
+        return engineerSuccess();
+      }
+      if (params.role === 'review') {
+        return reviewApprove();
+      }
+      throw new Error(`Unexpected role: ${params.role}`);
+    });
+
+    await expect(startWorkers(ITEM_ID)).rejects.toThrow('Task T1 failed for repo-a: boom');
+
+    currentTasks.length = 0;
+    await expect(startWorkers(ITEM_ID, { mode: 'retry_failed' })).resolves.toBeUndefined();
+
+    expect(getRepoTaskState('repo-a').tasks).toEqual([
+      expect.objectContaining({ id: 'T1', status: 'completed', attempts: 2 }),
+      expect.objectContaining({ id: 'T2', status: 'pending', attempts: 0 }),
+      expect.objectContaining({ id: 'T3', status: 'pending', attempts: 0 }),
+    ]);
+    expect(currentTasks).toEqual(['T1: Task 1']);
   });
 
   it('normalizes stale in-progress tasks to failed and skips them', async () => {

@@ -22,6 +22,7 @@ import { readJsonl } from '../lib/jsonl';
 import { getItemEventsPath, getAgentEventsPath, getItemPlanPath, getWorkspaceRoot } from '../lib/paths';
 import { readYamlSafe } from '../lib/yaml';
 import type { Plan } from '@agent-orch/shared';
+import { readRepoTaskState, type RepoTaskStateFile } from './task-state-service';
 
 /**
  * Map old agent statuses to new ones for backward compat with persisted events.
@@ -320,7 +321,78 @@ export async function deriveRepoStatuses(itemId: string): Promise<Map<string, Re
     }
   }
 
+  await overlayExecutionStateFromTaskState(itemId, repoStates, currentPlanRepos);
+
   return repoStates;
+}
+
+async function overlayExecutionStateFromTaskState(
+  itemId: string,
+  repoStates: Map<string, RepoDerivedState>,
+  currentPlanRepos: Set<string> | null
+): Promise<void> {
+  if (!currentPlanRepos || currentPlanRepos.size === 0) {
+    return;
+  }
+
+  for (const repoName of currentPlanRepos) {
+    ensureRepo(repoStates, repoName, currentPlanRepos);
+    const persistedState = await readRepoTaskState(itemId, repoName);
+    const repoState = repoStates.get(repoName);
+    if (!persistedState || !repoState) {
+      continue;
+    }
+    applyExecutionStateFromTaskState(repoState, persistedState);
+  }
+}
+
+function applyExecutionStateFromTaskState(
+  repoState: RepoDerivedState,
+  taskState: RepoTaskStateFile
+): void {
+  if (repoState.status === 'review_receiving' || repoState.activePhase === 'review_receive') {
+    return;
+  }
+  if (repoState.status === 'completed') {
+    return;
+  }
+  if (repoState.status === 'error' && repoState.activePhase === 'pr') {
+    return;
+  }
+
+  const failedTask = taskState.tasks.find((task) => task.status === 'failed');
+  if (failedTask) {
+    repoState.status = 'error';
+    repoState.activePhase = failedTask.currentPhase || 'engineer';
+    repoState.lastErrorMessage = failedTask.lastError;
+    return;
+  }
+
+  const runningTask = taskState.tasks.find(
+    (task) => task.status === 'in_progress' || task.status === 'in_review'
+  );
+  if (runningTask) {
+    repoState.status = 'running';
+    repoState.activePhase = runningTask.currentPhase || 'engineer';
+    repoState.lastErrorMessage = undefined;
+    return;
+  }
+
+  const hasUnfinishedTask = taskState.tasks.some((task) => task.status !== 'completed');
+  if (hasUnfinishedTask) {
+    const hasCompletedTask = taskState.tasks.some((task) => task.status === 'completed');
+    if (repoState.status === 'error' && !hasCompletedTask) {
+      return;
+    }
+    repoState.status = 'ready';
+    repoState.activePhase = undefined;
+    repoState.lastErrorMessage = undefined;
+    return;
+  }
+
+  repoState.status = 'running';
+  repoState.activePhase = 'pr';
+  repoState.lastErrorMessage = undefined;
 }
 
 function ensureRepo(

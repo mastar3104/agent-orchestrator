@@ -16,6 +16,10 @@ vi.mock('../../lib/yaml', () => ({
   readYamlSafe: vi.fn().mockResolvedValue(null),
 }));
 
+vi.mock('../task-state-service', () => ({
+  readRepoTaskState: vi.fn().mockResolvedValue(null),
+}));
+
 vi.mock('fs', () => ({
   existsSync: vi.fn().mockReturnValue(false),
 }));
@@ -27,9 +31,11 @@ vi.mock('fs/promises', () => ({
 import { deriveItemStatus, deriveRepoStatuses } from '../state-service';
 import { readJsonl } from '../../lib/jsonl';
 import { readYamlSafe } from '../../lib/yaml';
+import { readRepoTaskState } from '../task-state-service';
 
 const mockReadJsonl = vi.mocked(readJsonl);
 const mockReadYamlSafe = vi.mocked(readYamlSafe);
+const mockReadRepoTaskState = vi.mocked(readRepoTaskState);
 
 function makeEvent(type: string, extra: Record<string, unknown> = {}): ItemEvent {
   return {
@@ -48,10 +54,27 @@ function setPlanRepos(repos: string[]) {
   } as any);
 }
 
+function makeTaskState(
+  repoName: string,
+  tasks: Array<Record<string, unknown>>
+) {
+  return {
+    version: '1',
+    itemId: 'item-1',
+    repository: repoName,
+    planFingerprint: 'fingerprint',
+    createdAt: '2026-01-01T00:00:00Z',
+    updatedAt: '2026-01-01T00:00:00Z',
+    tasks,
+  } as any;
+}
+
 describe('deriveItemStatus - basic', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockReadYamlSafe.mockResolvedValue(null);
+    mockReadRepoTaskState.mockReset();
+    mockReadRepoTaskState.mockResolvedValue(null);
   });
 
   it('returns created for no events', async () => {
@@ -64,6 +87,8 @@ describe('deriveItemStatus - error check after running check', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockReadYamlSafe.mockResolvedValue(null);
+    mockReadRepoTaskState.mockReset();
+    mockReadRepoTaskState.mockResolvedValue(null);
   });
 
   it('returns running when agent errored but retry is running', async () => {
@@ -187,31 +212,97 @@ describe('deriveRepoStatuses', () => {
     expect(statuses.get('repoA')?.status).toBe('completed');
   });
 
-  it('hooks failure → retry success → no PR yet → repo=running', async () => {
+  it('all tasks completed and no PR yet → repo=running', async () => {
     setPlanRepos(['repoA']);
+    mockReadRepoTaskState.mockResolvedValue({
+      version: '1',
+      itemId: 'item-1',
+      repository: 'repoA',
+      planFingerprint: 'fingerprint',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+      tasks: [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          dependencies: [],
+          status: 'completed',
+          attempts: 1,
+        },
+      ],
+    } as any);
     mockReadJsonl.mockResolvedValue([
       makeEvent('plan_created', { planPath: '/plan.yaml' }),
-      makeEvent('agent_started', { agentId: 'A', role: 'engineer', repoName: 'repoA' }),
-      makeEvent('agent_exited', { agentId: 'A', exitCode: 0 }),
-      makeEvent('hooks_executed', { repoName: 'repoA', allPassed: false, attempt: 1, results: [] }),
-      makeEvent('error', { repoName: 'repoA', phase: 'hooks', message: 'Hooks validation failed for repoA' }),
       makeEvent('agent_started', { agentId: 'B', role: 'engineer', repoName: 'repoA' }),
       makeEvent('agent_exited', { agentId: 'B', exitCode: 0 }),
       makeEvent('hooks_executed', { repoName: 'repoA', allPassed: true, attempt: 1, results: [] }),
     ]);
 
     const statuses = await deriveRepoStatuses('item-1');
-    // hooks passed but PR not created yet — agent exited with 0, hooks good → but no pr_created
-    // status should still be whatever it was after hooks_executed (running maintained from agent_started)
-    // Actually after agent_exited(exitCode=0) the status stays at whatever hooks did
-    // Since hooks allPassed=true doesn't change status, and after agent_exited(0) doesn't set error,
-    // the status was set to 'running' by agent_started B, then agent_exited 0 doesn't change it (only sets error on non-0)
-    // So it remains 'running' — correct!
     expect(statuses.get('repoA')?.status).toBe('running');
+    expect(statuses.get('repoA')?.activePhase).toBe('pr');
+  });
+
+  it('retry success with pending tasks remaining → repo/item ready', async () => {
+    setPlanRepos(['repoA']);
+    mockReadRepoTaskState.mockResolvedValue({
+      version: '1',
+      itemId: 'item-1',
+      repository: 'repoA',
+      planFingerprint: 'fingerprint',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+      tasks: [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          dependencies: [],
+          status: 'completed',
+          attempts: 2,
+        },
+        {
+          id: 'T2',
+          title: 'Task 2',
+          dependencies: [],
+          status: 'pending',
+          attempts: 0,
+        },
+      ],
+    } as any);
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'A', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('error', { repoName: 'repoA', phase: 'hooks', message: 'Hooks failed' }),
+      makeEvent('agent_exited', { agentId: 'A', exitCode: 1 }),
+      makeEvent('agent_started', { agentId: 'B', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('agent_exited', { agentId: 'B', exitCode: 0 }),
+      makeEvent('hooks_executed', { repoName: 'repoA', allPassed: true, attempt: 1, results: [] }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')?.status).toBe('ready');
+    expect(statuses.get('repoA')?.activePhase).toBeUndefined();
+    expect(await deriveItemStatus('item-1')).toBe('ready');
   });
 
   it('multi-repo: repoA hooks failure, repoB hooks pass', async () => {
     setPlanRepos(['repoA', 'repoB']);
+    mockReadRepoTaskState.mockImplementation(async (_itemId, repoName) => {
+      if (repoName === 'repoA') {
+        return makeTaskState('repoA', [
+          {
+            id: 'T1',
+            title: 'Task 1',
+            dependencies: [],
+            status: 'failed',
+            currentPhase: 'hooks',
+            attempts: 1,
+            lastError: 'Hooks validation failed for repoA after 2 attempts',
+          },
+        ]);
+      }
+      return null;
+    });
     mockReadJsonl.mockResolvedValue([
       makeEvent('plan_created', { planPath: '/plan.yaml' }),
       // repoA fails
@@ -264,6 +355,19 @@ describe('deriveRepoStatuses', () => {
 
   it('review_receive_completed (no new comments, originally error) → restores error', async () => {
     setPlanRepos(['repoA']);
+    mockReadRepoTaskState.mockResolvedValue(
+      makeTaskState('repoA', [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          dependencies: [],
+          status: 'failed',
+          currentPhase: 'hooks',
+          attempts: 1,
+          lastError: 'Hooks failed',
+        },
+      ])
+    );
     mockReadJsonl.mockResolvedValue([
       makeEvent('plan_created', { planPath: '/plan.yaml' }),
       makeEvent('agent_started', { agentId: 'A', role: 'engineer', repoName: 'repoA' }),
@@ -279,6 +383,7 @@ describe('deriveRepoStatuses', () => {
 
   it('review_receive_started → plan_created(repo in plan) → review_receive_completed → ready', async () => {
     setPlanRepos(['repoA']);
+    mockReadRepoTaskState.mockResolvedValue(null);
     mockReadJsonl.mockResolvedValue([
       makeEvent('plan_created', { planPath: '/plan.yaml' }),
       makeEvent('agent_started', { agentId: 'A', role: 'engineer', repoName: 'repoA' }),
@@ -315,6 +420,7 @@ describe('deriveRepoStatuses', () => {
 
   it('plan created → in-scope repos ready, item.status=ready', async () => {
     setPlanRepos(['repoA']);
+    mockReadRepoTaskState.mockResolvedValue(null);
     mockReadJsonl.mockResolvedValue([
       makeEvent('plan_created', { planPath: '/plan.yaml' }),
     ]);
@@ -326,6 +432,7 @@ describe('deriveRepoStatuses', () => {
 
   it('new plan_created after error cycle → old errors dont leak to new cycle', async () => {
     setPlanRepos(['repoA']);
+    mockReadRepoTaskState.mockResolvedValue(null);
     mockReadJsonl.mockResolvedValue([
       makeEvent('plan_created', { planPath: '/plan.yaml' }),
       makeEvent('agent_started', { agentId: 'A', role: 'engineer', repoName: 'repoA' }),
@@ -342,6 +449,19 @@ describe('deriveRepoStatuses', () => {
 
   it('legacy error (agentId only) is attributed to repo via agent map', async () => {
     setPlanRepos(['repoA']);
+    mockReadRepoTaskState.mockResolvedValue(
+      makeTaskState('repoA', [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          dependencies: [],
+          status: 'failed',
+          currentPhase: 'engineer',
+          attempts: 1,
+          lastError: 'Something failed',
+        },
+      ])
+    );
     mockReadJsonl.mockResolvedValue([
       makeEvent('plan_created', { planPath: '/plan.yaml' }),
       makeEvent('agent_started', { agentId: 'A', role: 'engineer', repoName: 'repoA' }),
@@ -355,6 +475,19 @@ describe('deriveRepoStatuses', () => {
 
   it('legacy hooks error message resolves repo via regex', async () => {
     setPlanRepos(['myrepo']);
+    mockReadRepoTaskState.mockResolvedValue(
+      makeTaskState('myrepo', [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          dependencies: [],
+          status: 'failed',
+          currentPhase: 'hooks',
+          attempts: 1,
+          lastError: 'Hooks validation failed for myrepo after 2 attempts',
+        },
+      ])
+    );
     mockReadJsonl.mockResolvedValue([
       makeEvent('plan_created', { planPath: '/plan.yaml' }),
       makeEvent('agent_started', { agentId: 'A', role: 'engineer', repoName: 'myrepo' }),
@@ -368,6 +501,19 @@ describe('deriveRepoStatuses', () => {
 
   it('structured error (repoName + phase) is correctly attributed', async () => {
     setPlanRepos(['repoA']);
+    mockReadRepoTaskState.mockResolvedValue(
+      makeTaskState('repoA', [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          dependencies: [],
+          status: 'failed',
+          currentPhase: 'hooks',
+          attempts: 1,
+          lastError: 'Hooks failed',
+        },
+      ])
+    );
     mockReadJsonl.mockResolvedValue([
       makeEvent('plan_created', { planPath: '/plan.yaml' }),
       makeEvent('agent_started', { agentId: 'A', role: 'engineer', repoName: 'repoA' }),
@@ -386,6 +532,8 @@ describe('deriveItemStatus - worker partial re-run scenarios', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockReadYamlSafe.mockResolvedValue(null);
+    mockReadRepoTaskState.mockReset();
+    mockReadRepoTaskState.mockResolvedValue(null);
   });
 
   it('returns ready when plan exists but no workers started', async () => {
@@ -416,6 +564,8 @@ describe('deriveRepoStatuses - status_changed(stopped) recovery', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockReadYamlSafe.mockResolvedValue(null);
+    mockReadRepoTaskState.mockReset();
+    mockReadRepoTaskState.mockResolvedValue(null);
   });
 
   it('engineer stopped (running→stopped) → repo error', async () => {

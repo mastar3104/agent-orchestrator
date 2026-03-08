@@ -59,6 +59,13 @@ export interface PlanFeedbackRequest {
   feedbacks: PlanFeedbackItem[];
 }
 
+export type StartWorkersMode = 'all' | 'retry_failed';
+
+export interface StartWorkersRequest {
+  repos?: string[];
+  mode?: StartWorkersMode;
+}
+
 // Response types
 export interface ApiResponse<T> {
   success: boolean;

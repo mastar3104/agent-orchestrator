@@ -7,6 +7,7 @@ import type {
   AgentExecutionOutput,
   Plan,
   PlanFeedbackItem,
+  StartWorkersRequest,
 } from '@agent-orch/shared';
 import {
   stopAgent,
@@ -236,11 +237,13 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
   // Start all workers (async — returns 202 immediately)
   fastify.post<{
     Params: { id: string };
-    Body: { repos?: string[] };
+    Body: StartWorkersRequest;
     Reply: ApiResponse<{ started: boolean }>;
   }>('/items/:id/workers/start', async (request, reply) => {
     const itemId = request.params.id;
-    const targetRepos = (request.body as { repos?: string[] })?.repos;
+    const startWorkersRequest = request.body || {};
+    const targetRepos = startWorkersRequest.repos;
+    const mode = startWorkersRequest.mode;
 
     if (isItemLocked(itemId)) {
       return reply.status(409).send({
@@ -251,7 +254,7 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
 
     // Fire-and-forget with item lock + error logging
     withItemLock(itemId, async () => {
-      await startWorkers(itemId, targetRepos);
+      await startWorkers(itemId, { targetRepos, mode });
     }).catch(async (err) => {
       const message = err instanceof Error ? err.message : 'Unknown error';
       console.error(`[${itemId}] Workers failed:`, message);
