@@ -7,10 +7,11 @@ import type {
 import { readYamlSafe, writeYaml } from '../lib/yaml';
 import { getRepositoriesPath } from '../lib/paths';
 import { sanitizeRepoAllowedTools } from '../lib/role-loader';
+import { normalizeGitRepository } from '../lib/repository-config';
 
 async function loadRepositories(): Promise<GitRepository[]> {
   const repos = await readYamlSafe<GitRepository[]>(getRepositoriesPath());
-  return repos || [];
+  return (repos || []).map(normalizeGitRepository);
 }
 
 async function saveRepositories(repos: GitRepository[]): Promise<void> {

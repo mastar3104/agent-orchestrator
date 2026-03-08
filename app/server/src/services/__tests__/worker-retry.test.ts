@@ -445,7 +445,7 @@ describe('Worker task-state execution', () => {
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer') {
         currentTasks.push(params.currentTask);
-        if (params.currentTask === 'T1: Task 1' && t1Attempts < 2) {
+        if (params.currentTask === 'T1: Task 1' && t1Attempts < 3) {
           t1Attempts += 1;
           throw new Error('boom');
         }
@@ -490,7 +490,7 @@ describe('Worker task-state execution', () => {
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer') {
         currentTasks.push(params.currentTask);
-        if (params.currentTask === 'T1: Task 1' && t1Attempts < 2) {
+        if (params.currentTask === 'T1: Task 1' && t1Attempts < 3) {
           t1Attempts += 1;
           throw new Error('boom');
         }
@@ -601,7 +601,7 @@ describe('Worker task-state execution', () => {
       'Review feedback handling failed for repo-a during task T1'
     );
 
-    expect(feedbackAttempts).toBe(2);
+    expect(feedbackAttempts).toBe(3);
     expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
   });
 

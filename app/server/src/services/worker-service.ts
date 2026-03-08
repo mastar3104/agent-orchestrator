@@ -46,13 +46,13 @@ import {
   type RepoTaskStateTask,
 } from './task-state-service';
 import { deriveRepoStatuses } from './state-service';
+import { resolveHooksMaxAttempts } from '../lib/repository-config';
 
 const MAX_FEEDBACK_ROUNDS = 2;
 const MAX_DIFF_LINES = 20000;
 const REVIEW_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-const ENGINEER_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes
-const AGENT_MAX_RETRIES = 1;
-const MAX_HOOKS_RETRIES = 2;
+const ENGINEER_TIMEOUT_MS = 50 * 60 * 1000; // 50 minutes
+const AGENT_MAX_RETRIES = 2;
 const HOOK_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes per command
 const MAX_OUTPUT_LENGTH = 2000;
 
@@ -332,6 +332,14 @@ function buildTaskStateIndex(statesByRepo: Map<string, RepoTaskStateFile>): Map<
   return index;
 }
 
+function buildPlanTaskIndex(plan: Plan): Map<string, PlanTask> {
+  return new Map(plan.tasks.map((task) => [task.id, task]));
+}
+
+function isHooksFailedTask(taskState: RepoTaskStateTask | undefined): boolean {
+  return taskState?.status === 'failed' && taskState.currentPhase === 'hooks';
+}
+
 function areDependenciesCompleted(
   task: PlanTask,
   taskStateIndex: Map<string, RepoTaskStateTask>
@@ -433,6 +441,77 @@ function selectNextFailedTask(
   }
 
   return null;
+}
+
+function isPendingTaskBlockedByHookFailures(
+  task: PlanTask,
+  planTaskIndex: Map<string, PlanTask>,
+  taskStateIndex: Map<string, RepoTaskStateTask>,
+  visiting: Set<string> = new Set()
+): boolean {
+  const taskState = taskStateIndex.get(task.id);
+  if (taskState?.status !== 'pending') {
+    return false;
+  }
+
+  const dependencies = task.dependencies || [];
+  if (dependencies.length === 0 || visiting.has(task.id)) {
+    return false;
+  }
+
+  visiting.add(task.id);
+  let hasBlockingDependency = false;
+
+  for (const dependencyId of dependencies) {
+    const dependencyState = taskStateIndex.get(dependencyId);
+    if (!dependencyState) {
+      visiting.delete(task.id);
+      return false;
+    }
+
+    if (dependencyState.status === 'completed') {
+      continue;
+    }
+
+    if (isHooksFailedTask(dependencyState)) {
+      hasBlockingDependency = true;
+      continue;
+    }
+
+    if (dependencyState.status === 'pending') {
+      const dependencyTask = planTaskIndex.get(dependencyId);
+      if (
+        dependencyTask &&
+        isPendingTaskBlockedByHookFailures(dependencyTask, planTaskIndex, taskStateIndex, visiting)
+      ) {
+        hasBlockingDependency = true;
+        continue;
+      }
+    }
+
+    visiting.delete(task.id);
+    return false;
+  }
+
+  visiting.delete(task.id);
+  return hasBlockingDependency;
+}
+
+function canIgnoreRemainingTasksAfterHookFailures(
+  plan: Plan,
+  statesByRepo: Map<string, RepoTaskStateFile>,
+  remainingTasks: PlanTask[]
+): boolean {
+  const taskStateIndex = buildTaskStateIndex(statesByRepo);
+  const planTaskIndex = buildPlanTaskIndex(plan);
+
+  return remainingTasks.every((task) => {
+    const taskState = taskStateIndex.get(task.id);
+    return (
+      isHooksFailedTask(taskState) ||
+      isPendingTaskBlockedByHookFailures(task, planTaskIndex, taskStateIndex)
+    );
+  });
 }
 
 async function markTaskInProgress(
@@ -713,9 +792,11 @@ async function runTaskHooksPhase(
     throw new Error(`Task state missing for repo ${repo.name}`);
   }
 
-  for (let hookAttempt = 1; hookAttempt <= MAX_HOOKS_RETRIES; hookAttempt++) {
+  const hooksMaxAttempts = resolveHooksMaxAttempts(repo.hooksMaxAttempts);
+
+  for (let hookAttempt = 1; hookAttempt <= hooksMaxAttempts; hookAttempt++) {
     console.log(
-      `[${itemId}/${repo.name}] Running hooks for ${task.id} (attempt ${hookAttempt}/${MAX_HOOKS_RETRIES})`
+      `[${itemId}/${repo.name}] Running hooks for ${task.id} (attempt ${hookAttempt}/${hooksMaxAttempts})`
     );
     const hookResults = await runHooks(hooks, agentWorkdir, hookLogDir, hookAttempt);
     const allPassed = hookResults.every((result) => result.exitCode === 0);
@@ -728,7 +809,7 @@ async function runTaskHooksPhase(
       return latestState;
     }
 
-    if (hookAttempt < MAX_HOOKS_RETRIES) {
+    if (hookAttempt < hooksMaxAttempts) {
       const fixPrompt = buildHooksFixPrompt(hookResults);
       try {
         const committed = await runEngineerAttemptWithCleanup({
@@ -756,7 +837,7 @@ async function runTaskHooksPhase(
   }
 
   throw new Error(
-    `Hooks validation failed for ${repo.name} during task ${task.id} after ${MAX_HOOKS_RETRIES} attempts`
+    `Hooks validation failed for ${repo.name} during task ${task.id} after ${hooksMaxAttempts} attempts`
   );
 }
 
@@ -766,7 +847,7 @@ async function runTaskReviewPhase(
   repo: ItemRepositoryConfig,
   task: PlanTask,
   agentWorkdir: string
-): Promise<{ state: RepoTaskStateFile; errorMessage?: string }> {
+): Promise<{ state: RepoTaskStateFile; errorMessage?: string; shouldAbortRun?: boolean }> {
   const reviewerRole = getRole('reviewer');
   const engineerRole = getRole('engineer');
   const effectiveTools = mergeAllowedTools(engineerRole.allowedTools, repo.allowedTools);
@@ -799,7 +880,8 @@ async function runTaskReviewPhase(
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return failTaskWithError(itemId, repo.name, task.id, 'hooks', message);
+      const failure = await failTaskWithError(itemId, repo.name, task.id, 'hooks', message);
+      return { state: failure.state, errorMessage: failure.errorMessage, shouldAbortRun: false };
     }
 
     currentState = await markTaskInReview(itemId, repo.name, task.id, 'review');
@@ -847,13 +929,14 @@ async function runTaskReviewPhase(
     }
 
     if (!reviewResponse) {
-      return failTaskWithError(
+      const failure = await failTaskWithError(
         itemId,
         repo.name,
         task.id,
         'review',
         `Review failed for ${repo.name} during task ${task.id}: ${reviewError}`
       );
+      return { state: failure.state, errorMessage: failure.errorMessage, shouldAbortRun: true };
     }
 
     const comments = reviewResponse.comments ?? [];
@@ -941,13 +1024,14 @@ async function runTaskReviewPhase(
     }
 
     if (!feedbackSucceeded) {
-      return failTaskWithError(
+      const failure = await failTaskWithError(
         itemId,
         repo.name,
         task.id,
         'review',
         `Review feedback handling failed for ${repo.name} during task ${task.id}: ${feedbackError}`
       );
+      return { state: failure.state, errorMessage: failure.errorMessage, shouldAbortRun: true };
     }
   }
 }
@@ -1118,6 +1202,9 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
     const reviewResult = await runTaskReviewPhase(itemId, plan, repo, nextTask, agentWorkdir);
     statesByRepo.set(repo.name, reviewResult.state);
     if (reviewResult.errorMessage) {
+      if (reviewResult.shouldAbortRun === false) {
+        continue;
+      }
       failedTaskMessage = reviewResult.errorMessage;
       break;
     }
@@ -1162,6 +1249,9 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
   });
 
   if (remainingTasks.length > 0) {
+    if (canIgnoreRemainingTasksAfterHookFailures(plan, statesByRepo, remainingTasks)) {
+      return;
+    }
     throw new Error(
       `No runnable tasks remain for item ${itemId}: ${remainingTasks.map((task) => task.id).join(', ')}`
     );

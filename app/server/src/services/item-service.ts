@@ -29,6 +29,7 @@ import type {
   WorkflowStageStatus,
 } from '@agent-orch/shared';
 import { getRepository, createRepository } from './repository-service';
+import { normalizeItemConfig } from '../lib/repository-config';
 import { sanitizeRepoAllowedTools } from '../lib/role-loader';
 import { readYaml, writeYaml, readYamlSafe } from '../lib/yaml';
 import { appendJsonl, readJsonl } from '../lib/jsonl';
@@ -86,6 +87,7 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
         linkMode: savedRepo.linkMode,
         allowedTools: repoInput.allowedTools || savedRepo.allowedTools,
         hooks: savedRepo.hooks,
+        hooksMaxAttempts: savedRepo.hooksMaxAttempts,
       };
     } else if (repoInput.repository) {
       // Use directly provided repository config
@@ -324,9 +326,6 @@ async function cloneRemoteRepo(
   }
 }
 
-/** @deprecated Use setupWorkspace instead */
-export const cloneRepo = setupWorkspace;
-
 export async function listItems(): Promise<ItemSummary[]> {
   const itemsDir = getItemsDir();
 
@@ -368,7 +367,7 @@ export async function getItemConfig(itemId: string): Promise<ItemConfig | null> 
   if (config && !config.repositories) {
     throw new Error(`Legacy item.yaml detected for ${itemId}: missing 'repositories' field. Please recreate this item.`);
   }
-  return config;
+  return config ? normalizeItemConfig(config) : null;
 }
 
 const WORKFLOW_STAGE_LABELS: Record<WorkflowStageId, string> = {

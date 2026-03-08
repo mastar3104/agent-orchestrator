@@ -12,6 +12,8 @@ export interface GitRepository {
   allowedTools?: string[];
   /** Engineer完了後に順次実行するバリデーションコマンド。失敗時は自動修正を試みる。 */
   hooks?: string[];
+  /** hooks の初回実行を含む最大試行回数。saved repository YAML からのみ注入する。 */
+  hooksMaxAttempts?: number;
   createdAt: string;
   updatedAt: string;
 }

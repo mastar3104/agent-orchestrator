@@ -10,6 +10,7 @@ export interface ItemRepositoryConfig {
   /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
   allowedTools?: string[];
   hooks?: string[];
+  hooksMaxAttempts?: number;
 }
 
 export interface ItemConfig {
