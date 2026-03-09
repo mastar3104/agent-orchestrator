@@ -816,6 +816,99 @@ describe('Worker hooks', () => {
     // Review should have been called twice (review loop continued after post-feedback hooks passed)
     const reviewCalls = mockExecuteAgent.mock.calls.filter(call => call[0].role === 'review');
     expect(reviewCalls).toHaveLength(2);
+    const reviewFixCalls = mockExecuteAgent.mock.calls.filter(call => call[0].currentTask === 'T1: review-fix');
+    expect(reviewFixCalls).toHaveLength(1);
+  });
+
+  it('should allow three review cycles with two review-fix rounds before approval', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    setupSpawnMock([
+      { exitCode: 0, stdout: 'tests pass' }, // Phase 1 hook
+      { exitCode: 0, stdout: 'tests pass' }, // Post-feedback hook 1
+      { exitCode: 0, stdout: 'tests pass' }, // Post-feedback hook 2
+    ]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any) // initial engineer
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
+      } as any)
+      .mockResolvedValueOnce(successResult() as any) // feedback engineer 1
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this again', severity: 'major' }] } },
+      } as any)
+      .mockResolvedValueOnce(successResult() as any) // feedback engineer 2
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'approve', comments: [] } },
+      } as any);
+
+    await startWorkers(ITEM_ID);
+
+    expect(mockCreateHooksExecutedEvent).toHaveBeenCalledTimes(3);
+    const reviewCalls = mockExecuteAgent.mock.calls.filter(call => call[0].role === 'review');
+    expect(reviewCalls).toHaveLength(3);
+    const reviewFixCalls = mockExecuteAgent.mock.calls.filter(call => call[0].currentTask === 'T1: review-fix');
+    expect(reviewFixCalls).toHaveLength(2);
+    expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      reviewRounds: 2,
+    });
+  });
+
+  it('should fail the task after the fourth review rejection exhausts feedback rounds', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    setupSpawnMock([
+      { exitCode: 0, stdout: 'tests pass' }, // Phase 1 hook
+      { exitCode: 0, stdout: 'tests pass' }, // Post-feedback hook 1
+      { exitCode: 0, stdout: 'tests pass' }, // Post-feedback hook 2
+      { exitCode: 0, stdout: 'tests pass' }, // Post-feedback hook 3
+    ]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any) // initial engineer
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
+      } as any)
+      .mockResolvedValueOnce(successResult() as any) // feedback engineer 1
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this again', severity: 'major' }] } },
+      } as any)
+      .mockResolvedValueOnce(successResult() as any) // feedback engineer 2
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'still broken', severity: 'major' }] } },
+      } as any)
+      .mockResolvedValueOnce(successResult() as any) // feedback engineer 3
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'one more issue', severity: 'major' }] } },
+      } as any);
+
+    await expect(startWorkers(ITEM_ID)).rejects.toThrow('Review feedback rounds exhausted');
+
+    const reviewCalls = mockExecuteAgent.mock.calls.filter(call => call[0].role === 'review');
+    expect(reviewCalls).toHaveLength(4);
+    const reviewFixCalls = mockExecuteAgent.mock.calls.filter(call => call[0].currentTask === 'T1: review-fix');
+    expect(reviewFixCalls).toHaveLength(3);
+    expect(mockCreateErrorEvent).toHaveBeenCalledWith(
+      ITEM_ID,
+      expect.stringContaining('Review feedback rounds exhausted'),
+      { repoName: 'repo-a', phase: 'review' }
+    );
+    expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
+    expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'failed',
+      currentPhase: 'review',
+      reviewRounds: 3,
+    });
   });
 
   it('should persist the union of files modified by engineer, hooks-fix, and review-fix', async () => {

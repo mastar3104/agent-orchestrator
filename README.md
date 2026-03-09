@@ -209,7 +209,7 @@ tasks:
 Worker の起動時、以下の流れで処理される:
 
 1. **Task Execution** — `plan.yaml` の task を依存関係を見ながら 1 件ずつ直列実行。Engineer が task を実装しコミット
-2. **Task Review Loop** — 各 task の直後に hooks と reviewer を実行し、`approve` されるまで同じ task を修正し続ける
+2. **Task Review Loop** — 各 task の直後に hooks と reviewer を実行し、`approve` されるまで同じ task を修正し続ける。`request_changes` は最大 3 回まで feedback fix を試し、それでも reject され続けた task は failed になる
 3. **Push & PR** — その repository の task がすべて完了したら `gh` CLI で Draft PR を作成
 
 ### Git 差分管理

@@ -537,7 +537,7 @@ export function ItemDetailPage() {
                               </span>
                               {step.reviewRounds ? (
                                 <span className="text-xs text-gray-500">
-                                  reviews {step.reviewRounds}
+                                  feedback {step.reviewRounds}
                                 </span>
                               ) : null}
                             </div>

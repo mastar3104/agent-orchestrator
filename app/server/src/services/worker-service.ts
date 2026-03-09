@@ -48,7 +48,7 @@ import {
 import { deriveRepoStatuses } from './state-service';
 import { resolveHooksMaxAttempts } from '../lib/repository-config';
 
-const MAX_FEEDBACK_ROUNDS = 2;
+const MAX_FEEDBACK_ROUNDS = 3;
 const MAX_DIFF_LINES = 20000;
 const REVIEW_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const ENGINEER_TIMEOUT_MS = 50 * 60 * 1000; // 50 minutes
@@ -967,11 +967,16 @@ async function runTaskReviewPhase(
       return { state: currentState };
     }
 
-    currentState = await incrementTaskReviewRounds(itemId, repo.name, task.id);
-    const taskStateAfterReview = getRepoTaskEntry(currentState, task.id);
-    if ((taskStateAfterReview.reviewRounds || 0) >= MAX_FEEDBACK_ROUNDS) {
-      currentState = await markTaskCompleted(itemId, repo.name, task.id, currentHead);
-      return { state: currentState };
+    const completedFeedbackRounds = taskStateAfterHooks.reviewRounds || 0;
+    if (completedFeedbackRounds >= MAX_FEEDBACK_ROUNDS) {
+      const failure = await failTaskWithError(
+        itemId,
+        repo.name,
+        task.id,
+        'review',
+        `Review feedback rounds exhausted for ${repo.name} during task ${task.id} after ${MAX_FEEDBACK_ROUNDS} rounds`
+      );
+      return { state: failure.state, errorMessage: failure.errorMessage, shouldAbortRun: true };
     }
 
     let feedbackDiff: string;
@@ -1010,6 +1015,7 @@ async function runTaskReviewPhase(
           task.id,
           committed.filesModified
         );
+        currentState = await incrementTaskReviewRounds(itemId, repo.name, task.id);
         feedbackSucceeded = true;
         break;
       } catch (error) {
