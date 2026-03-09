@@ -576,12 +576,22 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
     return 'running';
   }
 
-  // 7. In-scope repo error
+  // 7. All in-scope repos completed
+  if (inScopeRepos.length > 0 && inScopeRepos.every(r => r.status === 'completed')) {
+    return 'completed';
+  }
+
+  // 8. No in-scope repos but some completed
+  if (inScopeRepos.length === 0 && allRepos.some(r => r.status === 'completed')) {
+    return 'completed';
+  }
+
+  // 9. In-scope repo error
   if (inScopeRepos.some(r => r.status === 'error')) {
     return 'error';
   }
 
-  // 8. Item-level unattributed errors since last plan_created
+  // 10. Item-level unattributed errors since last plan_created
   let lastPlanCreatedIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {
     if (events[i].type === 'plan_created') {
@@ -607,19 +617,9 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
     return 'error';
   }
 
-  // 9. All in-scope repos completed
-  if (inScopeRepos.length > 0 && inScopeRepos.every(r => r.status === 'completed')) {
-    return 'completed';
-  }
-
-  // 10. In-scope repos have ready
+  // 11. In-scope repos have ready
   if (inScopeRepos.some(r => r.status === 'ready')) {
     return 'ready';
-  }
-
-  // 11. No in-scope repos but some completed
-  if (inScopeRepos.length === 0 && allRepos.some(r => r.status === 'completed')) {
-    return 'completed';
   }
 
   // 12. Default

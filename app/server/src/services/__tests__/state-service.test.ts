@@ -173,7 +173,7 @@ describe('deriveItemStatus - error check after running check', () => {
     expect(await deriveItemStatus('item-1')).toBe('completed');
   });
 
-  it('returns error when error exists and PR created but item-level error after PR', async () => {
+  it('returns completed when all repos completed even if item-level error after PR', async () => {
     setPlanRepos(['repoA']);
     mockReadJsonl.mockResolvedValue([
       makeEvent('plan_created', { planPath: '/plan.yaml' }),
@@ -183,7 +183,7 @@ describe('deriveItemStatus - error check after running check', () => {
       makeEvent('error', { message: 'Post-PR error' }), // item-level error after PR
     ]);
 
-    expect(await deriveItemStatus('item-1')).toBe('error');
+    expect(await deriveItemStatus('item-1')).toBe('completed');
   });
 });
 
