@@ -18,15 +18,6 @@ export interface ResolvedRole {
   jsonSchema: object;
 }
 
-const ALLOWED_BASH_PATTERNS = [
-  'Bash(git add:*)',
-  'Bash(git rm:*)',
-  'Bash(git commit -m:*)',
-  'Bash(git status:*)',
-  'Bash(git diff:*)',
-  'Bash(git log:*)',
-];
-
 function validateAllowedTools(roleName: string, tools: string[]): void {
   if (!Array.isArray(tools) || tools.length === 0) {
     throw new Error(`Role '${roleName}': allowedTools must be a non-empty array`);
@@ -41,13 +32,6 @@ function validateAllowedTools(roleName: string, tools: string[]): void {
     if (tool === 'Bash' || tool === 'Bash(*)') {
       throw new Error(
         `Role '${roleName}': unrestricted '${tool}' is forbidden. Use specific patterns like 'Bash(git add:*)'`
-      );
-    }
-
-    if (tool.startsWith('Bash(') && !ALLOWED_BASH_PATTERNS.includes(tool)) {
-      throw new Error(
-        `Role '${roleName}': Bash pattern '${tool}' is not allowed. ` +
-        `Permitted: ${ALLOWED_BASH_PATTERNS.join(', ')}`
       );
     }
   }
