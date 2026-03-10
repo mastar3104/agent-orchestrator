@@ -261,10 +261,10 @@ export function RepositoriesPage() {
           value={form.allowedTools}
           onChange={e => updateField('allowedTools', e.target.value)}
           className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm font-mono focus:outline-none focus:border-blue-500"
-          placeholder="Bash(make:*), Bash(go:*)"
+          placeholder="Bash(git status), Bash(npm run test)"
         />
         <p className="text-xs text-yellow-600 mt-0.5">
-          Comma-separated. Dangerous commands can also be configured — use at your own risk.
+          Comma-separated. Values are passed to Claude CLI as-is. Dangerous commands can also be configured - use at your own risk.
         </p>
       </div>
 

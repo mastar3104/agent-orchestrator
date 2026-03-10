@@ -18,20 +18,9 @@ export interface ResolvedRole {
   jsonSchema: object;
 }
 
-// ─── Informational mapping: config key → runtime role ID ───
-
-// Config key → runtime role ID
-const CONFIG_TO_RUNTIME: Record<string, string> = {
-  planner: 'planner',
-  engineer: 'engineer',        // dynamic per repo
-  reviewer: 'review',
-  reviewReceiver: 'review-receiver',
-};
-
-// ─── Validation ───
-
 const ALLOWED_BASH_PATTERNS = [
   'Bash(git add:*)',
+  'Bash(git rm:*)',
   'Bash(git commit -m:*)',
   'Bash(git status:*)',
   'Bash(git diff:*)',
@@ -55,14 +44,11 @@ function validateAllowedTools(roleName: string, tools: string[]): void {
       );
     }
 
-    // Validate Bash(...) patterns against whitelist
-    if (tool.startsWith('Bash(')) {
-      if (!ALLOWED_BASH_PATTERNS.includes(tool)) {
-        throw new Error(
-          `Role '${roleName}': Bash pattern '${tool}' is not allowed. ` +
-          `Permitted: ${ALLOWED_BASH_PATTERNS.join(', ')}`
-        );
-      }
+    if (tool.startsWith('Bash(') && !ALLOWED_BASH_PATTERNS.includes(tool)) {
+      throw new Error(
+        `Role '${roleName}': Bash pattern '${tool}' is not allowed. ` +
+        `Permitted: ${ALLOWED_BASH_PATTERNS.join(', ')}`
+      );
     }
   }
 }
@@ -248,34 +234,40 @@ export class AllowedToolsFormatError extends Error {
   }
 }
 
-const REPO_BASH_PATTERN = /^Bash\([^)]+:\*\)$/;
-
 /**
  * Normalize and validate per-repository allowedTools.
  *
  * **注意: allowedTools は危険なコマンドも設定可能な自己責任項目です。**
- * この関数は入力形式（フォーマット）チェックのみを行います。
- * スコープなし Bash / Bash(*) はフォーマット不正として拒否しますが、
- * スコープ付きパターン (例: Bash(rm:*)) は形式上有効として通します。
- * 実際のセキュリティ制御（ツールの実行許可判断）は Claude CLI 側が担います。
+ * この関数は Claude CLI に渡す前の最低限の入力検証と正規化のみを行います。
+ * 各要素は Claude CLI の --allowedTools に渡す opaque string として扱い、
+ * Bash(...) の独自フォーマット検証は行いません。
  *
  * Returns a normalized (trimmed, deduplicated) array suitable for persistence.
  */
-export function sanitizeRepoAllowedTools(repoName: string, tools: string[]): string[] {
-  // Normalize: trim, remove empty, deduplicate
-  const normalized = [...new Set(tools.map(t => t.trim()).filter(t => t.length > 0))];
+export function sanitizeRepoAllowedTools(repoName: string, tools: unknown): string[] {
+  if (!Array.isArray(tools)) {
+    throw new AllowedToolsFormatError(
+      `Repository '${repoName}': allowedTools must be an array of strings.`
+    );
+  }
 
-  for (const tool of normalized) {
-    if (tool === 'Bash' || tool === 'Bash(*)') {
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+
+  for (const [index, tool] of tools.entries()) {
+    if (typeof tool !== 'string') {
       throw new AllowedToolsFormatError(
-        `Repository '${repoName}': unrestricted '${tool}' is not allowed. Use scoped patterns like 'Bash(make:*)'.`
+        `Repository '${repoName}': allowedTools[${index}] must be a string.`
       );
     }
-    if (tool.startsWith('Bash(') && !REPO_BASH_PATTERN.test(tool)) {
-      throw new AllowedToolsFormatError(
-        `Repository '${repoName}': invalid Bash pattern '${tool}'. Expected format: 'Bash(<command>:*)'.`
-      );
+
+    const trimmed = tool.trim();
+    if (trimmed.length === 0 || seen.has(trimmed)) {
+      continue;
     }
+
+    seen.add(trimmed);
+    normalized.push(trimmed);
   }
 
   return normalized;

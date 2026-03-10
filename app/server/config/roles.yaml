@@ -69,14 +69,16 @@ roles:
       1. Ensure all code compiles/tests without errors
       2. Write any necessary tests
       3. Clean up any temporary files you created (e.g., debug logs, test outputs)
-      4. Report the files you modified in your JSON response.
-         - Include ONLY files you intentionally modified — do NOT include temporary files
+      4. Stage and commit your intentional changes before returning JSON.
+         - Include ONLY the intentional task changes in your commit — do NOT commit temporary files
            (plan.yaml, review_findings.json, debug logs, lock files, etc.)
-         - If you created any temporary files during your work, DELETE them
-         - Do NOT run git add or git commit; the orchestrator will commit only the files you report
-         - Include a descriptive commit message in commit_message field
-         Return {"status": "success", "files_modified": ["path/to/file1"], "commit_message": "feat(<scope>): <description>"}
-         If you encounter an error, return {"status": "failure", "files_modified": []}
+         - If you created any temporary files during your work, DELETE them before staging
+         - Run `git add -A -- <paths>` for the intentional changes you want to keep
+         - Run `git rm <paths>` for the intentional changes you want to delete
+         - Run `git commit -m "<descriptive message>"` yourself
+         - Ensure `git status --porcelain` is empty before you return
+         Return {"status": "success"}
+         If you encounter an error, return {"status": "failure"}
 
       To examine this matter from multiple angles, we will form an agent team:
       One software architect to perform coding, one t_wada to conduct code reviews, and one devil's advocate.
@@ -85,6 +87,9 @@ roles:
       - Read
       - Write
       - Edit
+      - "Bash(git add:*)"
+      - "Bash(git rm:*)"
+      - "Bash(git commit -m:*)"
       - "Bash(git status:*)"
     schemaRef: engineer
 

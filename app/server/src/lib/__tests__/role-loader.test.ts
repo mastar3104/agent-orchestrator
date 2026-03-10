@@ -38,7 +38,7 @@ const VALID_ROLES = {
     },
     engineer: {
       promptTemplate: 'You are an engineer.',
-      allowedTools: ['Read', 'Write', 'Edit', 'Bash(git status:*)'],
+      allowedTools: ['Read', 'Write', 'Edit', 'Bash(git add:*)', 'Bash(git commit -m:*)', 'Bash(git status:*)'],
       schemaRef: 'engineer',
     },
     reviewer: {
@@ -165,7 +165,7 @@ describe('role-loader', () => {
       roles: {
         good: {
           promptTemplate: 'test',
-          allowedTools: ['Read', 'Bash(git add:*)', 'Bash(git status:*)'],
+          allowedTools: ['Read', 'Bash(git add:*)', 'Bash(git commit -m:*)', 'Bash(git status:*)'],
           schemaRef: 'planner',
         },
       },
@@ -174,6 +174,7 @@ describe('role-loader', () => {
 
     const roles = loadRoles();
     expect(roles.good.allowedTools).toContain('Bash(git add:*)');
+    expect(roles.good.allowedTools).toContain('Bash(git commit -m:*)');
     expect(roles.good.allowedTools).toContain('Bash(git status:*)');
   });
 });
@@ -363,31 +364,31 @@ describe('local file priority', () => {
 describe('sanitizeRepoAllowedTools', () => {
   it('trims whitespace and removes empty strings', () => {
     const result = sanitizeRepoAllowedTools('test-repo', [
-      '  Bash(make:*)  ',
+      '  Bash(git status)  ',
       '',
       '  ',
-      'Bash(go:*)',
+      'Edit',
     ]);
-    expect(result).toEqual(['Bash(make:*)', 'Bash(go:*)']);
+    expect(result).toEqual(['Bash(git status)', 'Edit']);
   });
 
   it('removes duplicates', () => {
     const result = sanitizeRepoAllowedTools('test-repo', [
-      'Bash(make:*)',
-      'Bash(make:*)',
-      'Bash(go:*)',
+      'Bash(git status)',
+      'Bash(git status)',
+      'Edit',
     ]);
-    expect(result).toEqual(['Bash(make:*)', 'Bash(go:*)']);
+    expect(result).toEqual(['Bash(git status)', 'Edit']);
   });
 
-  it('allows scoped Bash patterns like Bash(make:*)', () => {
-    const result = sanitizeRepoAllowedTools('test-repo', ['Bash(make:*)', 'Bash(go:*)', 'Bash(npm:*)']);
-    expect(result).toEqual(['Bash(make:*)', 'Bash(go:*)', 'Bash(npm:*)']);
+  it('allows opaque Bash values without requiring :*', () => {
+    const result = sanitizeRepoAllowedTools('test-repo', ['Bash(git status)', 'Bash', 'Bash(*)']);
+    expect(result).toEqual(['Bash(git status)', 'Bash', 'Bash(*)']);
   });
 
   it('allows non-Bash tools', () => {
-    const result = sanitizeRepoAllowedTools('test-repo', ['Read', 'Write', 'Bash(make:*)']);
-    expect(result).toEqual(['Read', 'Write', 'Bash(make:*)']);
+    const result = sanitizeRepoAllowedTools('test-repo', ['Read', 'Write', 'WebFetch']);
+    expect(result).toEqual(['Read', 'Write', 'WebFetch']);
   });
 
   it('allows empty array', () => {
@@ -395,28 +396,23 @@ describe('sanitizeRepoAllowedTools', () => {
     expect(result).toEqual([]);
   });
 
-  it('rejects unrestricted Bash', () => {
-    expect(() => sanitizeRepoAllowedTools('test-repo', ['Bash'])).toThrow(AllowedToolsFormatError);
-    expect(() => sanitizeRepoAllowedTools('test-repo', ['Bash'])).toThrow("unrestricted 'Bash' is not allowed");
+  it('rejects non-array values', () => {
+    expect(() => sanitizeRepoAllowedTools('test-repo', 'Bash(git status)')).toThrow(AllowedToolsFormatError);
+    expect(() => sanitizeRepoAllowedTools('test-repo', 'Bash(git status)')).toThrow('allowedTools must be an array of strings');
   });
 
-  it('rejects Bash(*)', () => {
-    expect(() => sanitizeRepoAllowedTools('test-repo', ['Bash(*)'])).toThrow(AllowedToolsFormatError);
-    expect(() => sanitizeRepoAllowedTools('test-repo', ['Bash(*)'])).toThrow("unrestricted 'Bash(*)' is not allowed");
-  });
-
-  it('rejects Bash patterns without proper scope format', () => {
-    expect(() => sanitizeRepoAllowedTools('test-repo', ['Bash(rm -rf)'])).toThrow(AllowedToolsFormatError);
-    expect(() => sanitizeRepoAllowedTools('test-repo', ['Bash(rm -rf)'])).toThrow("invalid Bash pattern");
+  it('rejects non-string entries', () => {
+    expect(() => sanitizeRepoAllowedTools('test-repo', ['Read', 42])).toThrow(AllowedToolsFormatError);
+    expect(() => sanitizeRepoAllowedTools('test-repo', ['Read', 42])).toThrow('allowedTools[1] must be a string');
   });
 
   it('returns normalized array suitable for persistence', () => {
     const result = sanitizeRepoAllowedTools('test-repo', [
-      '  Bash(make:*)  ',
-      'Bash(go:*)  ',
-      '  Bash(make:*)  ',
+      '  Bash(git status)  ',
+      'Edit  ',
+      '  Bash(git status)  ',
     ]);
-    expect(result).toEqual(['Bash(make:*)', 'Bash(go:*)']);
+    expect(result).toEqual(['Bash(git status)', 'Edit']);
   });
 });
 

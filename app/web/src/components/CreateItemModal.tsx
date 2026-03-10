@@ -352,10 +352,10 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                               value={repo.allowedTools}
                               onChange={(e) => updateRepo(repo.key, { allowedTools: e.target.value })}
                               className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm font-mono focus:outline-none focus:border-blue-500"
-                              placeholder="Bash(make:*), Bash(go:*)"
+                              placeholder="Bash(git status), Bash(npm test)"
                             />
                             <p className="text-xs text-yellow-600 mt-0.5">
-                              Dangerous commands can also be configured — use at your own risk.
+                              Values are passed to Claude CLI as-is. Dangerous commands can also be configured - use at your own risk.
                             </p>
                           </div>
                         </>
@@ -490,10 +490,10 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                           value={repo.allowedTools}
                           onChange={(e) => updateRepo(repo.key, { allowedTools: e.target.value })}
                           className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm font-mono focus:outline-none focus:border-blue-500"
-                          placeholder="Bash(make:*), Bash(go:*)"
+                          placeholder="Bash(git status), Bash(npm test)"
                         />
                         <p className="text-xs text-yellow-600 mt-0.5">
-                          Dangerous commands can also be configured — use at your own risk.
+                          Values are passed to Claude CLI as-is. Dangerous commands can also be configured - use at your own risk.
                         </p>
                       </div>
 

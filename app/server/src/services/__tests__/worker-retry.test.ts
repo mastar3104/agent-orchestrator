@@ -2,8 +2,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const taskStateStore = vi.hoisted(() => new Map<string, any>());
 const gitMockState = vi.hoisted(() => ({
-  lastAddedPaths: ['file.ts'] as string[],
-  committedPaths: null as string[] | null,
+  currentHead: 'head-0',
+  nextCommitId: 1,
+  committedPaths: ['file.ts'] as string[],
+  statusPorcelain: '',
+  diffRanges: {} as Record<string, string[]>,
 }));
 const mockSpawn = vi.hoisted(() => vi.fn());
 
@@ -120,12 +123,19 @@ vi.mock('../../lib/role-loader', () => ({
       };
     }
     return {
-      promptTemplate: 'You are an engineer.',
-      allowedTools: ['Read', 'Write'],
+      promptTemplate: [
+        'You are an engineer.',
+        'Stage and commit your intentional changes before returning JSON.',
+        'Run `git add -A -- <paths>` for the intentional changes you want to keep.',
+        'Run `git commit -m "<descriptive message>"` yourself.',
+        'Ensure `git status --porcelain` is empty before you return.',
+        'Return {"status": "success"}.',
+      ].join('\n'),
+      allowedTools: ['Read', 'Write', 'Edit', 'Bash(git add:*)', 'Bash(git commit -m:*)', 'Bash(git status:*)'],
       jsonSchema: {},
     };
   }),
-  mergeAllowedTools: vi.fn().mockReturnValue(['Read', 'Write']),
+  mergeAllowedTools: vi.fn().mockReturnValue(['Read', 'Write', 'Edit', 'Bash(git add:*)', 'Bash(git commit -m:*)', 'Bash(git status:*)']),
 }));
 
 vi.mock('child_process', () => {
@@ -137,28 +147,34 @@ vi.mock('child_process', () => {
       proc.stderr = new EventEmitter();
       setTimeout(() => {
         if (args[0] === 'rev-parse') {
-          proc.stdout.emit('data', args[1]?.endsWith('^') ? 'phase-base-123' : 'head-123');
+          proc.stdout.emit('data', gitMockState.currentHead);
         } else if (args[0] === 'merge-base') {
           proc.stdout.emit('data', 'merge-base-123');
+        } else if (args[0] === 'status' && args[1] === '--porcelain') {
+          proc.stdout.emit('data', gitMockState.statusPorcelain);
         } else if (args[0] === 'diff') {
-          if (args.includes('--cached') && args.includes('--name-only')) {
-            proc.stdout.emit('data', gitMockState.lastAddedPaths.join('\n'));
-          } else if (args.includes('--name-only')) {
-            proc.stdout.emit('data', (gitMockState.committedPaths || gitMockState.lastAddedPaths).join('\n'));
+          const rangeKey = args[2] && args[3] ? `${args[2]}..${args[3]}` : '';
+          const changedPaths = gitMockState.diffRanges[rangeKey] || gitMockState.committedPaths;
+          if (args.includes('--name-only')) {
+            proc.stdout.emit('data', changedPaths.join('\n'));
           } else if (args.includes('--name-status')) {
-            proc.stdout.emit('data', 'M\tfile.ts');
+            proc.stdout.emit('data', changedPaths.map((path) => `M\t${path}`).join('\n'));
           } else if (args.includes('--numstat')) {
-            proc.stdout.emit('data', '10\t5\tfile.ts');
+            proc.stdout.emit('data', changedPaths.map((path) => `10\t5\t${path}`).join('\n'));
           } else {
             proc.stdout.emit('data', 'diff content');
           }
-        } else if (args[0] === 'add') {
-          const separatorIndex = args.indexOf('--');
-          gitMockState.lastAddedPaths = separatorIndex >= 0 ? args.slice(separatorIndex + 1) : ['file.ts'];
         } else if (args[0] === 'show') {
           proc.stdout.emit('data', '// file content');
         } else if (args[0] === 'cat-file') {
           proc.stdout.emit('data', '1024');
+        } else if (args[0] === 'reset' && args[1] === '--hard') {
+          if (args[2] && args[2] !== 'HEAD') {
+            gitMockState.currentHead = args[2];
+          }
+          gitMockState.statusPorcelain = '';
+        } else if (args[0] === 'clean' && args[1] === '-fd') {
+          gitMockState.statusPorcelain = '';
         }
         proc.emit('close', 0);
       }, 0);
@@ -218,14 +234,50 @@ function makeItemConfig(repos: string[]) {
   };
 }
 
-function engineerSuccess(filesModified: string[] = ['file.ts']) {
+function simulateEngineerCommit(
+  filesModified: string[] = ['file.ts'],
+  options?: { dirtyStatus?: string; skipCommit?: boolean }
+) {
+  if (options?.skipCommit) {
+    gitMockState.statusPorcelain = options.dirtyStatus || '';
+    return;
+  }
+
+  const preCommitHead = gitMockState.currentHead;
+  const commitHash = `head-${gitMockState.nextCommitId++}`;
+  gitMockState.currentHead = commitHash;
+  gitMockState.committedPaths = filesModified;
+  gitMockState.diffRanges[`${preCommitHead}..${commitHash}`] = filesModified;
+  gitMockState.statusPorcelain = options?.dirtyStatus || '';
+}
+
+function engineerSuccess(
+  filesModified: string[] = ['file.ts'],
+  options?: { dirtyStatus?: string; skipCommit?: boolean }
+) {
+  let applied = false;
+  return {
+    agent: {} as any,
+    get result() {
+      if (!applied) {
+        simulateEngineerCommit(filesModified, options);
+        applied = true;
+      }
+      return {
+        output: {
+          status: 'success' as const,
+        },
+      };
+    },
+  };
+}
+
+function engineerFailure() {
   return {
     agent: {} as any,
     result: {
       output: {
-        status: 'success' as const,
-        files_modified: filesModified,
-        commit_message: 'feat(repo-a): implement task',
+        status: 'failure' as const,
       },
     },
   };
@@ -270,8 +322,11 @@ describe('Worker task-state execution', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     taskStateStore.clear();
-    gitMockState.lastAddedPaths = ['file.ts'];
-    gitMockState.committedPaths = null;
+    gitMockState.currentHead = 'head-0';
+    gitMockState.nextCommitId = 1;
+    gitMockState.committedPaths = ['file.ts'];
+    gitMockState.statusPorcelain = '';
+    gitMockState.diffRanges = {};
     mockGetPlan.mockResolvedValue(
       makePlan([{ id: 'T1', title: 'Task 1', repository: 'repo-a' }]) as any
     );
@@ -307,6 +362,10 @@ describe('Worker task-state execution', () => {
     expect(engineerPrompts[0]).not.toContain('### Task: T2 - Task 2');
     expect(engineerPrompts[1]).toContain('### Task: T2 - Task 2');
     expect(engineerPrompts[1]).not.toContain('### Task: T1 - Task 1');
+    expect(engineerPrompts[0]).toContain('git add -A -- <paths>');
+    expect(engineerPrompts[0]).toContain('git commit -m');
+    expect(engineerPrompts[0]).toContain('Return {"status": "success"}');
+    expect(engineerPrompts[0]).not.toContain('files_modified');
   });
 
   it('respects dependencies even when dependent tasks appear first in plan order', async () => {
@@ -361,11 +420,10 @@ describe('Worker task-state execution', () => {
     });
   });
 
-  it('stores the committed file list from git diff instead of the engineer report', async () => {
-    gitMockState.committedPaths = ['committed.ts'];
+  it('stores the committed file list from git diff after the agent commit', async () => {
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer') {
-        return engineerSuccess(['reported.ts']);
+        return engineerSuccess(['committed.ts']);
       }
       if (params.role === 'review') {
         return reviewApprove();
@@ -382,10 +440,10 @@ describe('Worker task-state execution', () => {
     });
   });
 
-  it('stages reported files with git add -A so deletions are included', async () => {
+  it('fails the attempt when the engineer reports success without creating a commit', async () => {
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer') {
-        return engineerSuccess(['src/a.ts', 'src/b.ts']);
+        return engineerSuccess(['src/a.ts', 'src/b.ts'], { skipCommit: true });
       }
       if (params.role === 'review') {
         return reviewApprove();
@@ -393,24 +451,54 @@ describe('Worker task-state execution', () => {
       throw new Error(`Unexpected role: ${params.role}`);
     });
 
-    await startWorkers(ITEM_ID);
-
-    const addCall = mockSpawn.mock.calls.find(
-      ([cmd, args]) => cmd === 'git' && Array.isArray(args) && args[0] === 'add'
+    await expect(startWorkers(ITEM_ID)).rejects.toThrow(
+      'Engineer did not create a commit'
     );
-    expect(addCall).toBeDefined();
-    expect(addCall?.[1]).toEqual(['add', '-A', '--', 'src/a.ts', 'src/b.ts']);
+    expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'failed',
+      currentPhase: 'engineer',
+    });
   });
 
-  it('cleans the repo around each engineer retry after a timeout', async () => {
+  it('fails the attempt when the engineer reports failure', async () => {
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        return engineerFailure();
+      }
+      if (params.role === 'review') {
+        return reviewApprove();
+      }
+      throw new Error(`Unexpected role: ${params.role}`);
+    });
+
+    await expect(startWorkers(ITEM_ID)).rejects.toThrow('Engineer reported failure');
+  });
+
+  it('fails the attempt when the engineer leaves a dirty worktree', async () => {
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        return engineerSuccess(['src/a.ts'], { dirtyStatus: ' M src/a.ts' });
+      }
+      if (params.role === 'review') {
+        return reviewApprove();
+      }
+      throw new Error(`Unexpected role: ${params.role}`);
+    });
+
+    await expect(startWorkers(ITEM_ID)).rejects.toThrow('Engineer left dirty worktree');
+  });
+
+  it('rolls failed attempts back to preAttemptHead before retrying', async () => {
     let attempts = 0;
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer') {
         attempts += 1;
         if (attempts === 1) {
-          throw new Error('timeout');
+          return engineerSuccess(['broken.ts'], { dirtyStatus: ' M broken.ts' });
         }
-        return engineerSuccess();
+        expect(gitMockState.currentHead).toBe('head-0');
+        return engineerSuccess(['fixed.ts']);
       }
       if (params.role === 'review') {
         return reviewApprove();
@@ -427,8 +515,13 @@ describe('Worker task-state execution', () => {
     const cleanCalls = gitCalls.filter((args) => args[0] === 'clean' && args[1] === '-fd');
 
     expect(attempts).toBe(2);
-    expect(resetCalls.length).toBeGreaterThanOrEqual(5);
-    expect(cleanCalls.length).toBeGreaterThanOrEqual(5);
+    expect(resetCalls.some((args) => args[2] === 'head-0')).toBe(true);
+    expect(cleanCalls.length).toBeGreaterThan(0);
+    expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      filesModified: ['fixed.ts'],
+    });
   });
 
   it('mode=all skips failed tasks and continues with later runnable tasks', async () => {
@@ -581,6 +674,32 @@ describe('Worker task-state execution', () => {
     expect(reviewAttempts).toBe(2);
   });
 
+  it('uses self-commit instructions in the review-fix prompt', async () => {
+    let reviewCalls = 0;
+    let reviewFixPrompt = '';
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer' && params.currentTask === 'T1: Task 1') {
+        return engineerSuccess();
+      }
+      if (params.role === 'review') {
+        reviewCalls += 1;
+        return reviewCalls === 1 ? reviewRequestChanges() : reviewApprove();
+      }
+      if (params.role === 'engineer' && params.currentTask === 'T1: review-fix') {
+        reviewFixPrompt = params.prompt;
+        return engineerSuccess();
+      }
+      throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    expect(reviewFixPrompt).toContain('git add -A -- <paths>');
+    expect(reviewFixPrompt).toContain('git commit -m');
+    expect(reviewFixPrompt).toContain('Return {"status": "success"}');
+    expect(reviewFixPrompt).not.toContain('files_modified');
+  });
+
   it('fails the run when feedback engineer exhausts its retries', async () => {
     let feedbackAttempts = 0;
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
@@ -605,7 +724,7 @@ describe('Worker task-state execution', () => {
     expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
   });
 
-  it('does not run a third reviewer or extra review-fix after the last feedback round', async () => {
+  it('does not run an extra review-fix after the last feedback round', async () => {
     let reviewCalls = 0;
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer' && params.currentTask === 'T1: Task 1') {
@@ -621,12 +740,14 @@ describe('Worker task-state execution', () => {
       throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
     });
 
-    await startWorkers(ITEM_ID);
+    await expect(startWorkers(ITEM_ID)).rejects.toThrow(
+      'Review feedback rounds exhausted for repo-a during task T1 after 3 rounds'
+    );
 
-    expect(reviewCalls).toBe(2);
+    expect(reviewCalls).toBe(4);
     expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
       id: 'T1',
-      status: 'completed',
+      status: 'failed',
     });
     const lastCall = mockExecuteAgent.mock.calls[mockExecuteAgent.mock.calls.length - 1];
     expect(lastCall[0].role).toBe('review');
@@ -634,7 +755,7 @@ describe('Worker task-state execution', () => {
     const reviewFixCalls = mockExecuteAgent.mock.calls.filter(
       (call) => call[0].currentTask === 'T1: review-fix'
     );
-    expect(reviewFixCalls).toHaveLength(1);
+    expect(reviewFixCalls).toHaveLength(3);
   });
 
   it('resumes an in-review task from hooks and reviewer without rerunning engineer', async () => {

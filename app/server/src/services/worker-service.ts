@@ -112,8 +112,12 @@ async function getGitDiffNameOnly(cwd: string, base: string, head: string): Prom
   return [...new Set(output.trim().split('\n').filter(Boolean))];
 }
 
-async function resetRepoForAttempt(cwd: string): Promise<void> {
-  await execGit(['reset', '--hard', 'HEAD'], cwd);
+async function getGitStatusPorcelain(cwd: string): Promise<string> {
+  return execGit(['status', '--porcelain'], cwd);
+}
+
+async function resetRepoForAttempt(cwd: string, targetRef: string = 'HEAD'): Promise<void> {
+  await execGit(['reset', '--hard', targetRef], cwd);
   await execGit(['clean', '-fd'], cwd);
 }
 
@@ -130,48 +134,9 @@ function validateAgentWorkdir(agentWorkdir: string, workspaceRoot: string): void
   }
 }
 
-// ─── Orchestrator-side commit ───
-
-interface CommitEngineerChangesResult {
+interface EngineerAttemptResult {
   commitHash: string;
   filesModified: string[];
-}
-
-async function commitEngineerChanges(
-  cwd: string,
-  engineerResponse: EngineerResponse,
-  fallbackMessage: string,
-  itemId: string,
-  repoName: string,
-  preAttemptHead: string
-): Promise<CommitEngineerChangesResult | null> {
-  if (engineerResponse.status !== 'success') {
-    console.log(`[${itemId}/${repoName}] Engineer status=${engineerResponse.status}, skipping commit`);
-    return null;
-  }
-
-  const filesToAdd = engineerResponse.files_modified || [];
-  if (filesToAdd.length === 0) {
-    console.log(`[${itemId}/${repoName}] No files_modified reported, skipping commit`);
-    return null;
-  }
-
-  // files_modified に報告された path だけを、追加・更新・削除込みで stage する
-  await execGit(['add', '-A', '--', ...filesToAdd], cwd);
-
-  const staged = await execGit(['diff', '--cached', '--name-only'], cwd);
-  if (!staged.trim()) {
-    console.log(`[${itemId}/${repoName}] No staged changes for files_modified, skipping commit`);
-    return null;
-  }
-
-  const message = engineerResponse.commit_message?.trim() || fallbackMessage;
-  await execGit(['commit', '-m', message], cwd);
-  const commitHash = await getGitHead(cwd);
-  const committedFiles = await getGitDiffNameOnly(cwd, preAttemptHead, commitHash);
-
-  console.log(`[${itemId}/${repoName}] Committed: ${message}`);
-  return { commitHash, filesModified: committedFiles };
 }
 
 interface RunEngineerAttemptOptions {
@@ -183,16 +148,12 @@ interface RunEngineerAttemptOptions {
   allowedTools: string[];
   jsonSchema: object;
   timeoutMs: number;
-  fallbackMessage: string;
 }
 
 async function runEngineerAttemptWithCleanup(
   options: RunEngineerAttemptOptions
-): Promise<CommitEngineerChangesResult> {
-  await resetRepoForAttempt(options.workingDir);
+): Promise<EngineerAttemptResult> {
   const preAttemptHead = await getGitHead(options.workingDir);
-
-  let attemptError: unknown;
   try {
     const { result } = await executeAgent<EngineerResponse>({
       itemId: options.itemId,
@@ -205,31 +166,39 @@ async function runEngineerAttemptWithCleanup(
       jsonSchema: options.jsonSchema,
       timeoutMs: options.timeoutMs,
     });
-    const committed = await commitEngineerChanges(
-      options.workingDir,
-      result.output,
-      options.fallbackMessage,
-      options.itemId,
-      options.repoName,
-      preAttemptHead
-    );
-    return committed ?? { commitHash: preAttemptHead, filesModified: [] };
-  } catch (error) {
-    attemptError = error;
-    throw error;
-  } finally {
-    try {
-      await resetRepoForAttempt(options.workingDir);
-    } catch (cleanupError) {
-      const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-      if (attemptError) {
-        console.warn(
-          `[${options.itemId}/${options.repoName}] Cleanup after ${options.currentTask} failed: ${cleanupMessage}`
-        );
-      } else {
-        throw cleanupError;
-      }
+
+    if (result.output.status !== 'success') {
+      throw new Error(`[${options.itemId}/${options.repoName}] Engineer reported failure`);
     }
+
+    const commitHash = await getGitHead(options.workingDir);
+    if (commitHash === preAttemptHead) {
+      throw new Error(`[${options.itemId}/${options.repoName}] Engineer did not create a commit`);
+    }
+
+    const porcelain = await getGitStatusPorcelain(options.workingDir);
+    if (porcelain.trim()) {
+      const summary = porcelain
+        .split('\n')
+        .filter(Boolean)
+        .slice(0, 5)
+        .join(', ');
+      throw new Error(`[${options.itemId}/${options.repoName}] Engineer left dirty worktree: ${summary}`);
+    }
+
+    const filesModified = await getGitDiffNameOnly(options.workingDir, preAttemptHead, commitHash);
+    return { commitHash, filesModified };
+  } catch (error) {
+    try {
+      await resetRepoForAttempt(options.workingDir, preAttemptHead);
+    } catch (cleanupError) {
+      const attemptMessage = error instanceof Error ? error.message : String(error);
+      const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      throw new Error(
+        `[${options.itemId}/${options.repoName}] ${attemptMessage}; cleanup to ${preAttemptHead} failed: ${cleanupMessage}`
+      );
+    }
+    throw error;
   }
 }
 
@@ -745,9 +714,10 @@ ${failedHooks}
 1. Read the log files above to understand what failed
 2. Fix all issues
 
-Please fix all issues and report the modified files.
-Return {"status": "success", "files_modified": [...], "commit_message": "fix(<scope>): address hook failures"} when done.
-If you encounter an error, return {"status": "failure", "files_modified": []}.`;
+Please fix all issues, commit your intentional changes, and return status.
+Before returning, stage your intentional fixes with \`git add -A -- <paths>\`, create a commit with \`git commit -m "<message>"\`, and ensure \`git status --porcelain\` is empty.
+Return {"status": "success"} when done.
+If you encounter an error, return {"status": "failure"}.`;
 }
 
 async function finalizeCompletedRepo(itemId: string, repoName: string): Promise<void> {
@@ -821,7 +791,6 @@ async function runTaskHooksPhase(
           allowedTools: effectiveTools,
           jsonSchema: engineerRole.jsonSchema,
           timeoutMs: ENGINEER_TIMEOUT_MS,
-          fallbackMessage: `fix(${repo.name}): address hook validation failures for ${task.id}`,
         });
         latestState = await mergeTaskFilesModified(
           itemId,
@@ -1007,7 +976,6 @@ async function runTaskReviewPhase(
           allowedTools: effectiveTools,
           jsonSchema: engineerRole.jsonSchema,
           timeoutMs: ENGINEER_TIMEOUT_MS,
-          fallbackMessage: `fix(${repo.name}): address review feedback for ${task.id}`,
         });
         currentState = await mergeTaskFilesModified(
           itemId,
@@ -1163,7 +1131,6 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
             allowedTools: effectiveTools,
             jsonSchema: engineerRole.jsonSchema,
             timeoutMs: ENGINEER_TIMEOUT_MS,
-            fallbackMessage: `feat(${repo.name}): implement ${nextTask.title}`,
           });
 
           const inReviewState = await markTaskInReview(
@@ -1530,9 +1497,10 @@ ${diff}
 \`\`\`
 
 ## Instructions
-Please address all review comments and report the modified files.
-Return {"status": "success", "files_modified": [...], "commit_message": "fix(<scope>): address review feedback"} when done.
-If you encounter an error, return {"status": "failure", "files_modified": []}.`;
+Please address all review comments, commit your intentional changes, and return status.
+Before returning, stage your intentional fixes with \`git add -A -- <paths>\`, create a commit with \`git commit -m "<message>"\`, and ensure \`git status --porcelain\` is empty.
+Return {"status": "success"} when done.
+If you encounter an error, return {"status": "failure"}.`;
 
   return `${role.promptTemplate}\n\n${context}`;
 }

@@ -7,8 +7,6 @@ export interface PlannerResponse {
 
 export interface EngineerResponse {
   status: 'success' | 'failure';
-  files_modified: string[];
-  commit_message?: string;
 }
 
 export interface ReviewComment {
@@ -41,10 +39,8 @@ export const ENGINEER_RESPONSE_SCHEMA = {
   type: 'object',
   properties: {
     status: { type: 'string', enum: ['success', 'failure'] },
-    files_modified: { type: 'array', items: { type: 'string' } },
-    commit_message: { type: 'string' },
   },
-  required: ['status', 'files_modified'],
+  required: ['status'],
 };
 
 export const REVIEWER_RESPONSE_SCHEMA = {

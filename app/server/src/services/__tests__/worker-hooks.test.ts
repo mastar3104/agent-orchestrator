@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const taskStateStore = vi.hoisted(() => new Map<string, any>());
+const gitMockState = vi.hoisted(() => ({
+  currentHead: 'head-0',
+  nextCommitId: 1,
+  committedPaths: ['file.ts'] as string[],
+  statusPorcelain: '',
+  diffRanges: {} as Record<string, string[]>,
+}));
 
 // ─── Mocks ───
 
@@ -114,10 +121,10 @@ vi.mock('../../lib/events', () => ({
 vi.mock('../../lib/role-loader', () => ({
   getRole: vi.fn().mockReturnValue({
     promptTemplate: 'You are an engineer.',
-    allowedTools: ['Read', 'Write'],
+    allowedTools: ['Read', 'Write', 'Edit', 'Bash(git add:*)', 'Bash(git commit -m:*)', 'Bash(git status:*)'],
     jsonSchema: {},
   }),
-  mergeAllowedTools: vi.fn().mockReturnValue(['Read', 'Write']),
+  mergeAllowedTools: vi.fn().mockReturnValue(['Read', 'Write', 'Edit', 'Bash(git add:*)', 'Bash(git commit -m:*)', 'Bash(git status:*)']),
 }));
 
 vi.mock('fs/promises', () => ({
@@ -225,12 +232,67 @@ function makeItemConfig(
   };
 }
 
-function successResult() {
+function simulateEngineerCommit(
+  filesModified: string[] = ['file.ts'],
+  options?: { dirtyStatus?: string; skipCommit?: boolean }
+) {
+  if (options?.skipCommit) {
+    gitMockState.statusPorcelain = options.dirtyStatus || '';
+    return;
+  }
+
+  const preCommitHead = gitMockState.currentHead;
+  const commitHash = `head-${gitMockState.nextCommitId++}`;
+  gitMockState.currentHead = commitHash;
+  gitMockState.committedPaths = filesModified;
+  gitMockState.diffRanges[`${preCommitHead}..${commitHash}`] = filesModified;
+  gitMockState.statusPorcelain = options?.dirtyStatus || '';
+}
+
+function successResult(
+  filesModified: string[] = ['file.ts'],
+  options?: { dirtyStatus?: string; skipCommit?: boolean }
+) {
+  let applied = false;
   return {
-    result: {
-      output: { status: 'success' as const, files_modified: ['file.ts'] },
+    get result() {
+      if (!applied) {
+        simulateEngineerCommit(filesModified, options);
+        applied = true;
+      }
+      return {
+        output: { status: 'success' as const },
+      };
     },
   };
+}
+
+function handleGitSpawn(args: string[]) {
+  if (args[0] === 'rev-parse') return createGitProc(gitMockState.currentHead);
+  if (args[0] === 'merge-base') return createGitProc('base123');
+  if (args[0] === 'status' && args[1] === '--porcelain') return createGitProc(gitMockState.statusPorcelain);
+  if (args[0] === 'diff') {
+    const rangeKey = args[2] && args[3] ? `${args[2]}..${args[3]}` : '';
+    const changedPaths = gitMockState.diffRanges[rangeKey] || gitMockState.committedPaths;
+    if (args.includes('--name-only')) return createGitProc(changedPaths.join('\n'));
+    if (args.includes('--name-status')) return createGitProc(changedPaths.map((path) => `M\t${path}`).join('\n'));
+    if (args.includes('--numstat')) return createGitProc(changedPaths.map((path) => `10\t5\t${path}`).join('\n'));
+    return createGitProc('diff content');
+  }
+  if (args[0] === 'show') return createGitProc('// file content');
+  if (args[0] === 'cat-file') return createGitProc('1024');
+  if (args[0] === 'reset' && args[1] === '--hard') {
+    if (args[2] && args[2] !== 'HEAD') {
+      gitMockState.currentHead = args[2];
+    }
+    gitMockState.statusPorcelain = '';
+    return createGitProc('');
+  }
+  if (args[0] === 'clean' && args[1] === '-fd') {
+    gitMockState.statusPorcelain = '';
+    return createGitProc('');
+  }
+  return createGitProc('');
 }
 
 function createGitProc(output: string = 'abc123') {
@@ -265,28 +327,10 @@ function createHookProc(exitCode: number, stdout: string = '', stderr: string = 
 
 function setupSpawnMock(hookResults: { exitCode: number; stdout?: string; stderr?: string }[]) {
   let hookCallIndex = 0;
-  let lastAddedPaths = ['file.ts'];
 
   mockSpawn.mockImplementation((cmd: string, args: string[], _opts?: any) => {
     if (cmd === 'git') {
-      if (args[0] === 'rev-parse') return createGitProc('abc123');
-      if (args[0] === 'merge-base') return createGitProc('base123');
-      if (args[0] === 'diff') {
-        if (args.includes('--cached') && args.includes('--name-only')) return createGitProc(lastAddedPaths.join('\n'));
-        if (args.includes('--name-only')) return createGitProc(lastAddedPaths.join('\n'));
-        if (args.includes('--name-status')) return createGitProc('M\tfile.ts');
-        if (args.includes('--numstat')) return createGitProc('10\t5\tfile.ts');
-        return createGitProc('diff content');
-      }
-      if (args[0] === 'show') return createGitProc('// file content');
-      if (args[0] === 'cat-file') return createGitProc('1024');
-      if (args[0] === 'add') {
-        const separatorIndex = args.indexOf('--');
-        lastAddedPaths = separatorIndex >= 0 ? args.slice(separatorIndex + 1) : ['file.ts'];
-        return createGitProc('');
-      }
-      if (args[0] === 'reset' || args[0] === 'clean' || args[0] === 'commit') return createGitProc('');
-      return createGitProc('');
+      return handleGitSpawn(args);
     }
     if (cmd === 'sh') {
       const result = hookResults[hookCallIndex] || { exitCode: 0 };
@@ -303,6 +347,11 @@ describe('Worker hooks', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     taskStateStore.clear();
+    gitMockState.currentHead = 'head-0';
+    gitMockState.nextCommitId = 1;
+    gitMockState.committedPaths = ['file.ts'];
+    gitMockState.statusPorcelain = '';
+    gitMockState.diffRanges = {};
   });
 
   it('should proceed to review when no hooks are configured', async () => {
@@ -602,27 +651,9 @@ describe('Worker hooks', () => {
       makeItemConfig(['repo-a', 'repo-b'], { 'repo-a': ['exit 1'] }) as any
     );
 
-    let lastAddedPaths = ['file.ts'];
     mockSpawn.mockImplementation((cmd: string, args: string[], _opts?: any) => {
       if (cmd === 'git') {
-        if (args[0] === 'rev-parse') return createGitProc('abc123');
-        if (args[0] === 'merge-base') return createGitProc('base123');
-        if (args[0] === 'diff') {
-          if (args.includes('--cached') && args.includes('--name-only')) return createGitProc(lastAddedPaths.join('\n'));
-          if (args.includes('--name-only')) return createGitProc(lastAddedPaths.join('\n'));
-          if (args.includes('--name-status')) return createGitProc('M\tfile.ts');
-          if (args.includes('--numstat')) return createGitProc('10\t5\tfile.ts');
-          return createGitProc('diff content');
-        }
-        if (args[0] === 'show') return createGitProc('// file content');
-        if (args[0] === 'cat-file') return createGitProc('1024');
-        if (args[0] === 'add') {
-          const separatorIndex = args.indexOf('--');
-          lastAddedPaths = separatorIndex >= 0 ? args.slice(separatorIndex + 1) : ['file.ts'];
-          return createGitProc('');
-        }
-        if (args[0] === 'reset' || args[0] === 'clean' || args[0] === 'commit') return createGitProc('');
-        return createGitProc('');
+        return handleGitSpawn(args);
       }
       if (cmd === 'sh') {
         // All hook attempts fail
@@ -679,6 +710,10 @@ describe('Worker hooks', () => {
     // Fix engineer call should NOT contain promptTemplate
     const fixCall = mockExecuteAgent.mock.calls[1];
     expect(fixCall[0].prompt).not.toContain('You are an engineer.');
+    expect(fixCall[0].prompt).toContain('git add -A -- <paths>');
+    expect(fixCall[0].prompt).toContain('git commit -m');
+    expect(fixCall[0].prompt).toContain('Return {"status": "success"}');
+    expect(fixCall[0].prompt).not.toContain('files_modified');
   });
 
   it('fix prompt should contain log file paths', async () => {
@@ -738,27 +773,9 @@ describe('Worker hooks', () => {
     );
 
     // Create a spawn mock that simulates process killed by signal
-    let lastAddedPaths = ['file.ts'];
     mockSpawn.mockImplementation((cmd: string, args: string[], _opts?: any) => {
       if (cmd === 'git') {
-        if (args[0] === 'rev-parse') return createGitProc('abc123');
-        if (args[0] === 'merge-base') return createGitProc('base123');
-        if (args[0] === 'diff') {
-          if (args.includes('--cached') && args.includes('--name-only')) return createGitProc(lastAddedPaths.join('\n'));
-          if (args.includes('--name-only')) return createGitProc(lastAddedPaths.join('\n'));
-          if (args.includes('--name-status')) return createGitProc('M\tfile.ts');
-          if (args.includes('--numstat')) return createGitProc('10\t5\tfile.ts');
-          return createGitProc('diff content');
-        }
-        if (args[0] === 'show') return createGitProc('// file content');
-        if (args[0] === 'cat-file') return createGitProc('1024');
-        if (args[0] === 'add') {
-          const separatorIndex = args.indexOf('--');
-          lastAddedPaths = separatorIndex >= 0 ? args.slice(separatorIndex + 1) : ['file.ts'];
-          return createGitProc('');
-        }
-        if (args[0] === 'reset' || args[0] === 'clean' || args[0] === 'commit') return createGitProc('');
-        return createGitProc('');
+        return handleGitSpawn(args);
       }
       if (cmd === 'sh') {
         const EventEmitter = require('events');
@@ -818,6 +835,36 @@ describe('Worker hooks', () => {
     expect(reviewCalls).toHaveLength(2);
     const reviewFixCalls = mockExecuteAgent.mock.calls.filter(call => call[0].currentTask === 'T1: review-fix');
     expect(reviewFixCalls).toHaveLength(1);
+  });
+
+  it('review-fix prompt should use self-commit instructions', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    setupSpawnMock([
+      { exitCode: 0, stdout: 'tests pass' },
+      { exitCode: 0, stdout: 'tests pass' },
+    ]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any)
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
+      } as any)
+      .mockResolvedValueOnce(successResult() as any)
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'approve', comments: [] } },
+      } as any);
+
+    await startWorkers(ITEM_ID);
+
+    const reviewFixCall = mockExecuteAgent.mock.calls.find(call => call[0].currentTask === 'T1: review-fix');
+    expect(reviewFixCall?.[0].prompt).toContain('git add -A -- <paths>');
+    expect(reviewFixCall?.[0].prompt).toContain('git commit -m');
+    expect(reviewFixCall?.[0].prompt).toContain('Return {"status": "success"}');
+    expect(reviewFixCall?.[0].prompt).not.toContain('files_modified');
   });
 
   it('should allow three review cycles with two review-fix rounds before approval', async () => {
@@ -924,24 +971,8 @@ describe('Worker hooks', () => {
     ]);
 
     mockExecuteAgent
-      .mockResolvedValueOnce({
-        result: {
-          output: {
-            status: 'success' as const,
-            files_modified: ['engineer.ts'],
-            commit_message: 'feat(repo-a): engineer',
-          },
-        },
-      } as any)
-      .mockResolvedValueOnce({
-        result: {
-          output: {
-            status: 'success' as const,
-            files_modified: ['hooks-fix.ts'],
-            commit_message: 'fix(repo-a): hooks',
-          },
-        },
-      } as any)
+      .mockResolvedValueOnce(successResult(['engineer.ts']) as any)
+      .mockResolvedValueOnce(successResult(['hooks-fix.ts']) as any)
       .mockResolvedValueOnce({
         result: {
           output: {
@@ -950,15 +981,7 @@ describe('Worker hooks', () => {
           },
         },
       } as any)
-      .mockResolvedValueOnce({
-        result: {
-          output: {
-            status: 'success' as const,
-            files_modified: ['review-fix.ts'],
-            commit_message: 'fix(repo-a): review',
-          },
-        },
-      } as any)
+      .mockResolvedValueOnce(successResult(['review-fix.ts']) as any)
       .mockResolvedValueOnce({
         result: { output: { review_status: 'approve', comments: [] } },
       } as any);
