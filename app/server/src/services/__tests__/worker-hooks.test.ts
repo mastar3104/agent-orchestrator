@@ -251,7 +251,7 @@ function simulateEngineerCommit(
 
 function successResult(
   filesModified: string[] = ['file.ts'],
-  options?: { dirtyStatus?: string; skipCommit?: boolean }
+  options?: { dirtyStatus?: string; skipCommit?: boolean; sessionId?: string }
 ) {
   let applied = false;
   return {
@@ -262,6 +262,7 @@ function successResult(
       }
       return {
         output: { status: 'success' as const },
+        sessionId: options?.sessionId ?? 'session-1',
       };
     },
   };
@@ -458,6 +459,88 @@ describe('Worker hooks', () => {
         expect.objectContaining({ repoName: 'repo-a', taskId: 'T1', status: 'in_review', currentPhase: 'review' }),
       ])
     );
+  });
+
+  it('should allow hooks-fix to resolve as a clean no-op', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    setupSpawnMock([
+      { exitCode: 1, stderr: 'test failed' },
+      { exitCode: 0, stdout: 'tests pass' },
+    ]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult(['engineer.ts']) as any)
+      .mockResolvedValueOnce(successResult(['hooks-fix.ts'], { skipCommit: true }) as any)
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'approve', comments: [] } },
+      } as any);
+
+    await startWorkers(ITEM_ID);
+
+    expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      filesModified: ['engineer.ts'],
+    });
+  });
+
+  it('should normalize a dirty committed follow-up during hooks-fix before continuing', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    setupSpawnMock([
+      { exitCode: 1, stderr: 'test failed' },
+      { exitCode: 0, stdout: 'tests pass' },
+    ]);
+
+    let engineerCalls = 0;
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        engineerCalls += 1;
+        if (engineerCalls === 1) {
+          return successResult(['engineer.ts']);
+        }
+        if (engineerCalls === 2) {
+          return successResult(['hooks-fix.ts'], {
+            skipCommit: true,
+            dirtyStatus: ' M hooks-fix.ts',
+            sessionId: 'hooks-session-1',
+          });
+        }
+        if (engineerCalls === 3) {
+          expect(params.resumeSessionId).toBe('hooks-session-1');
+          return successResult(['hooks-fix.ts'], { dirtyStatus: ' M leftover.ts' });
+        }
+      }
+      if (params.role === 'review') {
+        return {
+          result: { output: { review_status: 'approve', comments: [] } },
+        } as any;
+      }
+      throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    const gitCalls = mockSpawn.mock.calls
+      .filter(([cmd]) => cmd === 'git')
+      .map(([, args]) => args as string[]);
+    const resetCalls = gitCalls.filter((args) => args[0] === 'reset' && args[1] === '--hard');
+
+    expect(resetCalls.some((args) => args[2] === 'head-2')).toBe(true);
+    expect(gitMockState.currentHead).toBe('head-2');
+    expect(gitMockState.statusPorcelain).toBe('');
+    expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      filesModified: expect.arrayContaining(['engineer.ts', 'hooks-fix.ts']),
+    });
   });
 
   it('should mark the current task failed when hooks fail after max retries', async () => {
@@ -865,6 +948,39 @@ describe('Worker hooks', () => {
     expect(reviewFixCall?.[0].prompt).toContain('git commit -m');
     expect(reviewFixCall?.[0].prompt).toContain('Return {"status": "success"}');
     expect(reviewFixCall?.[0].prompt).not.toContain('files_modified');
+  });
+
+  it('should allow review-fix to resolve as a clean no-op while still consuming a round', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    setupSpawnMock([
+      { exitCode: 0, stdout: 'tests pass' },
+      { exitCode: 0, stdout: 'tests pass' },
+    ]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult(['engineer.ts']) as any)
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
+      } as any)
+      .mockResolvedValueOnce(successResult(['review-fix.ts'], { skipCommit: true }) as any)
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'approve', comments: [] } },
+      } as any);
+
+    await startWorkers(ITEM_ID);
+
+    const reviewCalls = mockExecuteAgent.mock.calls.filter(call => call[0].role === 'review');
+    expect(reviewCalls).toHaveLength(2);
+    expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      reviewRounds: 1,
+      filesModified: ['engineer.ts'],
+    });
   });
 
   it('should allow three review cycles with two review-fix rounds before approval', async () => {

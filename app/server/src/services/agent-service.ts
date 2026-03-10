@@ -77,6 +77,8 @@ export async function executeAgent<T>(options: {
   allowedTools: string[];
   jsonSchema: object;
   agentId?: string;
+  resumeSessionId?: string;
+  emitErrorEvent?: boolean;
   env?: Record<string, string>;
   timeoutMs?: number;
 }): Promise<{ agent: AgentInfo; result: ClaudeExecutionResult<T> }> {
@@ -124,6 +126,7 @@ export async function executeAgent<T>(options: {
       allowedTools: options.allowedTools,
       jsonSchema: options.jsonSchema,
       cwd: options.workingDir,
+      resumeSessionId: options.resumeSessionId,
       env: options.env,
       timeoutMs: options.timeoutMs,
       signal: abortController.signal,
@@ -135,6 +138,7 @@ export async function executeAgent<T>(options: {
       stdout: result.rawStdout,
       stderr: result.stderr,
       parsedOutput: result.output,
+      sessionId: result.sessionId,
       exitCode: result.exitCode,
       durationMs: result.durationMs,
       timestamp: new Date().toISOString(),
@@ -164,15 +168,16 @@ export async function executeAgent<T>(options: {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
-    // Log error event
-    const phase = options.role === 'review-receiver' ? 'review_receive' as const
-      : (['engineer', 'review', 'planner'] as const).find(r => r === options.role);
-    const errorEvent = createErrorEvent(options.itemId, errorMessage, {
-      agentId,
-      repoName: options.repoName,
-      phase,
-    });
-    await logEvent(options.itemId, agentId, errorEvent);
+    if (options.emitErrorEvent !== false) {
+      const phase = options.role === 'review-receiver' ? 'review_receive' as const
+        : (['engineer', 'review', 'planner'] as const).find(r => r === options.role);
+      const errorEvent = createErrorEvent(options.itemId, errorMessage, {
+        agentId,
+        repoName: options.repoName,
+        phase,
+      });
+      await logEvent(options.itemId, agentId, errorEvent);
+    }
 
     // Log agent exited with error
     const exitEvent = createAgentExitedEvent(options.itemId, agentId, 1);

@@ -134,9 +134,15 @@ function validateAgentWorkdir(agentWorkdir: string, workspaceRoot: string): void
   }
 }
 
-interface EngineerAttemptResult {
+type EngineerAttemptResult =
+  | { outcome: 'committed'; commitHash: string; filesModified: string[] }
+  | { outcome: 'noop' };
+
+interface EngineerWorktreeState {
   commitHash: string;
-  filesModified: string[];
+  porcelain: string;
+  dirty: boolean;
+  summary: string;
 }
 
 interface RunEngineerAttemptOptions {
@@ -150,44 +156,183 @@ interface RunEngineerAttemptOptions {
   timeoutMs: number;
 }
 
+function summarizePorcelain(porcelain: string): string {
+  return porcelain
+    .split('\n')
+    .filter(Boolean)
+    .slice(0, 5)
+    .join(', ');
+}
+
+async function getEngineerWorktreeState(workingDir: string): Promise<EngineerWorktreeState> {
+  const commitHash = await getGitHead(workingDir);
+  const porcelain = await getGitStatusPorcelain(workingDir);
+  return {
+    commitHash,
+    porcelain,
+    dirty: porcelain.trim().length > 0,
+    summary: summarizePorcelain(porcelain),
+  };
+}
+
+async function executeSuccessfulEngineerAttempt(
+  options: RunEngineerAttemptOptions,
+  prompt: string,
+  resumeSessionId?: string,
+  emitErrorEvent: boolean = true
+): Promise<{ sessionId?: string }> {
+  const { result } = await executeAgent<EngineerResponse>({
+    itemId: options.itemId,
+    role: 'engineer',
+    repoName: options.repoName,
+    currentTask: options.currentTask,
+    prompt,
+    workingDir: options.workingDir,
+    allowedTools: options.allowedTools,
+    jsonSchema: options.jsonSchema,
+    resumeSessionId,
+    emitErrorEvent,
+    timeoutMs: options.timeoutMs,
+  });
+
+  if (result.output.status !== 'success') {
+    throw new Error(`[${options.itemId}/${options.repoName}] Engineer reported failure`);
+  }
+
+  return { sessionId: result.sessionId };
+}
+
+async function buildCommittedEngineerAttemptResult(
+  workingDir: string,
+  preAttemptHead: string,
+  commitHash: string
+): Promise<EngineerAttemptResult> {
+  const filesModified = await getGitDiffNameOnly(workingDir, preAttemptHead, commitHash);
+  return {
+    outcome: 'committed',
+    commitHash,
+    filesModified,
+  };
+}
+
+function buildNoCommitFollowUpPrompt(currentTask: string, porcelainSummary: string): string {
+  return `## Commit Verification
+Your previous response for "${currentTask}" reported success, but Git HEAD did not change and the worktree is still dirty.
+
+Current git status summary:
+${porcelainSummary || '<unable to summarize git status>'}
+
+## Required action
+Decide which of these is correct, then finish the repository in one of these terminal states:
+1. The uncommitted changes are intentional: stage and commit them now.
+2. The uncommitted changes are not needed: discard or revert them until \`git status --porcelain\` is empty.
+
+Do not leave the worktree dirty.
+Return {"status": "success"} only after either a new commit exists or the worktree is completely clean with no commit required.
+Return {"status": "failure"} only if you cannot resolve this yourself.`;
+}
+
+async function finalizeNoCommitFollowUpResult(
+  options: RunEngineerAttemptOptions,
+  preAttemptHead: string
+): Promise<EngineerAttemptResult> {
+  const state = await getEngineerWorktreeState(options.workingDir);
+
+  if (state.commitHash !== preAttemptHead) {
+    if (state.dirty) {
+      console.warn(
+        `[${options.itemId}/${options.repoName}] Engineer follow-up created commit ${state.commitHash} but left dirty worktree: ${state.summary || '(dirty worktree)'}. Resetting to the new commit and proceeding.`
+      );
+      await resetRepoForAttempt(options.workingDir, state.commitHash);
+    }
+
+    return buildCommittedEngineerAttemptResult(
+      options.workingDir,
+      preAttemptHead,
+      state.commitHash
+    );
+  }
+
+  if (!state.dirty) {
+    console.log(
+      `[${options.itemId}/${options.repoName}] Engineer follow-up cleaned the worktree with no new commit. Treating as no-op success.`
+    );
+    return { outcome: 'noop' };
+  }
+
+  console.warn(
+    `[${options.itemId}/${options.repoName}] Engineer follow-up still left dirty worktree with no commit: ${state.summary || '(dirty worktree)'}. Resetting to ${preAttemptHead} and proceeding as no-op.`
+  );
+  await resetRepoForAttempt(options.workingDir, preAttemptHead);
+  return { outcome: 'noop' };
+}
+
+async function resolveNoCommitEngineerAttempt(
+  options: RunEngineerAttemptOptions,
+  preAttemptHead: string,
+  sessionId?: string
+): Promise<EngineerAttemptResult> {
+  const initialState = await getEngineerWorktreeState(options.workingDir);
+  if (!initialState.dirty) {
+    console.log(
+      `[${options.itemId}/${options.repoName}] Engineer succeeded with no commit and clean worktree. Treating as no-op success.`
+    );
+    return { outcome: 'noop' };
+  }
+
+  const followUpPrompt = buildNoCommitFollowUpPrompt(options.currentTask, initialState.summary);
+
+  if (sessionId) {
+    try {
+      await executeSuccessfulEngineerAttempt(options, followUpPrompt, sessionId, false);
+      return finalizeNoCommitFollowUpResult(options, preAttemptHead);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `[${options.itemId}/${options.repoName}] Same-session engineer follow-up failed for ${options.currentTask}: ${message}. Retrying once in a fresh session.`
+      );
+    }
+  } else {
+    console.warn(
+      `[${options.itemId}/${options.repoName}] Engineer session id unavailable for ${options.currentTask}. Retrying commit verification in a fresh session.`
+    );
+  }
+
+  try {
+    await executeSuccessfulEngineerAttempt(options, followUpPrompt, undefined, false);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(
+      `[${options.itemId}/${options.repoName}] Fresh-session engineer follow-up failed for ${options.currentTask}: ${message}. Inspecting repo state before proceeding.`
+    );
+  }
+
+  return finalizeNoCommitFollowUpResult(options, preAttemptHead);
+}
+
 async function runEngineerAttemptWithCleanup(
   options: RunEngineerAttemptOptions
 ): Promise<EngineerAttemptResult> {
   const preAttemptHead = await getGitHead(options.workingDir);
   try {
-    const { result } = await executeAgent<EngineerResponse>({
-      itemId: options.itemId,
-      role: 'engineer',
-      repoName: options.repoName,
-      currentTask: options.currentTask,
-      prompt: options.prompt,
-      workingDir: options.workingDir,
-      allowedTools: options.allowedTools,
-      jsonSchema: options.jsonSchema,
-      timeoutMs: options.timeoutMs,
-    });
+    const { sessionId } = await executeSuccessfulEngineerAttempt(options, options.prompt);
 
-    if (result.output.status !== 'success') {
-      throw new Error(`[${options.itemId}/${options.repoName}] Engineer reported failure`);
+    const state = await getEngineerWorktreeState(options.workingDir);
+    if (state.commitHash === preAttemptHead) {
+      return resolveNoCommitEngineerAttempt(options, preAttemptHead, sessionId);
     }
 
-    const commitHash = await getGitHead(options.workingDir);
-    if (commitHash === preAttemptHead) {
-      throw new Error(`[${options.itemId}/${options.repoName}] Engineer did not create a commit`);
+    if (state.dirty) {
+      throw new Error(
+        `[${options.itemId}/${options.repoName}] Engineer left dirty worktree: ${state.summary}`
+      );
     }
 
-    const porcelain = await getGitStatusPorcelain(options.workingDir);
-    if (porcelain.trim()) {
-      const summary = porcelain
-        .split('\n')
-        .filter(Boolean)
-        .slice(0, 5)
-        .join(', ');
-      throw new Error(`[${options.itemId}/${options.repoName}] Engineer left dirty worktree: ${summary}`);
-    }
-
-    const filesModified = await getGitDiffNameOnly(options.workingDir, preAttemptHead, commitHash);
-    return { commitHash, filesModified };
+    return buildCommittedEngineerAttemptResult(
+      options.workingDir,
+      preAttemptHead,
+      state.commitHash
+    );
   } catch (error) {
     try {
       await resetRepoForAttempt(options.workingDir, preAttemptHead);
@@ -792,12 +937,14 @@ async function runTaskHooksPhase(
           jsonSchema: engineerRole.jsonSchema,
           timeoutMs: ENGINEER_TIMEOUT_MS,
         });
-        latestState = await mergeTaskFilesModified(
-          itemId,
-          repo.name,
-          task.id,
-          committed.filesModified
-        );
+        if (committed.outcome === 'committed') {
+          latestState = await mergeTaskFilesModified(
+            itemId,
+            repo.name,
+            task.id,
+            committed.filesModified
+          );
+        }
       } catch (fixError) {
         const fixMsg = fixError instanceof Error ? fixError.message : String(fixError);
         console.error(`[${itemId}/${repo.name}] Hooks fix engineer failed for ${task.id}: ${fixMsg}`);
@@ -977,12 +1124,14 @@ async function runTaskReviewPhase(
           jsonSchema: engineerRole.jsonSchema,
           timeoutMs: ENGINEER_TIMEOUT_MS,
         });
-        currentState = await mergeTaskFilesModified(
-          itemId,
-          repo.name,
-          task.id,
-          committed.filesModified
-        );
+        if (committed.outcome === 'committed') {
+          currentState = await mergeTaskFilesModified(
+            itemId,
+            repo.name,
+            task.id,
+            committed.filesModified
+          );
+        }
         currentState = await incrementTaskReviewRounds(itemId, repo.name, task.id);
         feedbackSucceeded = true;
         break;
@@ -1107,6 +1256,7 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
 
     const engineerRole = getRole('engineer');
     const effectiveTools = mergeAllowedTools(engineerRole.allowedTools, repo.allowedTools);
+    let skipReview = false;
     if (!reviewTask) {
       console.log(
         `[${itemId}/${repo.name}] Starting task ${taskIndex + 1}/${repoTasks.length}: ${nextTask.id} - ${nextTask.title}`
@@ -1133,16 +1283,31 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
             timeoutMs: ENGINEER_TIMEOUT_MS,
           });
 
-          const inReviewState = await markTaskInReview(
-            itemId,
-            repo.name,
-            nextTask.id,
-            'hooks',
-            committed.filesModified
-          );
-          statesByRepo.set(repo.name, inReviewState);
-          taskSucceeded = true;
-          break;
+          if (committed.outcome === 'noop') {
+            const completedState = await markTaskCompleted(
+              itemId,
+              repo.name,
+              nextTask.id,
+              await getGitHead(agentWorkdir)
+            );
+            statesByRepo.set(repo.name, completedState);
+            taskSucceeded = true;
+            skipReview = true;
+            break;
+          }
+
+          if (committed.outcome === 'committed') {
+            const inReviewState = await markTaskInReview(
+              itemId,
+              repo.name,
+              nextTask.id,
+              'hooks',
+              committed.filesModified
+            );
+            statesByRepo.set(repo.name, inReviewState);
+            taskSucceeded = true;
+            break;
+          }
         } catch (error) {
           lastError = error instanceof Error ? error.message : String(error);
           if (attempt < AGENT_MAX_RETRIES) {
@@ -1172,14 +1337,16 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
       );
     }
 
-    const reviewResult = await runTaskReviewPhase(itemId, plan, repo, nextTask, agentWorkdir);
-    statesByRepo.set(repo.name, reviewResult.state);
-    if (reviewResult.errorMessage) {
-      if (reviewResult.shouldAbortRun === false) {
-        continue;
+    if (!skipReview) {
+      const reviewResult = await runTaskReviewPhase(itemId, plan, repo, nextTask, agentWorkdir);
+      statesByRepo.set(repo.name, reviewResult.state);
+      if (reviewResult.errorMessage) {
+        if (reviewResult.shouldAbortRun === false) {
+          continue;
+        }
+        failedTaskMessage = reviewResult.errorMessage;
+        break;
       }
-      failedTaskMessage = reviewResult.errorMessage;
-      break;
     }
 
     const repoState = statesByRepo.get(repo.name);

@@ -10,6 +10,7 @@ export interface ClaudeExecutionOptions {
   allowedTools: string[];
   jsonSchema: object;
   cwd: string;
+  resumeSessionId?: string;
   env?: Record<string, string>;
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -18,6 +19,7 @@ export interface ClaudeExecutionOptions {
 export interface ClaudeExecutionResult<T = unknown> {
   output: T;
   rawStdout: string;
+  sessionId?: string;
   exitCode: number;
   stderr: string;
   durationMs: number;
@@ -92,11 +94,16 @@ export async function runClaude<T>(options: ClaudeExecutionOptions): Promise<Cla
   const claudePath = process.env.CLAUDE_PATH || findClaudePath();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-  const args = [
-    '-p',
+  const args = ['-p'];
+
+  if (options.resumeSessionId) {
+    args.push('-r', options.resumeSessionId);
+  }
+
+  args.push(
     '--output-format', 'json',
     '--json-schema', JSON.stringify(options.jsonSchema),
-  ];
+  );
 
   // Add allowed tools (comma-separated to avoid variadic arg consuming the prompt)
   if (options.allowedTools.length > 0) {
@@ -205,10 +212,19 @@ export async function runClaude<T>(options: ClaudeExecutionOptions): Promise<Cla
 
       // Parse JSON output
       let parsed: T;
+      let sessionId: string | undefined;
       try {
         // claude -p --output-format json returns a JSON object with a "result" field
         // The actual response is in the result field
         const rawParsed = JSON.parse(stdout);
+        if (
+          rawParsed &&
+          typeof rawParsed === 'object' &&
+          'session_id' in rawParsed &&
+          typeof rawParsed.session_id === 'string'
+        ) {
+          sessionId = rawParsed.session_id;
+        }
         // If the output has a result field containing the schema'd response, extract it
         if (rawParsed && typeof rawParsed === 'object' && 'result' in rawParsed) {
           // --json-schema 指定時は structured_output に構造化出力が入る
@@ -244,6 +260,7 @@ export async function runClaude<T>(options: ClaudeExecutionOptions): Promise<Cla
       resolve({
         output: parsed,
         rawStdout: stdout,
+        sessionId,
         exitCode,
         stderr,
         durationMs,

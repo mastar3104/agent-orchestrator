@@ -253,7 +253,7 @@ function simulateEngineerCommit(
 
 function engineerSuccess(
   filesModified: string[] = ['file.ts'],
-  options?: { dirtyStatus?: string; skipCommit?: boolean }
+  options?: { dirtyStatus?: string; skipCommit?: boolean; sessionId?: string }
 ) {
   let applied = false;
   return {
@@ -267,6 +267,7 @@ function engineerSuccess(
         output: {
           status: 'success' as const,
         },
+        sessionId: options?.sessionId ?? 'session-1',
       };
     },
   };
@@ -440,24 +441,138 @@ describe('Worker task-state execution', () => {
     });
   });
 
-  it('fails the attempt when the engineer reports success without creating a commit', async () => {
+  it('treats clean success without a commit as no-op success and skips review', async () => {
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer') {
         return engineerSuccess(['src/a.ts', 'src/b.ts'], { skipCommit: true });
       }
       if (params.role === 'review') {
-        return reviewApprove();
+        throw new Error('Reviewer should not run for clean no-op success');
       }
       throw new Error(`Unexpected role: ${params.role}`);
     });
 
-    await expect(startWorkers(ITEM_ID)).rejects.toThrow(
-      'Engineer did not create a commit'
-    );
+    await startWorkers(ITEM_ID);
+
     expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
       id: 'T1',
-      status: 'failed',
-      currentPhase: 'engineer',
+      status: 'completed',
+      commitHash: 'head-0',
+    });
+    const reviewerCall = mockExecuteAgent.mock.calls.find((call) => call[0].role === 'review');
+    expect(reviewerCall).toBeUndefined();
+  });
+
+  it('reuses the same session to resolve dirty no-commit success with a follow-up commit', async () => {
+    const resumeSessionIds: Array<string | undefined> = [];
+    let engineerCalls = 0;
+
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        engineerCalls += 1;
+        if (engineerCalls === 1) {
+          expect(params.resumeSessionId).toBeUndefined();
+          return engineerSuccess(['src/a.ts'], {
+            skipCommit: true,
+            dirtyStatus: ' M src/a.ts',
+            sessionId: 'session-dirty-1',
+          });
+        }
+        if (engineerCalls === 2) {
+          resumeSessionIds.push(params.resumeSessionId);
+          return engineerSuccess(['src/fixed.ts']);
+        }
+      }
+      if (params.role === 'review') {
+        return reviewApprove();
+      }
+      throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    expect(resumeSessionIds).toEqual(['session-dirty-1']);
+    expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      filesModified: ['src/fixed.ts'],
+    });
+  });
+
+  it('treats dirty no-commit success as no-op when the same-session follow-up cleans the worktree', async () => {
+    let engineerCalls = 0;
+
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        engineerCalls += 1;
+        if (engineerCalls === 1) {
+          return engineerSuccess(['src/a.ts'], {
+            skipCommit: true,
+            dirtyStatus: ' M src/a.ts',
+            sessionId: 'session-dirty-2',
+          });
+        }
+        if (engineerCalls === 2) {
+          expect(params.resumeSessionId).toBe('session-dirty-2');
+          return engineerSuccess(['src/a.ts'], { skipCommit: true });
+        }
+      }
+      if (params.role === 'review') {
+        throw new Error('Reviewer should not run when follow-up resolves to a no-op');
+      }
+      throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    expect(engineerCalls).toBe(2);
+    expect(gitMockState.currentHead).toBe('head-0');
+    expect(gitMockState.statusPorcelain).toBe('');
+    expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      commitHash: 'head-0',
+    });
+  });
+
+  it('falls back to a fresh follow-up and resets to baseline when dirty no-commit success stays unresolved', async () => {
+    const resumeSessionIds: Array<string | undefined> = [];
+    let engineerCalls = 0;
+
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        engineerCalls += 1;
+        if (engineerCalls === 1) {
+          return engineerSuccess(['src/a.ts'], {
+            skipCommit: true,
+            dirtyStatus: ' M src/a.ts',
+            sessionId: 'session-dirty-3',
+          });
+        }
+        if (engineerCalls === 2) {
+          resumeSessionIds.push(params.resumeSessionId);
+          throw new Error('same-session follow-up failed');
+        }
+        if (engineerCalls === 3) {
+          resumeSessionIds.push(params.resumeSessionId);
+          return engineerFailure();
+        }
+      }
+      if (params.role === 'review') {
+        throw new Error('Reviewer should not run when unresolved dirty changes are reset to no-op');
+      }
+      throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    expect(resumeSessionIds).toEqual(['session-dirty-3', undefined]);
+    expect(gitMockState.currentHead).toBe('head-0');
+    expect(gitMockState.statusPorcelain).toBe('');
+    expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      commitHash: 'head-0',
     });
   });
 

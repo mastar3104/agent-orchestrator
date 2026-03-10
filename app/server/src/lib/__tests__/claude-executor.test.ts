@@ -57,6 +57,7 @@ describe('runClaude JSON parsing', () => {
       type: 'result',
       subtype: 'success',
       result: '',
+      session_id: 'session-123',
       structured_output: {
         review_status: 'request_changes',
         comments: ['fix this', 'fix that'],
@@ -70,6 +71,7 @@ describe('runClaude JSON parsing', () => {
       review_status: 'request_changes',
       comments: ['fix this', 'fix that'],
     });
+    expect(result.sessionId).toBe('session-123');
   });
 
   it('should fall back to result field when structured_output is absent', async () => {
@@ -143,5 +145,29 @@ describe('runClaude JSON parsing', () => {
 
     const result = await promise;
     expect(result.output).toBe('');
+  });
+
+  it('should pass -r when resumeSessionId is provided', async () => {
+    const proc = createMockProc();
+    mockSpawn.mockReturnValue(proc);
+
+    const promise = runClaude<string>(baseOptions({ resumeSessionId: 'resume-123' }));
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      '/usr/bin/claude',
+      expect.arrayContaining(['-p', '-r', 'resume-123']),
+      expect.any(Object)
+    );
+
+    const output = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: 'ok',
+    });
+    proc.stdout!.emit('data', Buffer.from(output));
+    proc.emit('close', 0);
+
+    const result = await promise;
+    expect(result.output).toBe('ok');
   });
 });

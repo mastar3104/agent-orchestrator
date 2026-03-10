@@ -42,6 +42,7 @@ export interface AgentExecutionOutput {
   stdout: string;
   stderr: string;
   parsedOutput: unknown;
+  sessionId?: string;
   exitCode: number;
   durationMs: number;
   timestamp: string;
