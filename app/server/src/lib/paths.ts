@@ -1,6 +1,8 @@
-import { join } from 'path';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 
 const DATA_DIR = process.env.DATA_DIR || join(process.cwd(), 'data');
+const SERVER_ROOT_DIR = join(dirname(fileURLToPath(import.meta.url)), '../..');
 
 export function getDataDir(): string {
   return DATA_DIR;
@@ -56,6 +58,10 @@ export function getHookLogDir(itemId: string, repoName: string): string {
   return join(getItemDir(itemId), 'hooks', repoName);
 }
 
+export function getRepoSetupLogDir(itemId: string, repoName: string): string {
+  return join(getItemDir(itemId), 'setup', repoName);
+}
+
 export function getTaskStateDir(itemId: string): string {
   return join(getWorkspaceRoot(itemId), 'task-state');
 }
@@ -70,4 +76,8 @@ export function getTaskStateArchiveDir(itemId: string): string {
 
 export function getRepositoriesPath(): string {
   return join(DATA_DIR, 'repositories.yaml');
+}
+
+export function getRoleToolsLocalPath(): string {
+  return join(SERVER_ROOT_DIR, 'config', 'role-tools.local.yaml');
 }

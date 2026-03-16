@@ -73,6 +73,8 @@ export async function executeAgent<T>(options: {
   repoName?: string;
   currentTask?: string;
   prompt: string;
+  appendSystemPrompt?: string;
+  addDirs?: string[];
   workingDir: string;
   allowedTools: string[];
   jsonSchema: object;
@@ -123,6 +125,8 @@ export async function executeAgent<T>(options: {
   try {
     const result = await runClaude<T>({
       prompt: options.prompt,
+      appendSystemPrompt: options.appendSystemPrompt,
+      addDirs: options.addDirs,
       allowedTools: options.allowedTools,
       jsonSchema: options.jsonSchema,
       cwd: options.workingDir,

@@ -12,6 +12,7 @@ vi.mock('../../lib/paths', () => ({
   getWorkspaceRoot: vi.fn().mockReturnValue('/workspace'),
   getAgentEventsPath: vi.fn().mockReturnValue('/agent-events.jsonl'),
   getRepoWorkspaceDir: vi.fn().mockReturnValue('/workspace/repo'),
+  getRepoTaskStatePath: vi.fn((_itemId: string, repoName: string) => `/workspace/task-state/${repoName}.yaml`),
 }));
 
 vi.mock('../../lib/yaml', () => ({
@@ -25,6 +26,7 @@ vi.mock('fs', () => ({
 vi.mock('fs/promises', () => ({
   readdir: vi.fn().mockResolvedValue([]),
   readFile: vi.fn().mockResolvedValue(''),
+  rm: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../item-service', () => ({
@@ -59,7 +61,7 @@ vi.mock('../../lib/events', () => ({
 }));
 
 vi.mock('../../lib/role-loader', () => ({
-  getRole: vi.fn().mockReturnValue({ promptTemplate: '', allowedTools: [], jsonSchema: undefined }),
+  getRole: vi.fn().mockReturnValue({ systemPrompt: '', allowedTools: [], jsonSchema: undefined }),
 }));
 
 vi.mock('../planner-service', () => ({
@@ -89,16 +91,22 @@ function makeEvent(type: string, extra: Record<string, unknown> = {}): ItemEvent
 }
 
 function setPlanRepos(repos: string[]) {
-  mockReadYamlSafe.mockResolvedValue({
+  const plan = {
     summary: 'test',
     tasks: repos.map(r => ({ id: `T-${r}`, title: 'test', description: 'test', repository: r })),
-  } as any);
+  } as any;
+  mockReadYamlSafe.mockImplementation(async (path?: string) => {
+    if (path === '/workspace/plan.yaml') {
+      return plan;
+    }
+    return null;
+  });
 }
 
 describe('validateReviewReceivePreConditions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockReadYamlSafe.mockResolvedValue(null);
+    mockReadYamlSafe.mockImplementation(async () => null);
   });
 
   it('rejects when no PR exists (repoName omitted)', async () => {

@@ -112,7 +112,7 @@ function RepositoryDetails({ repository }: RepositoryDetailsProps) {
         )}
         {repository.allowedTools && repository.allowedTools.length > 0 && (
           <div className="col-span-2">
-            <span className="text-gray-400">Tools:</span>{' '}
+            <span className="text-gray-400">Engineer Tools:</span>{' '}
             <span className="flex items-center gap-1 flex-wrap mt-0.5">
               {repository.allowedTools.map((tool, i) => (
                 <span

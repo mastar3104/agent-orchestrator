@@ -26,7 +26,7 @@ function buildApp() {
   return app;
 }
 
-describe('repository routes allowedTools validation', () => {
+describe('repository routes validation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -104,5 +104,102 @@ describe('repository routes allowedTools validation', () => {
 
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toContain('allowedTools[1] must be a string');
+  });
+
+  it('accepts remote setup commands and trims blank lines', async () => {
+    mockReadYamlSafe.mockResolvedValue([]);
+
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/repositories',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'repo-a',
+        type: 'remote',
+        url: 'https://github.com/test/repo.git',
+        setup: ['  yarn install --frozen-lockfile  ', '   ', 'npm run build'],
+      }),
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.json().data.repository.setup).toEqual(['yarn install --frozen-lockfile', 'npm run build']);
+    expect(mockWriteYaml).toHaveBeenCalledWith(
+      '/repositories.yaml',
+      [
+        expect.objectContaining({
+          name: 'repo-a',
+          setup: ['yarn install --frozen-lockfile', 'npm run build'],
+        }),
+      ]
+    );
+  });
+
+  it('persists rolePrompts for supported roles', async () => {
+    mockReadYamlSafe.mockResolvedValue([]);
+
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/repositories',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'repo-a',
+        type: 'remote',
+        url: 'https://github.com/test/repo.git',
+        rolePrompts: {
+          planner: '  repo planner prompt  ',
+          engineer: 'repo engineer prompt',
+        },
+      }),
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.json().data.repository.rolePrompts).toEqual({
+      planner: 'repo planner prompt',
+      engineer: 'repo engineer prompt',
+    });
+  });
+
+  it('returns 400 when rolePrompts contains an unsupported role', async () => {
+    mockReadYamlSafe.mockResolvedValue([]);
+
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/repositories',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'repo-a',
+        type: 'remote',
+        url: 'https://github.com/test/repo.git',
+        rolePrompts: {
+          unknownRole: 'prompt',
+        },
+      }),
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toContain('not a supported role');
+  });
+
+  it('returns 400 when setup is provided for a local repository', async () => {
+    mockReadYamlSafe.mockResolvedValue([]);
+
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/repositories',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'repo-a',
+        type: 'local',
+        localPath: '/tmp/repo-a',
+        setup: ['yarn install --frozen-lockfile'],
+      }),
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe('setup is only supported for remote repositories');
   });
 });

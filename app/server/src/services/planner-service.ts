@@ -16,10 +16,12 @@ import {
   getItemPlanPath,
   getItemEventsPath,
   getWorkspaceRoot,
+  getRepoWorkspaceDir,
 } from '../lib/paths';
 import { eventBus } from './event-bus';
 import { type PlannerResponse } from '../lib/claude-schemas';
 import { getRole } from '../lib/role-loader';
+import { composePlannerRepositoryPrompts } from '../lib/repository-role-prompts';
 
 type LegacyPlanTask = PlanTask & { agent?: string };
 type LegacyPlan = Omit<Plan, 'tasks'> & { tasks: LegacyPlanTask[] };
@@ -71,8 +73,8 @@ async function persistCurrentPlan(
   return { plan: normalizedPlan, content: normalizedContent };
 }
 
-async function loadGeneratedPlan(itemId: string): Promise<Plan> {
-  const planPath = getItemPlanPath(itemId);
+async function loadGeneratedPlan(itemId: string, sourcePath?: string): Promise<Plan> {
+  const planPath = sourcePath ?? getItemPlanPath(itemId);
   if (!existsSync(planPath)) {
     throw new Error('Planner completed but plan.yaml was not created');
   }
@@ -114,9 +116,9 @@ export async function archiveCurrentExecutionArtifacts(
 export async function finalizeGeneratedPlan(
   itemId: string,
   itemConfig: ItemConfig,
-  options?: { allowEmptyTasks?: boolean }
+  options?: { allowEmptyTasks?: boolean; sourcePath?: string }
 ): Promise<void> {
-  const plan = await loadGeneratedPlan(itemId);
+  const plan = await loadGeneratedPlan(itemId, options?.sourcePath);
   if (!options?.allowEmptyTasks && plan.tasks.length === 0) {
     throw new Error('plan.yaml has no tasks');
   }
@@ -140,15 +142,17 @@ export async function startPlanner(itemId: string): Promise<void> {
   }
 
   const role = getRole('planner');
-  const context = buildPlannerContext(config);
-  const prompt = `${role.promptTemplate}\n\n${context}`;
+  const context = buildPlannerPrompt(config);
   const workspaceRoot = getWorkspaceRoot(itemId);
+  const addDirs = getPlannerAddDirs(itemId, config);
 
   await archiveCurrentExecutionArtifacts(itemId);
   await executeAgent<PlannerResponse>({
     itemId,
     role: 'planner',
-    prompt,
+    prompt: context,
+    appendSystemPrompt: role.systemPrompt,
+    addDirs,
     workingDir: workspaceRoot,
     allowedTools: role.allowedTools,
     jsonSchema: role.jsonSchema,
@@ -179,6 +183,30 @@ ${config.designDoc || 'No design document provided.'}
 
 Use the \`repository\` field to specify which repository each task belongs to.
 Do not include review tasks or any \`agent\` field in plan.yaml.`;
+}
+
+function buildPlannerPrompt(config: ItemConfig): string {
+  return composePlannerRepositoryPrompts(
+    buildPlannerContext(config),
+    config.repositories
+  );
+}
+
+function getPlannerAddDirs(itemId: string, config: ItemConfig): string[] {
+  const seen = new Set<string>();
+  const addDirs: string[] = [];
+
+  for (const repository of config.repositories) {
+    const repoDir = getRepoWorkspaceDir(itemId, repository.name);
+    if (!existsSync(repoDir) || seen.has(repoDir)) {
+      continue;
+    }
+
+    seen.add(repoDir);
+    addDirs.push(repoDir);
+  }
+
+  return addDirs;
 }
 
 export async function getPlan(itemId: string): Promise<Plan | null> {
@@ -360,16 +388,18 @@ export async function planFeedback(
 
   const currentPlanContent = await readFile(planPath, 'utf-8');
   const role = getRole('planner');
-  const context = buildPlannerContext(config);
+  const context = buildPlannerPrompt(config);
   const feedbackSection = formatFeedbacks(feedbacks, currentPlanContent);
-  const prompt = `${role.promptTemplate}\n\n${context}\n\n${feedbackSection}`;
   const workspaceRoot = getWorkspaceRoot(itemId);
+  const addDirs = getPlannerAddDirs(itemId, config);
 
   await archiveCurrentExecutionArtifacts(itemId);
   await executeAgent<PlannerResponse>({
     itemId,
     role: 'planner',
-    prompt,
+    prompt: `${context}\n\n${feedbackSection}`,
+    appendSystemPrompt: role.systemPrompt,
+    addDirs,
     workingDir: workspaceRoot,
     allowedTools: role.allowedTools,
     jsonSchema: role.jsonSchema,

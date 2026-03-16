@@ -18,6 +18,8 @@ import type {
   CloneCompletedEvent,
   WorkspaceSetupStartedEvent,
   WorkspaceSetupCompletedEvent,
+  RepoSetupStartedEvent,
+  RepoSetupCompletedEvent,
   ErrorEvent,
   ErrorPhase,
   PrCreatedEvent,
@@ -80,6 +82,38 @@ export function createCloneCompletedEvent(
     repoName,
     success,
     error,
+  };
+}
+
+export function createRepoSetupStartedEvent(
+  itemId: string,
+  repoName: string,
+  commands: string[]
+): RepoSetupStartedEvent {
+  return {
+    id: createEventId(),
+    type: 'repo_setup_started',
+    timestamp: timestamp(),
+    itemId,
+    repoName,
+    commands,
+  };
+}
+
+export function createRepoSetupCompletedEvent(
+  itemId: string,
+  repoName: string,
+  results: HookResult[],
+  allPassed: boolean
+): RepoSetupCompletedEvent {
+  return {
+    id: createEventId(),
+    type: 'repo_setup_completed',
+    timestamp: timestamp(),
+    itemId,
+    repoName,
+    results,
+    allPassed,
   };
 }
 

@@ -9,6 +9,7 @@ import type {
   ReviewReceiveCompletedEvent,
   CloneCompletedEvent,
   WorkspaceSetupCompletedEvent,
+  RepoSetupCompletedEvent,
   AgentStartedEvent,
   AgentExitedEvent,
   ErrorEvent,
@@ -123,8 +124,13 @@ export async function deriveRepoStatuses(itemId: string): Promise<Map<string, Re
             state.status = 'error';
             state.activePhase = 'clone';
             state.lastErrorMessage = ev.error;
+          } else {
+            state.status = 'running';
+            if (state.activePhase === 'clone') {
+              state.activePhase = undefined;
+            }
+            state.lastErrorMessage = undefined;
           }
-          // success: keep running, workspace_setup follows
         }
         break;
       }
@@ -144,8 +150,33 @@ export async function deriveRepoStatuses(itemId: string): Promise<Map<string, Re
             state.status = 'error';
             state.activePhase = 'workspace_setup';
             state.lastErrorMessage = ev.error;
+          } else {
+            state.status = 'running';
+            if (state.activePhase === 'workspace_setup') {
+              state.activePhase = undefined;
+            }
+            state.lastErrorMessage = undefined;
           }
-          // success: keep status as-is, waiting for plan
+        }
+        break;
+      }
+      case 'repo_setup_started': {
+        const ev = e as import('@agent-orch/shared').RepoSetupStartedEvent;
+        ensureRepo(repoStates, ev.repoName, currentPlanRepos);
+        const state = repoStates.get(ev.repoName)!;
+        state.status = 'running';
+        state.activePhase = 'setup';
+        break;
+      }
+      case 'repo_setup_completed': {
+        const ev = e as RepoSetupCompletedEvent;
+        const state = repoStates.get(ev.repoName);
+        if (state) {
+          state.status = 'running';
+          if (state.activePhase === 'setup') {
+            state.activePhase = undefined;
+          }
+          state.lastErrorMessage = undefined;
         }
         break;
       }
@@ -517,12 +548,16 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
   }
 
   // 2. Clone/workspace_setup incomplete
-  const hasCloneStarted = events.some(e => e.type === 'clone_started' || e.type === 'workspace_setup_started');
-  if (hasCloneStarted) {
-    const allReposSetup = allRepos.every(r => r.activePhase !== 'clone' && r.activePhase !== 'workspace_setup' || r.status !== 'running');
-    // Check if there are repos still in clone/setup phase
+  const hasWorkspaceStarted = events.some((e) =>
+    e.type === 'clone_started' || e.type === 'workspace_setup_started' || e.type === 'repo_setup_started'
+  );
+  if (hasWorkspaceStarted) {
     const stillCloning = allRepos.some(r =>
-      r.status === 'running' && (r.activePhase === 'clone' || r.activePhase === 'workspace_setup')
+      r.status === 'running' && (
+        r.activePhase === 'clone' ||
+        r.activePhase === 'workspace_setup' ||
+        r.activePhase === 'setup'
+      )
     );
     if (stillCloning) {
       return 'cloning';
@@ -530,40 +565,62 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
   }
 
   // 3. Planner running
+  const hasPlan = events.some(e => e.type === 'plan_created');
   const agentRoles = new Map<string, string>();
   const agentStates = new Map<string, AgentStatus>();
+  let latestPlannerStatus: AgentStatus | undefined;
+  let hasPlannerSignal = false;
   for (const event of events) {
     if (event.type === 'agent_started') {
       const e = event as AgentStartedEvent;
       agentRoles.set(e.agentId, e.role);
       agentStates.set(e.agentId, 'running');
+      if (e.role === 'planner') {
+        latestPlannerStatus = 'running';
+        hasPlannerSignal = true;
+      }
     } else if (event.type === 'agent_exited' && event.agentId) {
       const e = event as AgentExitedEvent;
       const current = agentStates.get(event.agentId);
       if (current !== 'stopped') {
-        agentStates.set(event.agentId, e.exitCode === 0 ? 'completed' : 'error');
+        const nextStatus = e.exitCode === 0 ? 'completed' : 'error';
+        agentStates.set(event.agentId, nextStatus);
+        if (agentRoles.get(event.agentId) === 'planner') {
+          latestPlannerStatus = nextStatus;
+          hasPlannerSignal = true;
+        }
       }
     } else if (event.type === 'status_changed' && event.agentId) {
       const e = event as import('@agent-orch/shared').StatusChangedEvent;
       const current = agentStates.get(event.agentId);
       if (current !== 'stopped') {
-        agentStates.set(event.agentId, mapAgentStatus(e.newStatus));
+        const nextStatus = mapAgentStatus(e.newStatus);
+        agentStates.set(event.agentId, nextStatus);
+        if (agentRoles.get(event.agentId) === 'planner') {
+          latestPlannerStatus = nextStatus;
+          hasPlannerSignal = true;
+        }
+      }
+    } else if (event.type === 'error') {
+      const e = event as ErrorEvent;
+      if (e.phase === 'planner') {
+        latestPlannerStatus = 'error';
+        hasPlannerSignal = true;
       }
     }
   }
 
-  const plannerAgentId = [...agentStates.keys()].find(id => agentRoles.get(id) === 'planner');
-  if (plannerAgentId && agentStates.get(plannerAgentId) === 'running') {
+  if (latestPlannerStatus === 'running') {
     return 'planning';
   }
 
   // 4. Planner failed & no current plan
-  const hasPlan = events.some(e => e.type === 'plan_created');
-  if (!hasPlan && plannerAgentId) {
-    const plannerStatus = agentStates.get(plannerAgentId);
-    if (plannerStatus === 'error') {
-      return 'error';
-    }
+  if (!hasPlan && latestPlannerStatus === 'error') {
+    return 'error';
+  }
+
+  if (hasWorkspaceStarted && !hasPlannerSignal && !hasPlan && allRepos.some((r) => r.status === 'running')) {
+    return 'cloning';
   }
 
   // 5. Any repo review_receiving

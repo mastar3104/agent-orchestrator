@@ -5,6 +5,7 @@ import { join } from 'path';
 import { nanoid } from 'nanoid';
 import type {
   AgentInfo,
+  HookResult,
   ItemConfig,
   ItemRepositoryConfig,
   ItemSummary,
@@ -30,7 +31,7 @@ import type {
 } from '@agent-orch/shared';
 import { getRepository, createRepository } from './repository-service';
 import { normalizeItemConfig } from '../lib/repository-config';
-import { sanitizeRepoAllowedTools } from '../lib/role-loader';
+import { sanitizeRepoAllowedTools, sanitizeRolePrompts } from '../lib/role-loader';
 import { readYaml, writeYaml, readYamlSafe } from '../lib/yaml';
 import { appendJsonl, readJsonl } from '../lib/jsonl';
 import {
@@ -41,15 +42,19 @@ import {
   getItemEventsPath,
   getWorkspaceRoot,
   getRepoWorkspaceDir,
+  getRepoSetupLogDir,
 } from '../lib/paths';
 import {
   createItemCreatedEvent,
   createCloneStartedEvent,
   createCloneCompletedEvent,
+  createRepoSetupStartedEvent,
+  createRepoSetupCompletedEvent,
   createWorkspaceSetupStartedEvent,
   createWorkspaceSetupCompletedEvent,
   createErrorEvent,
 } from '../lib/events';
+import { runShellCommands } from '../lib/command-runner';
 import { deriveItemStatus, deriveRepoStatuses, getPendingApprovals, type RepoDerivedState } from './state-service';
 import { getAgentsByItem, stopAgent } from './agent-service';
 import { stopAllGitSnapshots } from './git-snapshot-service';
@@ -86,6 +91,8 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
         submodules: savedRepo.submodules,
         linkMode: savedRepo.linkMode,
         allowedTools: repoInput.allowedTools || savedRepo.allowedTools,
+        rolePrompts: savedRepo.rolePrompts,
+        setup: savedRepo.setup,
         hooks: savedRepo.hooks,
         hooksMaxAttempts: savedRepo.hooksMaxAttempts,
       };
@@ -101,6 +108,7 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
         submodules: repoInput.repository.submodules,
         linkMode: repoInput.repository.linkMode,
         allowedTools: repoInput.allowedTools || repoInput.repository.allowedTools,
+        rolePrompts: repoInput.repository.rolePrompts,
         hooks: repoInput.repository.hooks,
       };
 
@@ -116,6 +124,7 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
           linkMode: repoInput.repository.linkMode,
           directoryName: repoInput.name,
           allowedTools: repoConfig.allowedTools,
+          rolePrompts: repoConfig.rolePrompts,
           hooks: repoConfig.hooks,
         });
       }
@@ -125,6 +134,10 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
 
     if (repoConfig.allowedTools && repoConfig.allowedTools.length > 0) {
       repoConfig.allowedTools = sanitizeRepoAllowedTools(repoConfig.name, repoConfig.allowedTools);
+    }
+
+    if (repoConfig.rolePrompts) {
+      repoConfig.rolePrompts = sanitizeRolePrompts(repoConfig.name, repoConfig.rolePrompts);
     }
 
     repositories.push(repoConfig);
@@ -270,60 +283,85 @@ async function cloneRemoteRepo(
     args.push(url, repo.name);
 
     // Execute git clone
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn('git', args, {
-        cwd: workspaceRoot,
-        stdio: 'pipe',
-      });
-
-      let stderr = '';
-      proc.stderr?.on('data', (data) => {
-        stderr += data.toString();
-      });
-
-      proc.on('close', (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(new Error(`Git clone failed: ${stderr}`));
-        }
-      });
-
-      proc.on('error', reject);
-    });
+    await runGitCommand(args, workspaceRoot, 'Git clone failed');
 
     // Create work branch if specified
     if (repo.workBranch) {
-      await new Promise<void>((resolve, reject) => {
-        const proc = spawn('git', ['checkout', '-b', repo.workBranch!], {
-          cwd: repoDir,
-          stdio: 'pipe',
-        });
-
-        let stderr = '';
-        proc.stderr?.on('data', (data) => {
-          stderr += data.toString();
-        });
-
-        proc.on('close', (code) => {
-          if (code === 0) {
-            resolve();
-          } else {
-            reject(new Error(`Failed to create work branch: ${stderr}`));
-          }
-        });
-
-        proc.on('error', reject);
-      });
+      await runGitCommand(['checkout', '-b', repo.workBranch], repoDir, 'Failed to create work branch');
     }
 
     // Log clone completed
     await appendJsonl(eventsPath, createCloneCompletedEvent(itemId, repo.name, true));
+    await runRepoSetupCommands(itemId, repo, repoDir, eventsPath);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     await appendJsonl(eventsPath, createCloneCompletedEvent(itemId, repo.name, false, message));
     throw error;
   }
+}
+
+async function runGitCommand(args: string[], cwd: string, errorPrefix: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn('git', args, {
+      cwd,
+      stdio: 'pipe',
+    });
+
+    let stderr = '';
+    proc.stderr?.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`${errorPrefix}: ${stderr}`));
+      }
+    });
+
+    proc.on('error', reject);
+  });
+}
+
+function createRepoSetupFailureResult(command: string, message: string): HookResult {
+  return {
+    command,
+    exitCode: null,
+    stderr: message,
+    stdout: '',
+    durationMs: 0,
+    timedOut: false,
+  };
+}
+
+async function runRepoSetupCommands(
+  itemId: string,
+  repo: ItemRepositoryConfig,
+  repoDir: string,
+  eventsPath: string
+): Promise<void> {
+  const commands = (repo.setup || []).map((command) => command.trim()).filter((command) => command.length > 0);
+  if (commands.length === 0) {
+    return;
+  }
+
+  await appendJsonl(eventsPath, createRepoSetupStartedEvent(itemId, repo.name, commands));
+
+  let results: HookResult[];
+  try {
+    results = await runShellCommands(commands, repoDir, {
+      logDir: getRepoSetupLogDir(itemId, repo.name),
+      attempt: 1,
+      stopOnError: true,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    results = [createRepoSetupFailureResult(commands[0] ?? '<setup>', message)];
+  }
+
+  const allPassed = results.every((result) => result.exitCode === 0);
+  await appendJsonl(eventsPath, createRepoSetupCompletedEvent(itemId, repo.name, results, allPassed));
 }
 
 export async function listItems(): Promise<ItemSummary[]> {
@@ -432,7 +470,7 @@ export function buildWorkflowSummary(params: {
   const workspaceRunningRepos = config.repositories.filter((repo) => {
     const derived = repoStatuses.get(repo.name);
     return derived?.status === 'running' && (
-      derived.activePhase === 'clone' || derived.activePhase === 'workspace_setup'
+      derived.activePhase === 'clone' || derived.activePhase === 'workspace_setup' || derived.activePhase === 'setup'
     );
   });
 
@@ -451,10 +489,20 @@ export function buildWorkflowSummary(params: {
         event.success
       );
     }
-    return events.some((event) =>
+    const cloneSucceeded = events.some((event) =>
       event.type === 'clone_completed' &&
       event.repoName === repo.name &&
       event.success
+    );
+    if (!cloneSucceeded) {
+      return false;
+    }
+    if (!repo.setup || repo.setup.length === 0) {
+      return true;
+    }
+    return events.some((event) =>
+      event.type === 'repo_setup_completed' &&
+      event.repoName === repo.name
     );
   });
 
@@ -501,6 +549,8 @@ export function buildWorkflowSummary(params: {
         currentPhase: taskState?.currentPhase,
         attempts: taskState?.attempts ?? 0,
         reviewRounds: taskState?.reviewRounds,
+        reviewExhausted: taskState?.reviewExhausted,
+        hooksExhausted: taskState?.hooksExhausted,
         lastError: taskState?.lastError,
       };
     });

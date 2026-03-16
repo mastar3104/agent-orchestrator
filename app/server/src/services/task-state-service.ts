@@ -19,6 +19,8 @@ export interface RepoTaskStateTask {
   attempts: number;
   phaseBase?: string;
   reviewRounds?: number;
+  reviewExhausted?: boolean;
+  hooksExhausted?: boolean;
   lastStartedAt?: string;
   completedAt?: string;
   lastError?: string;

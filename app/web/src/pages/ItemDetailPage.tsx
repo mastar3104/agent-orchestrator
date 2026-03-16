@@ -159,6 +159,8 @@ export function ItemDetailPage() {
       event.type === 'clone_completed' ||
       event.type === 'workspace_setup_started' ||
       event.type === 'workspace_setup_completed' ||
+      event.type === 'repo_setup_started' ||
+      event.type === 'repo_setup_completed' ||
       event.type === 'agent_started' ||
       event.type === 'agent_exited' ||
       event.type === 'status_changed' ||
@@ -490,6 +492,8 @@ export function ItemDetailPage() {
                   <div className="space-y-2">
                     {job.steps.map((step) => {
                       const isRunning = step.status === 'in_progress' || step.status === 'in_review';
+                      const showReviewExhausted = step.status === 'completed' && step.reviewExhausted;
+                      const showHooksExhausted = Boolean(step.hooksExhausted);
                       return (
                         <div
                           key={step.taskId}
@@ -521,6 +525,16 @@ export function ItemDetailPage() {
                                 </span>
                                 <span className="text-sm font-medium text-white">{step.taskId}</span>
                                 <span className="text-sm text-gray-300 truncate">{step.title}</span>
+                                {showReviewExhausted ? (
+                                  <span className="px-2 py-0.5 rounded-full text-[11px] bg-amber-500/20 text-amber-200">
+                                    review exhausted
+                                  </span>
+                                ) : null}
+                                {showHooksExhausted ? (
+                                  <span className="px-2 py-0.5 rounded-full text-[11px] bg-orange-500/20 text-orange-200">
+                                    hooks exhausted
+                                  </span>
+                                ) : null}
                               </div>
                               {step.lastError && (
                                 <p className="text-xs text-red-300 mt-2">{step.lastError}</p>

@@ -72,6 +72,8 @@ function makeTaskState(
       currentPhase: task.currentPhase,
       attempts: task.attempts || 0,
       reviewRounds: task.reviewRounds,
+      reviewExhausted: task.reviewExhausted,
+      hooksExhausted: task.hooksExhausted,
       lastError: task.lastError,
     })),
   };
@@ -204,6 +206,71 @@ describe('buildWorkflowSummary', () => {
       expect.objectContaining({
         status: 'running',
         activeStage: 'publish',
+      })
+    );
+  });
+
+  it('keeps review-exhausted completed tasks in publish flow without increasing failed steps', () => {
+    const summary = buildSummary({
+      itemStatus: 'running',
+      plan: makePlan([{ id: 'T1', repository: 'repo-a', title: 'Task 1' }]),
+      repoStatuses: new Map([['repo-a', makeRepoState({ status: 'running', inCurrentPlan: true })]]),
+      taskStates: new Map([
+        ['repo-a', makeTaskState('repo-a', [{
+          id: 'T1',
+          title: 'Task 1',
+          status: 'completed',
+          attempts: 1,
+          reviewRounds: 3,
+          reviewExhausted: true,
+        }])],
+      ]),
+    });
+
+    expect(summary.jobs[0]).toEqual(
+      expect.objectContaining({
+        status: 'running',
+        activeStage: 'publish',
+        completedSteps: 1,
+        failedSteps: 0,
+      })
+    );
+    expect(summary.jobs[0].steps[0]).toEqual(
+      expect.objectContaining({
+        status: 'completed',
+        reviewExhausted: true,
+      })
+    );
+  });
+
+  it('keeps hooks-exhausted completed tasks in publish flow without increasing failed steps', () => {
+    const summary = buildSummary({
+      itemStatus: 'running',
+      plan: makePlan([{ id: 'T1', repository: 'repo-a', title: 'Task 1' }]),
+      repoStatuses: new Map([['repo-a', makeRepoState({ status: 'running', inCurrentPlan: true })]]),
+      taskStates: new Map([
+        ['repo-a', makeTaskState('repo-a', [{
+          id: 'T1',
+          title: 'Task 1',
+          status: 'completed',
+          attempts: 1,
+          hooksExhausted: true,
+        }])],
+      ]),
+    });
+
+    expect(summary.jobs[0]).toEqual(
+      expect.objectContaining({
+        status: 'running',
+        activeStage: 'publish',
+        completedSteps: 1,
+        failedSteps: 0,
+      })
+    );
+    expect(summary.jobs[0].steps[0]).toEqual(
+      expect.objectContaining({
+        status: 'completed',
+        hooksExhausted: true,
       })
     );
   });

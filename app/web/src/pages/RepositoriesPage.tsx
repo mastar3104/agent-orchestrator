@@ -1,6 +1,12 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import type { GitRepository, CreateRepositoryRequest, UpdateRepositoryRequest } from '@agent-orch/shared';
+import {
+  type EditableRolePromptKey,
+  type GitRepository,
+  type CreateRepositoryRequest,
+  type UpdateRepositoryRequest,
+  type RolePrompts,
+} from '@agent-orch/shared';
 import { useRepositoryList } from '../hooks/useRepositories';
 
 type RepoType = 'remote' | 'local';
@@ -16,7 +22,35 @@ interface RepoFormData {
   linkMode: LinkMode;
   directoryName: string;
   allowedTools: string;
+  rolePrompts: Record<EditableRolePromptKey, string>;
+  setup: string;
   hooks: string;
+}
+
+const EDITABLE_ROLE_PROMPT_KEYS: EditableRolePromptKey[] = [
+  'planner',
+  'engineer',
+  'reviewer',
+  'reviewReceiver',
+  'testPlanner',
+];
+
+const ROLE_PROMPT_LABELS: Record<EditableRolePromptKey, string> = {
+  planner: 'Planner',
+  engineer: 'Engineer',
+  reviewer: 'Reviewer',
+  reviewReceiver: 'Review Receiver',
+  testPlanner: 'Test Planner',
+};
+
+function createEmptyRolePrompts(): Record<EditableRolePromptKey, string> {
+  return {
+    planner: '',
+    engineer: '',
+    reviewer: '',
+    reviewReceiver: '',
+    testPlanner: '',
+  };
 }
 
 const emptyForm: RepoFormData = {
@@ -29,6 +63,8 @@ const emptyForm: RepoFormData = {
   linkMode: 'symlink',
   directoryName: '',
   allowedTools: '',
+  rolePrompts: createEmptyRolePrompts(),
+  setup: '',
   hooks: '',
 };
 
@@ -43,6 +79,11 @@ function repoToForm(repo: GitRepository): RepoFormData {
     linkMode: repo.linkMode || 'symlink',
     directoryName: repo.directoryName || '',
     allowedTools: (repo.allowedTools || []).join(', '),
+    rolePrompts: {
+      ...createEmptyRolePrompts(),
+      ...(repo.rolePrompts || {}),
+    },
+    setup: (repo.setup || []).join('\n'),
     hooks: (repo.hooks || []).join('\n'),
   };
 }
@@ -65,9 +106,29 @@ export function RepositoriesPage() {
     return tools.length > 0 ? tools : undefined;
   };
 
+  const parseRolePrompts = (raw: Record<EditableRolePromptKey, string>, preserveEmptyObject: boolean = false): RolePrompts | undefined => {
+    const entries = EDITABLE_ROLE_PROMPT_KEYS
+      .map((key) => [key, raw[key].trim()] as const)
+      .filter(([, value]) => value.length > 0);
+
+    if (entries.length === 0) {
+      return preserveEmptyObject ? {} : undefined;
+    }
+
+    return Object.fromEntries(entries) as RolePrompts;
+  };
+
   const parseHooks = (raw: string): string[] | undefined => {
     const hooks = raw.split('\n').map(h => h.trim()).filter(h => h.length > 0);
     return hooks.length > 0 ? hooks : undefined;
+  };
+
+  const parseSetup = (raw: string, preserveEmptyArray: boolean = false): string[] | undefined => {
+    const commands = raw.split('\n').map(command => command.trim()).filter(command => command.length > 0);
+    if (commands.length > 0) {
+      return commands;
+    }
+    return preserveEmptyArray ? [] : undefined;
   };
 
   const handleCreate = async () => {
@@ -84,6 +145,8 @@ export function RepositoriesPage() {
         linkMode: form.type === 'local' ? form.linkMode : undefined,
         directoryName: form.directoryName || undefined,
         allowedTools: parseAllowedTools(form.allowedTools),
+        rolePrompts: parseRolePrompts(form.rolePrompts),
+        setup: form.type === 'remote' ? parseSetup(form.setup) : undefined,
         hooks: parseHooks(form.hooks),
       };
       await create(data);
@@ -108,6 +171,8 @@ export function RepositoriesPage() {
         linkMode: form.linkMode,
         directoryName: form.directoryName || undefined,
         allowedTools: parseAllowedTools(form.allowedTools),
+        rolePrompts: parseRolePrompts(form.rolePrompts, true),
+        setup: form.type === 'remote' ? parseSetup(form.setup, true) : undefined,
         hooks: parseHooks(form.hooks),
       };
       await update(editingId, data);
@@ -255,7 +320,7 @@ export function RepositoriesPage() {
       )}
 
       <div>
-        <label className="block text-xs font-medium text-gray-400 mb-1">Allowed Tools</label>
+        <label className="block text-xs font-medium text-gray-400 mb-1">Engineer Extra Tools</label>
         <input
           type="text"
           value={form.allowedTools}
@@ -264,9 +329,51 @@ export function RepositoriesPage() {
           placeholder="Bash(git status), Bash(npm run test)"
         />
         <p className="text-xs text-yellow-600 mt-0.5">
-          Comma-separated. Values are passed to Claude CLI as-is. Dangerous commands can also be configured - use at your own risk.
+          Comma-separated. Applied only to the engineer role. Values are passed to Claude CLI as-is. Dangerous commands can also be configured - use at your own risk.
         </p>
       </div>
+
+      <div>
+        <label className="block text-xs font-medium text-gray-400 mb-2">Role Prompts</label>
+        <div className="space-y-2">
+          {EDITABLE_ROLE_PROMPT_KEYS.map((roleKey) => (
+            <div key={roleKey}>
+              <label className="block text-xs font-medium text-gray-500 mb-1">
+                {ROLE_PROMPT_LABELS[roleKey]}
+              </label>
+              <textarea
+                value={form.rolePrompts[roleKey]}
+                onChange={(e) => setForm((prev) => ({
+                  ...prev,
+                  rolePrompts: {
+                    ...prev.rolePrompts,
+                    [roleKey]: e.target.value,
+                  },
+                }))}
+                rows={2}
+                className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm focus:outline-none focus:border-blue-500"
+                placeholder={`Optional repository-specific prompt for ${ROLE_PROMPT_LABELS[roleKey]}`}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {form.type === 'remote' && (
+        <div>
+          <label className="block text-xs font-medium text-gray-400 mb-1">Setup Commands</label>
+          <textarea
+            value={form.setup}
+            onChange={e => updateField('setup', e.target.value)}
+            rows={3}
+            className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm font-mono focus:outline-none focus:border-blue-500"
+            placeholder={"yarn install --frozen-lockfile\nbundle install"}
+          />
+          <p className="text-xs text-gray-500 mt-0.5">
+            1行1コマンド。clone 完了後、planner 起動前に repository 直下で順次実行します。失敗しても planner は継続します。
+          </p>
+        </div>
+      )}
 
       <div>
         <label className="block text-xs font-medium text-gray-400 mb-1">Post-Engineer Hooks</label>
@@ -374,6 +481,11 @@ export function RepositoriesPage() {
                             {repo.hooks.length} hook{repo.hooks.length > 1 ? 's' : ''}
                           </span>
                         )}
+                        {repo.setup && repo.setup.length > 0 && (
+                          <span className="px-2 py-0.5 rounded text-xs bg-cyan-900/50 text-cyan-300">
+                            {repo.setup.length} setup
+                          </span>
+                        )}
                       </div>
                       <div className="text-xs text-gray-400 space-y-1">
                         {repo.type === 'remote' && repo.url && (
@@ -390,7 +502,7 @@ export function RepositoriesPage() {
                         </div>
                         {repo.allowedTools && repo.allowedTools.length > 0 && (
                           <div className="flex items-center gap-1 flex-wrap mt-1">
-                            <span className="text-gray-500">Tools:</span>
+                            <span className="text-gray-500">Engineer Tools:</span>
                             {repo.allowedTools.map((tool, i) => (
                               <span
                                 key={i}
@@ -399,6 +511,21 @@ export function RepositoriesPage() {
                                 {tool}
                               </span>
                             ))}
+                          </div>
+                        )}
+                        {repo.rolePrompts && Object.keys(repo.rolePrompts).length > 0 && (
+                          <div className="flex items-center gap-1 flex-wrap mt-1">
+                            <span className="text-gray-500">Role prompts:</span>
+                            {EDITABLE_ROLE_PROMPT_KEYS
+                              .filter((roleKey) => repo.rolePrompts?.[roleKey])
+                              .map((roleKey) => (
+                                <span
+                                  key={roleKey}
+                                  className="px-1.5 py-0.5 rounded bg-gray-700 text-gray-300 text-xs"
+                                >
+                                  {ROLE_PROMPT_LABELS[roleKey]}
+                                </span>
+                              ))}
                           </div>
                         )}
                       </div>

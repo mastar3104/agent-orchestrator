@@ -136,7 +136,9 @@ export async function createDraftPrForRepo(
 ): Promise<{ prUrl: string; prNumber: number } | null> {
   const repoDir = getRepoWorkspaceDir(itemId, repo.name);
   const eventsPath = getItemEventsPath(itemId);
+  let prErrorLogged = false;
 
+  try {
   const currentBranch = await getCurrentBranch(repoDir);
   const defaultBranch = await getDefaultBranch(repoDir);
 
@@ -144,12 +146,14 @@ export async function createDraftPrForRepo(
   if (PROTECTED_BRANCHES.includes(currentBranch)) {
     const error = `Cannot push to protected branch: ${currentBranch} (repo: ${repo.name})`;
     await appendJsonl(eventsPath, createErrorEvent(itemId, error, { repoName: repo.name, phase: 'pr' }));
+    prErrorLogged = true;
     throw new Error(error);
   }
 
   if (defaultBranch && currentBranch === defaultBranch) {
     const error = `Cannot push to default branch: ${currentBranch} (repo: ${repo.name})`;
     await appendJsonl(eventsPath, createErrorEvent(itemId, error, { repoName: repo.name, phase: 'pr' }));
+    prErrorLogged = true;
     throw new Error(error);
   }
 
@@ -202,6 +206,7 @@ export async function createDraftPrForRepo(
       console.log(`[${itemId}/${repo.name}] Pushed to fix branch: ${fixBranch}`);
     } catch (fixError) {
       await safeLogErrorEvent(eventsPath, itemId, `Git push failed for ${repo.name} (fix branch also failed): ${getErrorMessage(fixError)}`, repo.name);
+      prErrorLogged = true;
       throw fixError;
     }
   }
@@ -212,6 +217,7 @@ export async function createDraftPrForRepo(
     ghUsername = await getGhUsername(repoDir);
   } catch (error) {
     await safeLogErrorEvent(eventsPath, itemId, `Failed to get GitHub username for ${repo.name}: ${getErrorMessage(error)}`, repo.name);
+    prErrorLogged = true;
     throw error;
   }
 
@@ -248,6 +254,7 @@ export async function createDraftPrForRepo(
         prInfo = JSON.parse(prJsonOutput);
       } catch (error) {
         await safeLogErrorEvent(eventsPath, itemId, `PR creation failed for ${repo.name}: ${getErrorMessage(error)}`, repo.name);
+        prErrorLogged = true;
         throw error;
       }
     }
@@ -265,6 +272,7 @@ export async function createDraftPrForRepo(
       prInfo = JSON.parse(prJsonOutput);
     } catch (error) {
       await safeLogErrorEvent(eventsPath, itemId, `PR creation failed for ${repo.name} (fix branch): ${getErrorMessage(error)}`, repo.name);
+      prErrorLogged = true;
       throw error;
     }
   }
@@ -288,6 +296,17 @@ export async function createDraftPrForRepo(
   console.log(`[${itemId}/${repo.name}] Draft PR created: ${prInfo.url}`);
 
   return { prUrl: prInfo.url, prNumber: prInfo.number };
+  } catch (error) {
+    if (!prErrorLogged) {
+      await safeLogErrorEvent(
+        eventsPath,
+        itemId,
+        getErrorMessage(error),
+        repo.name
+      );
+    }
+    throw error;
+  }
 }
 
 /**

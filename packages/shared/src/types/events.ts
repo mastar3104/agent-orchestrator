@@ -18,6 +18,8 @@ export type EventType =
   | 'clone_completed'
   | 'workspace_setup_started'
   | 'workspace_setup_completed'
+  | 'repo_setup_started'
+  | 'repo_setup_completed'
   | 'error'
   | 'pr_created'
   | 'repo_no_changes'
@@ -156,6 +158,19 @@ export interface WorkspaceSetupCompletedEvent extends BaseEvent {
   error?: string;
 }
 
+export interface RepoSetupStartedEvent extends BaseEvent {
+  type: 'repo_setup_started';
+  repoName: string;
+  commands: string[];
+}
+
+export interface RepoSetupCompletedEvent extends BaseEvent {
+  type: 'repo_setup_completed';
+  repoName: string;
+  results: HookResult[];
+  allPassed: boolean;
+}
+
 export type ErrorPhase = 'planner' | 'clone' | 'workspace_setup' | 'engineer' | 'hooks' | 'review' | 'pr' | 'review_receive';
 
 export interface ErrorEvent extends BaseEvent {
@@ -277,6 +292,8 @@ export type ItemEvent =
   | CloneCompletedEvent
   | WorkspaceSetupStartedEvent
   | WorkspaceSetupCompletedEvent
+  | RepoSetupStartedEvent
+  | RepoSetupCompletedEvent
   | PlanCreatedEvent
   | StatusChangedEvent
   | ErrorEvent

@@ -15,6 +15,7 @@ vi.mock('../../lib/paths', () => ({
   getWorkspaceRoot: vi.fn().mockReturnValue('/workspace'),
   getItemEventsPath: vi.fn().mockReturnValue('/events.jsonl'),
   getItemPlanPath: vi.fn().mockReturnValue('/tmp/plan.yaml'),
+  getRepoWorkspaceDir: vi.fn((_itemId: string, repoName: string) => `/workspace/${repoName}`),
 }));
 
 vi.mock('fs', () => ({
@@ -43,8 +44,8 @@ vi.mock('../../lib/events', () => ({
 
 vi.mock('../../lib/role-loader', () => ({
   getRole: vi.fn().mockReturnValue({
-    promptTemplate: 'You are a planner.',
-    allowedTools: ['Read', 'Write'],
+    systemPrompt: 'You are a planner.',
+    allowedTools: ['Read', 'Write', 'Bash(git status:*)'],
     jsonSchema: {},
   }),
 }));
@@ -61,14 +62,14 @@ vi.mock('../task-state-service', () => ({
   regenerateTaskStatesForPlan: vi.fn().mockResolvedValue([]),
 }));
 
-import { validatePlanFeedback, planFeedback, formatFeedbacks } from '../planner-service';
+import { validatePlanFeedback, planFeedback, formatFeedbacks, finalizeGeneratedPlan, startPlanner } from '../planner-service';
 import { executeAgent } from '../agent-service';
 import { getItemConfig } from '../item-service';
 import { existsSync } from 'fs';
-import { readFile } from 'fs/promises';
+import { readFile, writeFile } from 'fs/promises';
 import { eventBus } from '../event-bus';
 import { appendJsonl } from '../../lib/jsonl';
-import { parseYaml } from '../../lib/yaml';
+import { parseYaml, stringifyYaml } from '../../lib/yaml';
 import type { Plan } from '@agent-orch/shared';
 
 const VALID_PLAN: Plan = {
@@ -159,12 +160,36 @@ describe('planFeedback', () => {
       id: 'item-1',
       name: 'Test',
       description: 'desc',
-      repositories: [{ name: 'repo-a', type: 'local' }],
+      repositories: [
+        { name: 'repo-a', type: 'local', rolePrompts: { planner: 'Prefer the existing repo-a architecture.' } },
+        { name: 'repo-b', type: 'local' },
+        { name: 'repo-c', type: 'local', rolePrompts: { planner: 'Coordinate repo-c changes after repo-a.' } },
+      ],
     } as any);
     vi.mocked(existsSync).mockReturnValue(true);
     vi.mocked(readFile).mockResolvedValue(PLAN_YAML as any);
     vi.mocked(parseYaml).mockReturnValue(VALID_PLAN);
     vi.mocked(executeAgent).mockResolvedValue(undefined as any);
+  });
+
+  it('startPlanner aggregates planner prompts and repo addDirs', async () => {
+    await startPlanner('item-1');
+
+    expect(executeAgent).toHaveBeenCalledTimes(1);
+    const callArgs = vi.mocked(executeAgent).mock.calls[0][0];
+    expect(callArgs.prompt).toContain('## Repository-Specific Instructions by Repository');
+    expect(callArgs.prompt).toContain('### repo-a');
+    expect(callArgs.prompt).toContain('Prefer the existing repo-a architecture.');
+    expect(callArgs.prompt).toContain('### repo-c');
+    expect(callArgs.prompt).toContain('Coordinate repo-c changes after repo-a.');
+    expect(callArgs.prompt).not.toContain('### repo-b');
+    expect(callArgs.addDirs).toEqual([
+      '/workspace/repo-a',
+      '/workspace/repo-b',
+      '/workspace/repo-c',
+    ]);
+    expect(callArgs.appendSystemPrompt).toBe('You are a planner.');
+    expect(callArgs.allowedTools).toEqual(['Read', 'Write', 'Bash(git status:*)']);
   });
 
   it('archives plan, calls executeAgent with feedback prompt, and emits plan_created', async () => {
@@ -173,8 +198,21 @@ describe('planFeedback', () => {
     // executeAgent was called with prompt containing the feedback
     expect(executeAgent).toHaveBeenCalledTimes(1);
     const callArgs = vi.mocked(executeAgent).mock.calls[0][0];
+    expect(callArgs.prompt).toContain('## Repository-Specific Instructions by Repository');
+    expect(callArgs.prompt).toContain('### repo-a');
+    expect(callArgs.prompt).toContain('Prefer the existing repo-a architecture.');
+    expect(callArgs.prompt).toContain('### repo-c');
+    expect(callArgs.prompt).toContain('Coordinate repo-c changes after repo-a.');
+    expect(callArgs.prompt).not.toContain('### repo-b');
     expect(callArgs.prompt).toContain('Fix this');
     expect(callArgs.prompt).toContain('task-1');
+    expect(callArgs.appendSystemPrompt).toBe('You are a planner.');
+    expect(callArgs.addDirs).toEqual([
+      '/workspace/repo-a',
+      '/workspace/repo-b',
+      '/workspace/repo-c',
+    ]);
+    expect(callArgs.allowedTools).toEqual(['Read', 'Write', 'Bash(git status:*)']);
 
     // plan_created event was emitted
     expect(appendJsonl).toHaveBeenCalled();
@@ -211,5 +249,38 @@ describe('formatFeedbacks', () => {
     expect(result).toContain('task-3');
     expect(result).toContain('Add tests');
     expect(result).toContain(PLAN_YAML);
+  });
+});
+
+describe('finalizeGeneratedPlan', () => {
+  const itemConfig = {
+    id: 'item-1',
+    name: 'Test',
+    description: 'desc',
+    repositories: [{ name: 'repo-a', type: 'local' }],
+  } as any;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFile).mockResolvedValue(PLAN_YAML as any);
+    vi.mocked(parseYaml).mockReturnValue(VALID_PLAN);
+    vi.mocked(stringifyYaml).mockReturnValue('normalized-plan');
+  });
+
+  it('reads generated plan from canonical workspace path by default', async () => {
+    await finalizeGeneratedPlan('item-1', itemConfig);
+
+    expect(readFile).toHaveBeenCalledWith('/tmp/plan.yaml', 'utf-8');
+    expect(writeFile).toHaveBeenCalledWith('/tmp/plan.yaml', 'normalized-plan', 'utf-8');
+  });
+
+  it('imports generated plan from sourcePath into the canonical workspace path', async () => {
+    await finalizeGeneratedPlan('item-1', itemConfig, {
+      sourcePath: '/workspace/repo-a/plan.yaml',
+    });
+
+    expect(readFile).toHaveBeenCalledWith('/workspace/repo-a/plan.yaml', 'utf-8');
+    expect(writeFile).toHaveBeenCalledWith('/tmp/plan.yaml', 'normalized-plan', 'utf-8');
   });
 });

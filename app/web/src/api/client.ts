@@ -153,24 +153,6 @@ export async function getAgentOutput(
   );
 }
 
-// Settings — Roles
-export async function getRolesYaml(): Promise<{ content: string; isLocal: boolean }> {
-  return request<{ content: string; isLocal: boolean }>('/settings/roles');
-}
-
-export async function updateRolesYaml(content: string): Promise<{ content: string; isLocal: boolean }> {
-  return request<{ content: string; isLocal: boolean }>('/settings/roles', {
-    method: 'PUT',
-    body: JSON.stringify({ content }),
-  });
-}
-
-export async function deleteLocalRolesYaml(): Promise<{ content: string; isLocal: boolean }> {
-  return request<{ content: string; isLocal: boolean }>('/settings/roles/local', {
-    method: 'DELETE',
-  });
-}
-
 // Plan Feedback
 export async function submitPlanFeedback(
   itemId: string,

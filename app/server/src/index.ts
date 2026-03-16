@@ -7,7 +7,7 @@ import { itemRoutes } from './routes/items';
 import { agentRoutes } from './routes/agents';
 import { wsRoutes } from './routes/ws';
 import { repositoryRoutes } from './routes/repositories';
-import { settingsRoutes } from './routes/settings';
+import { roleToolsRoutes } from './routes/role-tools';
 import { getItemsDir, getDataDir } from './lib/paths';
 import { cleanupOrphanedAgentsForItem } from './services/agent-service';
 import { listItems } from './services/item-service';
@@ -74,7 +74,7 @@ async function main() {
   await fastify.register(itemRoutes, { prefix: '/api' });
   await fastify.register(agentRoutes, { prefix: '/api' });
   await fastify.register(repositoryRoutes, { prefix: '/api' });
-  await fastify.register(settingsRoutes, { prefix: '/api' });
+  await fastify.register(roleToolsRoutes, { prefix: '/api' });
   await fastify.register(wsRoutes);
 
   // Health check

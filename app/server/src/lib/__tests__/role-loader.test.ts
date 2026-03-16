@@ -1,439 +1,180 @@
-import { describe, it, expect, beforeEach, afterAll } from 'vitest';
-import { writeFileSync, mkdirSync, unlinkSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { randomBytes } from 'crypto';
-import { stringify } from 'yaml';
+import { describe, it, expect, beforeEach } from 'vitest';
 import {
   loadRoles,
   getRole,
-  reloadRoles,
-  validateRolesYaml,
-  _setConfigPath,
-  getRolesReadPath,
-  getRolesLocalPath,
-  getRolesBasePath,
-  hasLocalRoles,
+  loadGlobalRoleToolOverrides,
   sanitizeRepoAllowedTools,
+  sanitizeRolePrompts,
   mergeAllowedTools,
   AllowedToolsFormatError,
+  RolePromptsFormatError,
+  RoleToolOverridesFormatError,
 } from '../role-loader';
 
-function tmpFile(): string {
-  const dir = join(tmpdir(), 'role-loader-test-' + randomBytes(4).toString('hex'));
-  mkdirSync(dir, { recursive: true });
-  return join(dir, 'roles.yaml');
-}
-
-function writeYaml(path: string, data: unknown): void {
-  writeFileSync(path, stringify(data), 'utf-8');
-}
-
-const VALID_ROLES = {
-  roles: {
-    planner: {
-      promptTemplate: 'You are a planner.',
-      allowedTools: ['Read', 'Write'],
-      schemaRef: 'planner',
-    },
-    engineer: {
-      promptTemplate: 'You are an engineer.',
-      allowedTools: ['Read', 'Write', 'Edit', 'Bash(git add:*)', 'Bash(git commit -m:*)', 'Bash(git status:*)'],
-      schemaRef: 'engineer',
-    },
-    reviewer: {
-      promptTemplate: 'You are a reviewer.',
-      allowedTools: ['Read', 'Glob', 'Grep'],
-      schemaRef: 'reviewer',
-    },
-    reviewReceiver: {
-      promptTemplate: 'You are a review receiver.',
-      allowedTools: ['Read', 'Write'],
-      schemaRef: 'reviewReceiver',
-    },
-  },
-};
-
-beforeEach(() => {
-  _setConfigPath(null);
-});
-
-afterAll(() => {
-  _setConfigPath(null);
-});
-
 describe('role-loader', () => {
-  it('loads valid YAML with 4 roles and resolves jsonSchema', () => {
-    const path = tmpFile();
-    writeYaml(path, VALID_ROLES);
-    _setConfigPath(path);
+  beforeEach(() => {
+    loadRoles(join(tmpdir(), `missing-role-tools-${Date.now()}.yaml`));
+  });
 
-    const roles = loadRoles();
-    expect(Object.keys(roles)).toHaveLength(4);
-    expect(roles).toHaveProperty('planner');
-    expect(roles).toHaveProperty('engineer');
-    expect(roles).toHaveProperty('reviewer');
-    expect(roles).toHaveProperty('reviewReceiver');
+  it('loads built-in roles and resolves jsonSchema', () => {
+    const roles = loadRoles(join(tmpdir(), `missing-role-tools-${Date.now()}.yaml`));
+
+    expect(Object.keys(roles)).toEqual([
+      'planner',
+      'engineer',
+      'reviewer',
+      'reviewReceiver',
+    ]);
 
     const resolved = getRole('planner');
-    expect(resolved.promptTemplate).toBe('You are a planner.');
-    expect(resolved.allowedTools).toEqual(['Read', 'Write']);
-    expect(resolved.jsonSchema).toBeDefined();
+    expect(resolved.systemPrompt).toContain('You are a development planner agent.');
+    expect(resolved.allowedTools).toEqual(['Read', 'Write', 'Skill']);
     expect(resolved.jsonSchema).toHaveProperty('type', 'object');
   });
 
-  it('throws when YAML file is missing', () => {
-    _setConfigPath('/nonexistent/path/roles.yaml');
-    expect(() => loadRoles()).toThrow('roles.yaml not found');
+  it('merges additive global role tool overrides from a local file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'role-tools-'));
+    const configPath = join(dir, 'role-tools.local.yaml');
+
+    try {
+      writeFileSync(configPath, [
+        'planner:',
+        '  - "Bash(git status:*)"',
+        'engineer:',
+        '  - "Read"',
+        '  - "Bash(npm test:*)"',
+        'reviewer:',
+        '  - "Grep"',
+      ].join('\n'));
+
+      loadRoles(configPath);
+
+      expect(getRole('planner').allowedTools).toEqual([
+        'Read',
+        'Write',
+        'Skill',
+        'Bash(git status:*)',
+      ]);
+      expect(getRole('engineer').allowedTools).toEqual([
+        'Read',
+        'Write',
+        'Edit',
+        'Skill',
+        'Bash(git add:*)',
+        'Bash(git rm:*)',
+        'Bash(git commit -m:*)',
+        'Bash(git status:*)',
+        'Bash(npm test:*)',
+      ]);
+      expect(getRole('reviewer').allowedTools).toEqual([
+        'Read',
+        'Glob',
+        'Grep',
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  it('throws when YAML has no roles key', () => {
-    const path = tmpFile();
-    writeYaml(path, { notRoles: {} });
-    _setConfigPath(path);
-
-    expect(() => loadRoles()).toThrow("missing top-level 'roles' key");
+  it('falls back to built-in tools when the local override file is missing', () => {
+    expect(
+      loadGlobalRoleToolOverrides(join(tmpdir(), `missing-role-tools-${Date.now()}.yaml`))
+    ).toEqual({});
   });
 
-  it('throws on invalid schemaRef', () => {
-    const path = tmpFile();
-    writeYaml(path, {
-      roles: {
-        bad: {
-          promptTemplate: 'test',
-          allowedTools: ['Read'],
-          schemaRef: 'nonexistent',
-        },
-      },
-    });
-    _setConfigPath(path);
+  it('throws for unsupported global role tool keys', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'role-tools-invalid-key-'));
+    const configPath = join(dir, 'role-tools.local.yaml');
 
-    expect(() => loadRoles()).toThrow("schemaRef 'nonexistent' not found");
+    try {
+      writeFileSync(configPath, 'unknownRole:\n  - "Read"\n');
+      expect(() => loadRoles(configPath)).toThrow(RoleToolOverridesFormatError);
+      expect(() => loadRoles(configPath)).toThrow('roleTools.unknownRole is not a supported role');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  it('throws on empty allowedTools', () => {
-    const path = tmpFile();
-    writeYaml(path, {
-      roles: {
-        bad: {
-          promptTemplate: 'test',
-          allowedTools: [],
-          schemaRef: 'planner',
-        },
-      },
-    });
-    _setConfigPath(path);
+  it('throws for non-string global role tool entries', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'role-tools-invalid-entry-'));
+    const configPath = join(dir, 'role-tools.local.yaml');
 
-    expect(() => loadRoles()).toThrow('allowedTools must be a non-empty array');
+    try {
+      writeFileSync(configPath, 'planner:\n  - "Read"\n  - 42\n');
+      expect(() => loadRoles(configPath)).toThrow(RoleToolOverridesFormatError);
+      expect(() => loadRoles(configPath)).toThrow('roleTools.planner[1] must be a string');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  it('rejects Bash(*) in allowedTools', () => {
-    const path = tmpFile();
-    writeYaml(path, {
-      roles: {
-        bad: {
-          promptTemplate: 'test',
-          allowedTools: ['Read', 'Bash(*)'],
-          schemaRef: 'planner',
-        },
-      },
-    });
-    _setConfigPath(path);
-
-    expect(() => loadRoles()).toThrow("unrestricted 'Bash(*)' is forbidden");
-  });
-
-  it('rejects non-whitelisted Bash patterns like Bash(rm -rf:*)', () => {
-    const path = tmpFile();
-    writeYaml(path, {
-      roles: {
-        bad: {
-          promptTemplate: 'test',
-          allowedTools: ['Read', 'Bash(rm -rf:*)'],
-          schemaRef: 'planner',
-        },
-      },
-    });
-    _setConfigPath(path);
-
-    expect(() => loadRoles()).toThrow("Bash pattern 'Bash(rm -rf:*)' is not allowed");
-  });
-
-  it('accepts valid Bash patterns', () => {
-    const path = tmpFile();
-    writeYaml(path, {
-      roles: {
-        good: {
-          promptTemplate: 'test',
-          allowedTools: ['Read', 'Bash(git add:*)', 'Bash(git commit -m:*)', 'Bash(git status:*)'],
-          schemaRef: 'planner',
-        },
-      },
-    });
-    _setConfigPath(path);
-
-    const roles = loadRoles();
-    expect(roles.good.allowedTools).toContain('Bash(git add:*)');
-    expect(roles.good.allowedTools).toContain('Bash(git commit -m:*)');
-    expect(roles.good.allowedTools).toContain('Bash(git status:*)');
-  });
-});
-
-describe('validateRolesYaml', () => {
-  it('parses valid YAML and returns 4 roles without affecting cache', () => {
-    // Load a known config into cache first
-    const path = tmpFile();
-    writeYaml(path, VALID_ROLES);
-    _setConfigPath(path);
-    loadRoles();
-
-    // validateRolesYaml should not touch the cache
-    const raw = stringify(VALID_ROLES);
-    const roles = validateRolesYaml(raw);
-    expect(Object.keys(roles)).toHaveLength(4);
-    expect(roles).toHaveProperty('planner');
-    expect(roles).toHaveProperty('engineer');
-    expect(roles).toHaveProperty('reviewer');
-    expect(roles).toHaveProperty('reviewReceiver');
-
-    // Cache should still work (wasn't cleared)
-    const resolved = getRole('planner');
-    expect(resolved.promptTemplate).toBe('You are a planner.');
-  });
-
-  it('throws on invalid YAML without affecting cache', () => {
-    const path = tmpFile();
-    writeYaml(path, VALID_ROLES);
-    _setConfigPath(path);
-    loadRoles();
-
-    expect(() => validateRolesYaml('{{{')).toThrow();
-
-    // Cache still intact
-    const resolved = getRole('planner');
-    expect(resolved.promptTemplate).toBe('You are a planner.');
-  });
-
-  it('throws on bad schemaRef', () => {
-    const raw = stringify({
-      roles: {
-        bad: {
-          promptTemplate: 'test',
-          allowedTools: ['Read'],
-          schemaRef: 'nonexistent',
-        },
-      },
-    });
-    expect(() => validateRolesYaml(raw)).toThrow("schemaRef 'nonexistent' not found");
-  });
-
-  it('throws on empty allowedTools', () => {
-    const raw = stringify({
-      roles: {
-        bad: {
-          promptTemplate: 'test',
-          allowedTools: [],
-          schemaRef: 'planner',
-        },
-      },
-    });
-    expect(() => validateRolesYaml(raw)).toThrow('allowedTools must be a non-empty array');
-  });
-});
-
-describe('reloadRoles (cache-safe)', () => {
-  it('preserves previous cache when reload fails due to corrupted file', () => {
-    // Load valid config
-    const path = tmpFile();
-    writeYaml(path, VALID_ROLES);
-    _setConfigPath(path);
-    loadRoles();
-
-    // Corrupt the file
-    writeFileSync(path, 'not: valid: yaml: {{', 'utf-8');
-
-    // reloadRoles should throw
-    expect(() => reloadRoles()).toThrow();
-
-    // Previous cache should still be intact
-    const resolved = getRole('planner');
-    expect(resolved.promptTemplate).toBe('You are a planner.');
-  });
-
-  it('updates cache on successful reload', () => {
-    const path = tmpFile();
-    writeYaml(path, VALID_ROLES);
-    _setConfigPath(path);
-    loadRoles();
-
-    // Update file with different prompt
-    const updated = {
-      roles: {
-        planner: {
-          promptTemplate: 'Updated planner.',
-          allowedTools: ['Read', 'Write'],
-          schemaRef: 'planner',
-        },
-      },
-    };
-    writeYaml(path, updated);
-
-    reloadRoles();
-
-    const resolved = getRole('planner');
-    expect(resolved.promptTemplate).toBe('Updated planner.');
-  });
-});
-
-describe('local file priority', () => {
-  it('reads from roles.local.yaml when it exists', () => {
-    const dir = join(tmpdir(), 'role-loader-local-' + randomBytes(4).toString('hex'));
-    mkdirSync(dir, { recursive: true });
-
-    const basePath = join(dir, 'roles.yaml');
-    const localPath = join(dir, 'roles.local.yaml');
-
-    writeYaml(basePath, VALID_ROLES);
-    writeYaml(localPath, {
-      roles: {
-        planner: {
-          promptTemplate: 'Local planner.',
-          allowedTools: ['Read', 'Write'],
-          schemaRef: 'planner',
-        },
-      },
-    });
-
-    _setConfigPath(basePath);
-    const roles = loadRoles();
-    expect(roles.planner.promptTemplate).toBe('Local planner.');
-    expect(Object.keys(roles)).toHaveLength(1);
-
-    // Cleanup
-    unlinkSync(localPath);
-  });
-
-  it('falls back to roles.yaml when local does not exist', () => {
-    const path = tmpFile();
-    writeYaml(path, VALID_ROLES);
-    _setConfigPath(path);
-
-    const roles = loadRoles();
-    expect(roles.planner.promptTemplate).toBe('You are a planner.');
-    expect(Object.keys(roles)).toHaveLength(4);
-  });
-
-  it('hasLocalRoles returns true when local file exists', () => {
-    const dir = join(tmpdir(), 'role-loader-has-' + randomBytes(4).toString('hex'));
-    mkdirSync(dir, { recursive: true });
-
-    const basePath = join(dir, 'roles.yaml');
-    const localPath = join(dir, 'roles.local.yaml');
-
-    writeYaml(basePath, VALID_ROLES);
-    writeYaml(localPath, VALID_ROLES);
-
-    _setConfigPath(basePath);
-    expect(hasLocalRoles()).toBe(true);
-
-    unlinkSync(localPath);
-    expect(hasLocalRoles()).toBe(false);
-  });
-
-  it('getRolesReadPath returns local path when local exists', () => {
-    const dir = join(tmpdir(), 'role-loader-rp-' + randomBytes(4).toString('hex'));
-    mkdirSync(dir, { recursive: true });
-
-    const basePath = join(dir, 'roles.yaml');
-    const localPath = join(dir, 'roles.local.yaml');
-
-    writeYaml(basePath, VALID_ROLES);
-    _setConfigPath(basePath);
-
-    expect(getRolesReadPath()).toBe(basePath);
-    expect(getRolesBasePath()).toBe(basePath);
-    expect(getRolesLocalPath()).toBe(localPath);
-
-    writeYaml(localPath, VALID_ROLES);
-    expect(getRolesReadPath()).toBe(localPath);
-
-    unlinkSync(localPath);
+  it('throws for an unknown role', () => {
+    expect(() => getRole('doesNotExist')).toThrow("Role 'doesNotExist' not found");
   });
 });
 
 describe('sanitizeRepoAllowedTools', () => {
-  it('trims whitespace and removes empty strings', () => {
-    const result = sanitizeRepoAllowedTools('test-repo', [
-      '  Bash(git status)  ',
-      '',
-      '  ',
-      'Edit',
-    ]);
-    expect(result).toEqual(['Bash(git status)', 'Edit']);
+  it('trims and deduplicates tool entries', () => {
+    expect(
+      sanitizeRepoAllowedTools('repo-a', ['  Bash(git status)  ', 'Edit', 'Bash(git status)', '  '])
+    ).toEqual(['Bash(git status)', 'Edit']);
   });
 
-  it('removes duplicates', () => {
-    const result = sanitizeRepoAllowedTools('test-repo', [
-      'Bash(git status)',
-      'Bash(git status)',
-      'Edit',
-    ]);
-    expect(result).toEqual(['Bash(git status)', 'Edit']);
+  it('throws when tools is not an array', () => {
+    expect(() => sanitizeRepoAllowedTools('repo-a', 'Bash(git status)')).toThrow(AllowedToolsFormatError);
   });
 
-  it('allows opaque Bash values without requiring :*', () => {
-    const result = sanitizeRepoAllowedTools('test-repo', ['Bash(git status)', 'Bash', 'Bash(*)']);
-    expect(result).toEqual(['Bash(git status)', 'Bash', 'Bash(*)']);
+  it('throws when an entry is not a string', () => {
+    expect(() => sanitizeRepoAllowedTools('repo-a', ['Read', 42])).toThrow(
+      "allowedTools[1] must be a string"
+    );
+  });
+});
+
+describe('sanitizeRolePrompts', () => {
+  it('trims known prompt keys and drops blank values', () => {
+    expect(
+      sanitizeRolePrompts('repo-a', {
+        planner: '  plan prompt  ',
+        engineer: '   ',
+        reviewer: 'review prompt',
+      })
+    ).toEqual({
+      planner: 'plan prompt',
+      reviewer: 'review prompt',
+    });
   });
 
-  it('allows non-Bash tools', () => {
-    const result = sanitizeRepoAllowedTools('test-repo', ['Read', 'Write', 'WebFetch']);
-    expect(result).toEqual(['Read', 'Write', 'WebFetch']);
+  it('returns undefined when all values are blank', () => {
+    expect(
+      sanitizeRolePrompts('repo-a', {
+        planner: '   ',
+      })
+    ).toBeUndefined();
   });
 
-  it('allows empty array', () => {
-    const result = sanitizeRepoAllowedTools('test-repo', []);
-    expect(result).toEqual([]);
+  it('throws for unsupported role keys', () => {
+    expect(() =>
+      sanitizeRolePrompts('repo-a', { unknownRole: 'prompt' })
+    ).toThrow(RolePromptsFormatError);
   });
 
-  it('rejects non-array values', () => {
-    expect(() => sanitizeRepoAllowedTools('test-repo', 'Bash(git status)')).toThrow(AllowedToolsFormatError);
-    expect(() => sanitizeRepoAllowedTools('test-repo', 'Bash(git status)')).toThrow('allowedTools must be an array of strings');
-  });
-
-  it('rejects non-string entries', () => {
-    expect(() => sanitizeRepoAllowedTools('test-repo', ['Read', 42])).toThrow(AllowedToolsFormatError);
-    expect(() => sanitizeRepoAllowedTools('test-repo', ['Read', 42])).toThrow('allowedTools[1] must be a string');
-  });
-
-  it('returns normalized array suitable for persistence', () => {
-    const result = sanitizeRepoAllowedTools('test-repo', [
-      '  Bash(git status)  ',
-      'Edit  ',
-      '  Bash(git status)  ',
-    ]);
-    expect(result).toEqual(['Bash(git status)', 'Edit']);
+  it('throws for non-string prompt values', () => {
+    expect(() =>
+      sanitizeRolePrompts('repo-a', { planner: 42 })
+    ).toThrow("rolePrompts.planner must be a string");
   });
 });
 
 describe('mergeAllowedTools', () => {
-  it('returns roleTools when repoTools is undefined', () => {
-    const result = mergeAllowedTools(['Read', 'Write']);
-    expect(result).toEqual(['Read', 'Write']);
-  });
-
-  it('returns roleTools when repoTools is empty', () => {
-    const result = mergeAllowedTools(['Read', 'Write'], []);
-    expect(result).toEqual(['Read', 'Write']);
-  });
-
-  it('merges roleTools and repoTools', () => {
-    const result = mergeAllowedTools(['Read', 'Write'], ['Bash(make:*)', 'Bash(go:*)']);
-    expect(result).toEqual(['Read', 'Write', 'Bash(make:*)', 'Bash(go:*)']);
-  });
-
-  it('deduplicates overlapping tools', () => {
-    const result = mergeAllowedTools(['Read', 'Write', 'Bash(git add:*)'], ['Read', 'Bash(make:*)']);
-    expect(result).toEqual(['Read', 'Write', 'Bash(git add:*)', 'Bash(make:*)']);
+  it('deduplicates role and repo tools', () => {
+    expect(mergeAllowedTools(['Read', 'Edit'], ['Edit', 'Bash(git status)'])).toEqual([
+      'Read',
+      'Edit',
+      'Bash(git status)',
+    ]);
   });
 });

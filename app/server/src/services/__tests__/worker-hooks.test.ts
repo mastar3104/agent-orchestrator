@@ -120,7 +120,7 @@ vi.mock('../../lib/events', () => ({
 
 vi.mock('../../lib/role-loader', () => ({
   getRole: vi.fn().mockReturnValue({
-    promptTemplate: 'You are an engineer.',
+    systemPrompt: 'You are an engineer.',
     allowedTools: ['Read', 'Write', 'Edit', 'Bash(git add:*)', 'Bash(git commit -m:*)', 'Bash(git status:*)'],
     jsonSchema: {},
   }),
@@ -216,7 +216,8 @@ function makePlan(repos: string[]) {
 function makeItemConfig(
   repos: string[],
   hooks?: Record<string, string[]>,
-  hooksMaxAttempts?: Record<string, unknown>
+  hooksMaxAttempts?: Record<string, unknown>,
+  rolePrompts?: Record<string, Record<string, string>>
 ) {
   return {
     id: ITEM_ID,
@@ -228,6 +229,7 @@ function makeItemConfig(
       branch: 'main',
       hooks: hooks?.[name],
       hooksMaxAttempts: hooksMaxAttempts?.[name] as number | undefined,
+      rolePrompts: rolePrompts?.[name],
     })),
   };
 }
@@ -543,7 +545,7 @@ describe('Worker hooks', () => {
     });
   });
 
-  it('should mark the current task failed when hooks fail after max retries', async () => {
+  it('should continue to review with a hooks warning when hooks fail after max retries', async () => {
     mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
     mockGetItemConfig.mockResolvedValue(
       makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
@@ -557,27 +559,26 @@ describe('Worker hooks', () => {
 
     mockExecuteAgent
       .mockResolvedValueOnce(successResult() as any) // initial engineer
-      .mockResolvedValueOnce(successResult() as any); // fix engineer
+      .mockResolvedValueOnce(successResult() as any) // fix engineer
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'approve', comments: [] } },
+      } as any); // reviewer
 
     await expect(startWorkers(ITEM_ID)).resolves.toBeUndefined();
 
-    expect(mockCreateErrorEvent).toHaveBeenCalledWith(
-      ITEM_ID,
-      expect.stringContaining('Hooks validation failed for repo-a'),
-      { repoName: 'repo-a', phase: 'hooks' }
-    );
+    expect(mockCreateErrorEvent).not.toHaveBeenCalled();
+
+    const reviewCall = mockExecuteAgent.mock.calls.find((call) => call[0].role === 'review');
+    expect(reviewCall?.[0].prompt).toContain('## Hook Status Warning');
+    expect(reviewCall?.[0].prompt).toContain('npm test');
 
     expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
       id: 'T1',
-      status: 'failed',
-      currentPhase: 'hooks',
-      lastError: 'Hooks validation failed for repo-a during task T1 after 2 attempts',
+      status: 'completed',
+      reviewRounds: 0,
+      hooksExhausted: true,
     });
-
-    const reviewerCall = mockExecuteAgent.mock.calls.find(
-      (call) => call[0].role === 'review'
-    );
-    expect(reviewerCall).toBeUndefined();
+    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(ITEM_ID, new Set(['repo-a']));
   });
 
   it('should respect hooksMaxAttempts=1', async () => {
@@ -588,17 +589,17 @@ describe('Worker hooks', () => {
 
     setupSpawnMock([{ exitCode: 1, stderr: 'test failed attempt 1' }]);
 
-    mockExecuteAgent.mockResolvedValueOnce(successResult() as any);
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any)
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'approve', comments: [] } },
+      } as any);
 
     await expect(startWorkers(ITEM_ID)).resolves.toBeUndefined();
 
     expect(mockCreateHooksExecutedEvent).toHaveBeenCalledTimes(1);
-    expect(mockCreateErrorEvent).toHaveBeenCalledWith(
-      ITEM_ID,
-      expect.stringContaining('after 1 attempts'),
-      { repoName: 'repo-a', phase: 'hooks' }
-    );
-    expect(mockExecuteAgent).toHaveBeenCalledTimes(1);
+    expect(mockCreateErrorEvent).not.toHaveBeenCalled();
+    expect(mockExecuteAgent).toHaveBeenCalledTimes(2);
   });
 
   it('should respect hooksMaxAttempts=3', async () => {
@@ -664,7 +665,7 @@ describe('Worker hooks', () => {
     );
   });
 
-  it('should continue to an independent later task in the same repo after hooks fail', async () => {
+  it('should continue to dependent and later tasks in the same repo after hooks exhaust', async () => {
     mockGetPlan.mockResolvedValue(
       makePlanFromTasks([
         { id: 'T1', title: 'Task 1', repository: 'repo-a' },
@@ -694,8 +695,8 @@ describe('Worker hooks', () => {
     await expect(startWorkers(ITEM_ID)).resolves.toBeUndefined();
 
     expect(taskStateStore.get('repo-a').tasks).toEqual([
-      expect.objectContaining({ id: 'T1', status: 'failed', currentPhase: 'hooks' }),
-      expect.objectContaining({ id: 'T2', status: 'pending' }),
+      expect.objectContaining({ id: 'T1', status: 'completed', hooksExhausted: true }),
+      expect.objectContaining({ id: 'T2', status: 'completed' }),
       expect.objectContaining({ id: 'T3', status: 'completed' }),
     ]);
   });
@@ -728,7 +729,7 @@ describe('Worker hooks', () => {
     );
   });
 
-  it('should continue to later repos when an earlier task fails hooks', async () => {
+  it('should continue to later repos when an earlier task exhausts hooks', async () => {
     mockGetPlan.mockResolvedValue(makePlan(['repo-a', 'repo-b']) as any);
     mockGetItemConfig.mockResolvedValue(
       makeItemConfig(['repo-a', 'repo-b'], { 'repo-a': ['exit 1'] }) as any
@@ -758,6 +759,10 @@ describe('Worker hooks', () => {
 
     expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(
       ITEM_ID,
+      new Set(['repo-a'])
+    );
+    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(
+      ITEM_ID,
       new Set(['repo-b'])
     );
     const engineerTaskCalls = mockExecuteAgent.mock.calls
@@ -765,14 +770,23 @@ describe('Worker hooks', () => {
       .map((call) => call[0].currentTask);
     expect(engineerTaskCalls).toContain('T1: Task for repo-a');
     expect(engineerTaskCalls).toContain('T2: Task for repo-b');
-    expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({ id: 'T1', status: 'failed' });
+    expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      hooksExhausted: true,
+    });
     expect(taskStateStore.get('repo-b').tasks[0]).toMatchObject({ id: 'T2', status: 'completed' });
   });
 
   it('fix prompt should not contain role promptTemplate', async () => {
     mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
     mockGetItemConfig.mockResolvedValue(
-      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+      makeItemConfig(
+        ['repo-a'],
+        { 'repo-a': ['npm test'] },
+        undefined,
+        { 'repo-a': { engineer: 'Fix hooks using existing repo-specific test helpers.' } }
+      ) as any
     );
 
     // First hook run: fail, second hook run: pass
@@ -792,6 +806,8 @@ describe('Worker hooks', () => {
 
     // Fix engineer call should NOT contain promptTemplate
     const fixCall = mockExecuteAgent.mock.calls[1];
+    expect(fixCall[0].prompt).toContain('## Repository-Specific Instructions');
+    expect(fixCall[0].prompt).toContain('Fix hooks using existing repo-specific test helpers.');
     expect(fixCall[0].prompt).not.toContain('You are an engineer.');
     expect(fixCall[0].prompt).toContain('git add -A -- <paths>');
     expect(fixCall[0].prompt).toContain('git commit -m');
@@ -923,7 +939,12 @@ describe('Worker hooks', () => {
   it('review-fix prompt should use self-commit instructions', async () => {
     mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
     mockGetItemConfig.mockResolvedValue(
-      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+      makeItemConfig(
+        ['repo-a'],
+        { 'repo-a': ['npm test'] },
+        undefined,
+        { 'repo-a': { engineer: 'When addressing review feedback, preserve repo conventions.' } }
+      ) as any
     );
 
     setupSpawnMock([
@@ -944,10 +965,66 @@ describe('Worker hooks', () => {
     await startWorkers(ITEM_ID);
 
     const reviewFixCall = mockExecuteAgent.mock.calls.find(call => call[0].currentTask === 'T1: review-fix');
+    expect(reviewFixCall?.[0].prompt).toContain('## Repository-Specific Instructions');
+    expect(reviewFixCall?.[0].prompt).toContain('When addressing review feedback, preserve repo conventions.');
     expect(reviewFixCall?.[0].prompt).toContain('git add -A -- <paths>');
     expect(reviewFixCall?.[0].prompt).toContain('git commit -m');
     expect(reviewFixCall?.[0].prompt).toContain('Return {"status": "success"}');
     expect(reviewFixCall?.[0].prompt).not.toContain('files_modified');
+  });
+
+  it('should clear hooksExhausted after a later review-fix cycle makes hooks pass', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    setupSpawnMock([
+      { exitCode: 1, stderr: 'test failed attempt 1' },
+      { exitCode: 1, stderr: 'test failed attempt 2' },
+      { exitCode: 0, stdout: 'tests pass' },
+    ]);
+
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer' && params.currentTask === 'T1: Task for repo-a') {
+        return successResult(['engineer.ts']) as any;
+      }
+      if (params.role === 'engineer' && params.currentTask === 'T1: hooks-fix') {
+        return successResult(['hooks-fix.ts']) as any;
+      }
+      if (params.role === 'engineer' && params.currentTask === 'T1: review-fix') {
+        return successResult(['review-fix.ts']) as any;
+      }
+      if (params.role === 'review' && params.currentTask === 'T1: review') {
+        if (!params.prompt.includes('## Hook Status Warning')) {
+          return {
+            result: { output: { review_status: 'approve', comments: [] } },
+          } as any;
+        }
+        expect(params.prompt).toContain('npm test');
+        return {
+          result: {
+            output: {
+              review_status: 'request_changes',
+              comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }],
+            },
+          },
+        } as any;
+      }
+      throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
+    });
+
+    await expect(startWorkers(ITEM_ID)).resolves.toBeUndefined();
+
+    const task = taskStateStore.get('repo-a').tasks[0];
+    expect(task).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      reviewRounds: 1,
+      filesModified: expect.arrayContaining(['engineer.ts', 'hooks-fix.ts', 'review-fix.ts']),
+    });
+    expect(task.hooksExhausted).toBeUndefined();
+    expect(mockCreateErrorEvent).not.toHaveBeenCalled();
   });
 
   it('should allow review-fix to resolve as a clean no-op while still consuming a round', async () => {
@@ -1023,7 +1100,7 @@ describe('Worker hooks', () => {
     });
   });
 
-  it('should fail the task after the fourth review rejection exhausts feedback rounds', async () => {
+  it('should complete the task with a review warning after the third review-fix exhausts feedback rounds', async () => {
     mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
     mockGetItemConfig.mockResolvedValue(
       makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
@@ -1054,24 +1131,27 @@ describe('Worker hooks', () => {
         result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'one more issue', severity: 'major' }] } },
       } as any);
 
-    await expect(startWorkers(ITEM_ID)).rejects.toThrow('Review feedback rounds exhausted');
+    await expect(startWorkers(ITEM_ID)).resolves.toBeUndefined();
 
+    expect(mockCreateHooksExecutedEvent).toHaveBeenCalledTimes(4);
     const reviewCalls = mockExecuteAgent.mock.calls.filter(call => call[0].role === 'review');
-    expect(reviewCalls).toHaveLength(4);
+    expect(reviewCalls).toHaveLength(3);
     const reviewFixCalls = mockExecuteAgent.mock.calls.filter(call => call[0].currentTask === 'T1: review-fix');
     expect(reviewFixCalls).toHaveLength(3);
-    expect(mockCreateErrorEvent).toHaveBeenCalledWith(
+    expect(mockCreateErrorEvent).not.toHaveBeenCalledWith(
       ITEM_ID,
       expect.stringContaining('Review feedback rounds exhausted'),
       { repoName: 'repo-a', phase: 'review' }
     );
-    expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
+    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(ITEM_ID, new Set(['repo-a']));
     expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
       id: 'T1',
-      status: 'failed',
-      currentPhase: 'review',
+      status: 'completed',
       reviewRounds: 3,
+      reviewExhausted: true,
     });
+    const lastAgentCall = mockExecuteAgent.mock.calls[mockExecuteAgent.mock.calls.length - 1];
+    expect(lastAgentCall[0].currentTask).toBe('T1: review-fix');
   });
 
   it('should persist the union of files modified by engineer, hooks-fix, and review-fix', async () => {
@@ -1111,41 +1191,48 @@ describe('Worker hooks', () => {
     });
   });
 
-  it('should mark the task failed when hooks exhaust retries after review-fix', async () => {
+  it('should complete the task with both warnings when final post-review-fix hooks fail', async () => {
     mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
     mockGetItemConfig.mockResolvedValue(
       makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
     );
 
-    // Phase 1 hook: pass, Post-feedback hooks: fail x2
+    // Phase 1 hook: pass, post-feedback hooks: pass, pass, final hooks fail once
     setupSpawnMock([
-      { exitCode: 0, stdout: 'tests pass' },           // Phase 1 hook
-      { exitCode: 1, stderr: 'test failed attempt 1' }, // Post-feedback hook attempt 1
-      { exitCode: 1, stderr: 'test failed attempt 2' }, // Post-feedback hook attempt 2
+      { exitCode: 0, stdout: 'tests pass' },
+      { exitCode: 0, stdout: 'tests pass' },
+      { exitCode: 0, stdout: 'tests pass' },
+      { exitCode: 1, stderr: 'test failed final attempt' },
     ]);
 
     mockExecuteAgent
       .mockResolvedValueOnce(successResult() as any) // initial engineer
-      .mockResolvedValueOnce({                       // reviewer: request_changes
+      .mockResolvedValueOnce({
         result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
       } as any)
-      .mockResolvedValueOnce(successResult() as any) // feedback engineer
-      .mockResolvedValueOnce(successResult() as any); // hook-fix engineer
+      .mockResolvedValueOnce(successResult() as any) // feedback engineer 1
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 2, comment: 'fix this again', severity: 'major' }] } },
+      } as any)
+      .mockResolvedValueOnce(successResult() as any) // feedback engineer 2
+      .mockResolvedValueOnce({
+        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 3, comment: 'one more fix', severity: 'major' }] } },
+      } as any)
+      .mockResolvedValueOnce(successResult() as any); // feedback engineer 3
 
     await expect(startWorkers(ITEM_ID)).resolves.toBeUndefined();
 
-    expect(mockCreateErrorEvent).toHaveBeenCalledWith(
-      ITEM_ID,
-      expect.stringContaining('Hooks validation failed for repo-a during task T1'),
-      { repoName: 'repo-a', phase: 'hooks' }
-    );
-
-    expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
+    expect(mockCreateErrorEvent).not.toHaveBeenCalled();
+    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(ITEM_ID, new Set(['repo-a']));
     expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
       id: 'T1',
-      status: 'failed',
-      currentPhase: 'hooks',
+      status: 'completed',
+      reviewRounds: 3,
+      reviewExhausted: true,
+      hooksExhausted: true,
     });
+    const hooksFixCalls = mockExecuteAgent.mock.calls.filter(call => call[0].currentTask === 'T1: hooks-fix');
+    expect(hooksFixCalls).toHaveLength(0);
   });
 
   it('should resume an in-review task without rerunning engineer', async () => {

@@ -16,7 +16,33 @@ import {
   updateRepository,
   deleteRepository,
 } from '../services/repository-service';
-import { AllowedToolsFormatError } from '../lib/role-loader';
+import { AllowedToolsFormatError, RolePromptsFormatError } from '../lib/role-loader';
+
+function normalizeCommandList(
+  fieldName: string,
+  value: unknown,
+  itemLabel: string
+): { commands?: string[]; error?: string } {
+  if (value === undefined) {
+    return {};
+  }
+  if (!Array.isArray(value)) {
+    return { error: `${fieldName} must be an array` };
+  }
+
+  const commands: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string') {
+      return { error: `Each ${itemLabel} must be a non-empty string` };
+    }
+    const trimmed = entry.trim();
+    if (trimmed.length > 0) {
+      commands.push(trimmed);
+    }
+  }
+
+  return { commands };
+}
 
 export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
   // List all repositories
@@ -96,24 +122,30 @@ export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
         });
       }
 
-      if (request.body.hooks) {
-        if (!Array.isArray(request.body.hooks)) {
-          return reply.status(400).send({ success: false, error: 'hooks must be an array' });
-        }
-        for (const hook of request.body.hooks) {
-          if (typeof hook !== 'string' || hook.trim().length === 0) {
-            return reply.status(400).send({ success: false, error: 'Each hook must be a non-empty string' });
-          }
-        }
+      const normalizedHooks = normalizeCommandList('hooks', request.body.hooks, 'hook');
+      if (normalizedHooks.error) {
+        return reply.status(400).send({ success: false, error: normalizedHooks.error });
       }
 
-      const repository = await createRepository(request.body);
+      const normalizedSetup = normalizeCommandList('setup', request.body.setup, 'setup command');
+      if (normalizedSetup.error) {
+        return reply.status(400).send({ success: false, error: normalizedSetup.error });
+      }
+      if (request.body.type === 'local' && request.body.setup !== undefined) {
+        return reply.status(400).send({ success: false, error: 'setup is only supported for remote repositories' });
+      }
+
+      const repository = await createRepository({
+        ...request.body,
+        hooks: normalizedHooks.commands,
+        setup: normalizedSetup.commands,
+      });
       return reply.status(201).send({
         success: true,
         data: { repository },
       });
     } catch (error) {
-      if (error instanceof AllowedToolsFormatError) {
+      if (error instanceof AllowedToolsFormatError || error instanceof RolePromptsFormatError) {
         return reply.status(400).send({ success: false, error: error.message });
       }
       const message = error instanceof Error ? error.message : 'Unknown error';
@@ -131,18 +163,32 @@ export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
     Reply: ApiResponse<UpdateRepositoryResponse>;
   }>('/repositories/:id', async (request, reply) => {
     try {
-      if (request.body.hooks) {
-        if (!Array.isArray(request.body.hooks)) {
-          return reply.status(400).send({ success: false, error: 'hooks must be an array' });
-        }
-        for (const hook of request.body.hooks) {
-          if (typeof hook !== 'string' || hook.trim().length === 0) {
-            return reply.status(400).send({ success: false, error: 'Each hook must be a non-empty string' });
-          }
-        }
+      const normalizedHooks = normalizeCommandList('hooks', request.body.hooks, 'hook');
+      if (normalizedHooks.error) {
+        return reply.status(400).send({ success: false, error: normalizedHooks.error });
       }
 
-      const repository = await updateRepository(request.params.id, request.body);
+      const existing = request.body.setup !== undefined ? await getRepository(request.params.id) : null;
+      if (request.body.setup !== undefined && !existing) {
+        return reply.status(404).send({
+          success: false,
+          error: 'Repository not found',
+        });
+      }
+      if (existing?.type === 'local') {
+        return reply.status(400).send({ success: false, error: 'setup is only supported for remote repositories' });
+      }
+
+      const normalizedSetup = normalizeCommandList('setup', request.body.setup, 'setup command');
+      if (normalizedSetup.error) {
+        return reply.status(400).send({ success: false, error: normalizedSetup.error });
+      }
+
+      const repository = await updateRepository(request.params.id, {
+        ...request.body,
+        hooks: normalizedHooks.commands,
+        setup: normalizedSetup.commands,
+      });
       if (!repository) {
         return reply.status(404).send({
           success: false,
@@ -154,7 +200,7 @@ export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
         data: { repository },
       });
     } catch (error) {
-      if (error instanceof AllowedToolsFormatError) {
+      if (error instanceof AllowedToolsFormatError || error instanceof RolePromptsFormatError) {
         return reply.status(400).send({ success: false, error: error.message });
       }
       const message = error instanceof Error ? error.message : 'Unknown error';

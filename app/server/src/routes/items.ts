@@ -21,7 +21,7 @@ import {
   ReviewReceiveValidationError,
 } from '../services/review-receive-service';
 import { withItemLock, isItemLocked } from '../lib/locks';
-import { AllowedToolsFormatError } from '../lib/role-loader';
+import { AllowedToolsFormatError, RolePromptsFormatError } from '../lib/role-loader';
 
 export const itemRoutes: FastifyPluginAsync = async (fastify) => {
   // Create a new item
@@ -42,7 +42,7 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
         data: { item },
       });
     } catch (error) {
-      if (error instanceof AllowedToolsFormatError) {
+      if (error instanceof AllowedToolsFormatError || error instanceof RolePromptsFormatError) {
         return reply.status(400).send({ success: false, error: error.message });
       }
       const message = error instanceof Error ? error.message : 'Unknown error';

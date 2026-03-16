@@ -3,6 +3,18 @@ import type { Plan } from './plan';
 import type { AgentInfo } from './agent';
 import type { ItemEvent } from './events';
 
+import type { RolePrompts } from './repository';
+
+export const GLOBAL_ROLE_TOOL_KEYS = [
+  'planner',
+  'engineer',
+  'reviewer',
+  'reviewReceiver',
+] as const;
+
+export type GlobalRoleToolKey = typeof GLOBAL_ROLE_TOOL_KEYS[number];
+export type GlobalRoleToolOverrides = Partial<Record<GlobalRoleToolKey, string[]>>;
+
 // Repository configuration for direct input
 export interface RepositoryConfig {
   type: 'remote' | 'local';
@@ -14,6 +26,7 @@ export interface RepositoryConfig {
   linkMode?: 'symlink' | 'copy';  // localの場合のモード
   /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
   allowedTools?: string[];
+  rolePrompts?: RolePrompts;
   hooks?: string[];
 }
 
@@ -64,6 +77,18 @@ export type StartWorkersMode = 'all' | 'retry_failed';
 export interface StartWorkersRequest {
   repos?: string[];
   mode?: StartWorkersMode;
+}
+
+export interface GetRoleToolsResponse {
+  roleTools: GlobalRoleToolOverrides;
+}
+
+export interface UpdateRoleToolsRequest {
+  roleTools: GlobalRoleToolOverrides;
+}
+
+export interface UpdateRoleToolsResponse {
+  roleTools: GlobalRoleToolOverrides;
 }
 
 // Response types

@@ -1,4 +1,6 @@
 import { existsSync } from 'fs';
+import { rm } from 'fs/promises';
+import { join } from 'path';
 import type {
   ItemEvent,
   PrCreatedEvent,
@@ -8,13 +10,14 @@ import { executeAgent, getAgentsByItem, generateAgentId } from './agent-service'
 import { getItemConfig } from './item-service';
 import { deriveRepoStatuses } from './state-service';
 import { readJsonl, appendJsonl } from '../lib/jsonl';
-import { getItemEventsPath, getItemPlanPath, getWorkspaceRoot } from '../lib/paths';
+import { getItemEventsPath } from '../lib/paths';
 import { createReviewReceiveStartedEvent, createReviewReceiveCompletedEvent, createErrorEvent } from '../lib/events';
 import { eventBus } from './event-bus';
 import { fetchPrComments, execGitInRepo } from './git-pr-service';
 import { getRepoWorkspaceDir } from '../lib/paths';
 import { type ReviewReceiverResponse } from '../lib/claude-schemas';
 import { getRole } from '../lib/role-loader';
+import { composeRepositoryRolePrompt } from '../lib/repository-role-prompts';
 import { archiveCurrentExecutionArtifacts, finalizeGeneratedPlan } from './planner-service';
 
 /**
@@ -264,7 +267,6 @@ export async function startReviewReceive(
   }
 
   const targetRepoName = prInfo.repoName;
-  const workspaceRoot = getWorkspaceRoot(itemId);
   const eventsPath = getItemEventsPath(itemId);
 
   // Pre-generate agent ID
@@ -340,6 +342,9 @@ export async function startReviewReceive(
   }
 
   const formattedComments = formatPrComments(newPrComments);
+  const repoPlanPath = join(repoDir, 'plan.yaml');
+
+  await rm(repoPlanPath, { force: true });
 
   // Build prompt with pre-fetched comments
   const role = getRole('reviewReceiver');
@@ -352,7 +357,12 @@ export async function startReviewReceive(
     config.repositories,
     formattedComments
   );
-  const prompt = `${role.promptTemplate}\n\n${context}`;
+  const targetRepository = config.repositories.find((repository) => repository.name === targetRepoName);
+  const prompt = composeRepositoryRolePrompt(
+    context,
+    targetRepository?.rolePrompts,
+    'reviewReceiver'
+  );
 
   // Execute review-receiver agent (NO Bash access)
   await executeAgent<ReviewReceiverResponse>({
@@ -360,15 +370,22 @@ export async function startReviewReceive(
     role: 'review-receiver',
     repoName: targetRepoName,
     prompt,
-    workingDir: workspaceRoot,
+    appendSystemPrompt: role.systemPrompt,
+    workingDir: repoDir,
     agentId,
     allowedTools: role.allowedTools,
     jsonSchema: role.jsonSchema,
   });
 
-  if (existsSync(getItemPlanPath(itemId))) {
-    await finalizeGeneratedPlan(itemId, config, { allowEmptyTasks: true });
+  if (!existsSync(repoPlanPath)) {
+    throw new Error(`Review receiver completed but plan.yaml was not created in repository workspace: ${repoPlanPath}`);
   }
+
+  await finalizeGeneratedPlan(itemId, config, {
+    allowEmptyTasks: true,
+    sourcePath: repoPlanPath,
+  });
+  await rm(repoPlanPath, { force: true });
 
   // Record review_receive_completed after successful agent execution
   const completedEvent = createReviewReceiveCompletedEvent(

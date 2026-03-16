@@ -1,3 +1,5 @@
+import type { RolePrompts } from './repository';
+
 export interface ItemRepositoryConfig {
   name: string;                    // ディレクトリ名 (例: "frontend")
   type: 'remote' | 'local';
@@ -9,6 +11,9 @@ export interface ItemRepositoryConfig {
   linkMode?: 'symlink' | 'copy';
   /** エージェントに追加で許可するツール。危険なコマンドも設定可能な自己責任項目。 */
   allowedTools?: string[];
+  /** role ごとの repository 固有 prompt。 */
+  rolePrompts?: RolePrompts;
+  setup?: string[];
   hooks?: string[];
   hooksMaxAttempts?: number;
 }
@@ -70,7 +75,7 @@ export type RepoStatus =
   | 'completed'
   | 'error';
 
-export type RepoPhase = 'clone' | 'workspace_setup' | 'engineer' | 'hooks' | 'review' | 'pr' | 'review_receive';
+export type RepoPhase = 'clone' | 'workspace_setup' | 'setup' | 'engineer' | 'hooks' | 'review' | 'pr' | 'review_receive';
 
 export interface RepoSummary {
   repoName: string;
@@ -97,6 +102,8 @@ export interface ItemWorkflowStep {
   currentPhase?: TaskProgressPhase;
   attempts: number;
   reviewRounds?: number;
+  reviewExhausted?: boolean;
+  hooksExhausted?: boolean;
   lastError?: string;
 }
 

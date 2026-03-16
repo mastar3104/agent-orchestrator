@@ -344,9 +344,9 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                             </div>
                           </div>
                           <div>
-                            <label className="block text-xs font-medium text-gray-400 mb-1">
-                              Allowed Tools
-                            </label>
+                              <label className="block text-xs font-medium text-gray-400 mb-1">
+                              Engineer Extra Tools
+                              </label>
                             <input
                               type="text"
                               value={repo.allowedTools}
@@ -354,9 +354,9 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                               className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm font-mono focus:outline-none focus:border-blue-500"
                               placeholder="Bash(git status), Bash(npm test)"
                             />
-                            <p className="text-xs text-yellow-600 mt-0.5">
-                              Values are passed to Claude CLI as-is. Dangerous commands can also be configured - use at your own risk.
-                            </p>
+                              <p className="text-xs text-yellow-600 mt-0.5">
+                              Applied only to the engineer role. Values are passed to Claude CLI as-is. Dangerous commands can also be configured - use at your own risk.
+                              </p>
                           </div>
                         </>
                       )}
@@ -483,7 +483,7 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                       {/* Allowed Tools */}
                       <div>
                         <label className="block text-xs font-medium text-gray-400 mb-1">
-                          Allowed Tools
+                          Engineer Extra Tools
                         </label>
                         <input
                           type="text"
@@ -493,7 +493,7 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                           placeholder="Bash(git status), Bash(npm test)"
                         />
                         <p className="text-xs text-yellow-600 mt-0.5">
-                          Values are passed to Claude CLI as-is. Dangerous commands can also be configured - use at your own risk.
+                          Applied only to the engineer role. Values are passed to Claude CLI as-is. Dangerous commands can also be configured - use at your own risk.
                         </p>
                       </div>
 

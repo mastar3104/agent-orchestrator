@@ -173,6 +173,16 @@ describe('deriveItemStatus - error check after running check', () => {
     expect(await deriveItemStatus('item-1')).toBe('completed');
   });
 
+  it('returns cloning while repo setup is still running before planner starts', async () => {
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('clone_started', { repoName: 'repoA', repositoryUrl: 'https://example.com/repo.git' }),
+      makeEvent('clone_completed', { repoName: 'repoA', success: true }),
+      makeEvent('repo_setup_started', { repoName: 'repoA', commands: ['yarn install --frozen-lockfile'] }),
+    ]);
+
+    expect(await deriveItemStatus('item-1')).toBe('cloning');
+  });
+
   it('returns completed when all repos completed even if item-level error after PR', async () => {
     setPlanRepos(['repoA']);
     mockReadJsonl.mockResolvedValue([
@@ -499,6 +509,26 @@ describe('deriveRepoStatuses', () => {
     expect(statuses.get('myrepo')?.status).toBe('error');
   });
 
+  it('all tasks completed but PR creation error sets repo to error with phase pr', async () => {
+    setPlanRepos(['repoA']);
+    mockReadRepoTaskState.mockResolvedValue(
+      makeTaskState('repoA', [
+        { id: 'T1', title: 'Task 1', dependencies: [], status: 'completed', attempts: 1 },
+      ])
+    );
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'A', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('agent_exited', { agentId: 'A', exitCode: 0 }),
+      makeEvent('hooks_executed', { repoName: 'repoA', allPassed: true, attempt: 1, results: [] }),
+      makeEvent('error', { repoName: 'repoA', phase: 'pr', message: 'git push failed' }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')?.status).toBe('error');
+    expect(statuses.get('repoA')?.activePhase).toBe('pr');
+  });
+
   it('structured error (repoName + phase) is correctly attributed', async () => {
     setPlanRepos(['repoA']);
     mockReadRepoTaskState.mockResolvedValue(
@@ -556,6 +586,47 @@ describe('deriveItemStatus - worker partial re-run scenarios', () => {
       makeEvent('agent_started', { agentId: 'P', role: 'planner' }),
       makeEvent('agent_exited', { agentId: 'P', exitCode: 1 }),
     ]);
+    expect(await deriveItemStatus('item-1')).toBe('error');
+  });
+
+  it('returns planning after clone completes successfully and planner starts', async () => {
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('clone_started', { repoName: 'repoA', repositoryUrl: 'https://example.com/repo.git' }),
+      makeEvent('clone_completed', { repoName: 'repoA', success: true }),
+      makeEvent('agent_started', { agentId: 'P', role: 'planner' }),
+    ]);
+
+    expect(await deriveItemStatus('item-1')).toBe('planning');
+  });
+
+  it('returns error for planner failure after clone completed successfully', async () => {
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('clone_started', { repoName: 'repoA', repositoryUrl: 'https://example.com/repo.git' }),
+      makeEvent('clone_completed', { repoName: 'repoA', success: true }),
+      makeEvent('agent_started', { agentId: 'P', role: 'planner' }),
+      makeEvent('error', {
+        agentId: 'P',
+        phase: 'planner',
+        message: 'Claude process killed (timeout or abort) after 1999s. stderr: (empty) stdout: (empty)',
+      }),
+      makeEvent('agent_exited', { agentId: 'P', exitCode: 1 }),
+      makeEvent('error', { phase: 'planner', message: 'planner_autostart_failed' }),
+    ]);
+
+    expect(await deriveItemStatus('item-1')).toBe('error');
+  });
+
+  it('returns error when planner fails after local workspace setup completed', async () => {
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('workspace_setup_started', {
+        repoName: 'repoA',
+        localPath: '/tmp/repoA',
+        linkMode: 'copy',
+      }),
+      makeEvent('workspace_setup_completed', { repoName: 'repoA', success: true }),
+      makeEvent('error', { phase: 'planner', message: 'planner_autostart_failed' }),
+    ]);
+
     expect(await deriveItemStatus('item-1')).toBe('error');
   });
 });
@@ -654,5 +725,65 @@ describe('deriveRepoStatuses - status_changed(stopped) recovery', () => {
 
     const statuses = await deriveRepoStatuses('item-1');
     expect(statuses.get('repoA')?.status).toBe('completed');
+  });
+
+  it('repo setup failure stays non-blocking and clears the setup phase after completion', async () => {
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('clone_started', { repoName: 'repoA', repositoryUrl: 'https://example.com/repo.git' }),
+      makeEvent('clone_completed', { repoName: 'repoA', success: true }),
+      makeEvent('repo_setup_started', { repoName: 'repoA', commands: ['yarn install --frozen-lockfile'] }),
+      makeEvent('repo_setup_completed', {
+        repoName: 'repoA',
+        allPassed: false,
+        results: [{ command: 'yarn install --frozen-lockfile', exitCode: 1, stderr: 'failed', stdout: '', durationMs: 10, timedOut: false }],
+      }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')).toMatchObject({
+      status: 'running',
+      activePhase: undefined,
+    });
+    expect(await deriveItemStatus('item-1')).toBe('cloning');
+  });
+
+  it('clone retry success clears clone phase and stale error', async () => {
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('clone_started', { repoName: 'repoA', repositoryUrl: 'https://example.com/repo.git' }),
+      makeEvent('clone_completed', { repoName: 'repoA', success: false, error: 'network error' }),
+      makeEvent('clone_started', { repoName: 'repoA', repositoryUrl: 'https://example.com/repo.git' }),
+      makeEvent('clone_completed', { repoName: 'repoA', success: true }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')).toMatchObject({
+      status: 'running',
+      activePhase: undefined,
+      lastErrorMessage: undefined,
+    });
+  });
+
+  it('workspace setup retry success clears workspace phase and stale error', async () => {
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('workspace_setup_started', {
+        repoName: 'repoA',
+        localPath: '/tmp/repoA',
+        linkMode: 'copy',
+      }),
+      makeEvent('workspace_setup_completed', { repoName: 'repoA', success: false, error: 'copy failed' }),
+      makeEvent('workspace_setup_started', {
+        repoName: 'repoA',
+        localPath: '/tmp/repoA',
+        linkMode: 'copy',
+      }),
+      makeEvent('workspace_setup_completed', { repoName: 'repoA', success: true }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')).toMatchObject({
+      status: 'running',
+      activePhase: undefined,
+      lastErrorMessage: undefined,
+    });
   });
 });

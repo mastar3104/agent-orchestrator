@@ -117,13 +117,13 @@ vi.mock('../../lib/role-loader', () => ({
   getRole: vi.fn().mockImplementation((role: string) => {
     if (role === 'reviewer') {
       return {
-        promptTemplate: 'You are a reviewer.',
+        systemPrompt: 'You are a reviewer.',
         allowedTools: ['Read'],
         jsonSchema: {},
       };
     }
     return {
-      promptTemplate: [
+      systemPrompt: [
         'You are an engineer.',
         'Stage and commit your intentional changes before returning JSON.',
         'Run `git add -A -- <paths>` for the intentional changes you want to keep.',
@@ -135,7 +135,9 @@ vi.mock('../../lib/role-loader', () => ({
       jsonSchema: {},
     };
   }),
-  mergeAllowedTools: vi.fn().mockReturnValue(['Read', 'Write', 'Edit', 'Bash(git add:*)', 'Bash(git commit -m:*)', 'Bash(git status:*)']),
+  mergeAllowedTools: vi.fn().mockImplementation((roleTools: string[], repoTools?: string[]) => [
+    ...new Set([...(roleTools || []), ...(repoTools || [])]),
+  ]),
 }));
 
 vi.mock('child_process', () => {
@@ -230,6 +232,23 @@ function makeItemConfig(repos: string[]) {
       name,
       url: `https://github.com/test/${name}`,
       branch: 'main',
+    })),
+  };
+}
+
+function makeItemConfigWithRolePrompts(
+  repos: string[],
+  rolePrompts: Record<string, Record<string, string>>
+) {
+  return {
+    id: ITEM_ID,
+    title: 'Test Item',
+    description: '',
+    repositories: repos.map((name) => ({
+      name,
+      url: `https://github.com/test/${name}`,
+      branch: 'main',
+      rolePrompts: rolePrompts[name],
     })),
   };
 }
@@ -343,10 +362,12 @@ describe('Worker task-state execution', () => {
     );
 
     const engineerPrompts: string[] = [];
+    const engineerSystemPrompts: string[] = [];
     const currentTasks: string[] = [];
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer') {
         engineerPrompts.push(params.prompt);
+        engineerSystemPrompts.push(params.appendSystemPrompt);
         currentTasks.push(params.currentTask);
         return engineerSuccess();
       }
@@ -363,10 +384,88 @@ describe('Worker task-state execution', () => {
     expect(engineerPrompts[0]).not.toContain('### Task: T2 - Task 2');
     expect(engineerPrompts[1]).toContain('### Task: T2 - Task 2');
     expect(engineerPrompts[1]).not.toContain('### Task: T1 - Task 1');
-    expect(engineerPrompts[0]).toContain('git add -A -- <paths>');
-    expect(engineerPrompts[0]).toContain('git commit -m');
-    expect(engineerPrompts[0]).toContain('Return {"status": "success"}');
+    expect(engineerSystemPrompts[0]).toContain('git add -A -- <paths>');
+    expect(engineerSystemPrompts[0]).toContain('git commit -m');
+    expect(engineerSystemPrompts[0]).toContain('Return {"status": "success"}');
     expect(engineerPrompts[0]).not.toContain('files_modified');
+  });
+
+  it('prepends repository-specific instructions to engineer and reviewer prompts', async () => {
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfigWithRolePrompts(['repo-a'], {
+        'repo-a': {
+          engineer: 'Prefer existing repository helper functions.',
+          reviewer: 'Review with extra focus on backward compatibility.',
+        },
+      }) as any
+    );
+
+    let engineerPrompt = '';
+    let reviewerPrompt = '';
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        engineerPrompt = params.prompt;
+        return engineerSuccess();
+      }
+      if (params.role === 'review') {
+        reviewerPrompt = params.prompt;
+        return reviewApprove();
+      }
+      throw new Error(`Unexpected role: ${params.role}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    expect(engineerPrompt).toContain('## Repository-Specific Instructions');
+    expect(engineerPrompt).toContain('Prefer existing repository helper functions.');
+    expect(engineerPrompt).toContain('### Task: T1 - Task 1');
+    expect(engineerPrompt).not.toContain('You are an engineer.');
+
+    expect(reviewerPrompt).toContain('## Repository-Specific Instructions');
+    expect(reviewerPrompt).toContain('Review with extra focus on backward compatibility.');
+    expect(reviewerPrompt).toContain('## Plan');
+    expect(reviewerPrompt).not.toContain('You are a reviewer.');
+  });
+
+  it('applies repository allowedTools only to engineer and not reviewer', async () => {
+    mockGetItemConfig.mockResolvedValue({
+      id: ITEM_ID,
+      title: 'Test Item',
+      description: '',
+      repositories: [{
+        name: 'repo-a',
+        url: 'https://github.com/test/repo-a',
+        branch: 'main',
+        allowedTools: ['Bash(npm test:*)'],
+      }],
+    } as any);
+
+    let engineerTools: string[] | undefined;
+    let reviewerTools: string[] | undefined;
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        engineerTools = params.allowedTools;
+        return engineerSuccess();
+      }
+      if (params.role === 'review') {
+        reviewerTools = params.allowedTools;
+        return reviewApprove();
+      }
+      throw new Error(`Unexpected role: ${params.role}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    expect(engineerTools).toEqual([
+      'Read',
+      'Write',
+      'Edit',
+      'Bash(git add:*)',
+      'Bash(git commit -m:*)',
+      'Bash(git status:*)',
+      'Bash(npm test:*)',
+    ]);
+    expect(reviewerTools).toEqual(['Read']);
   });
 
   it('respects dependencies even when dependent tasks appear first in plan order', async () => {
@@ -497,6 +596,55 @@ describe('Worker task-state execution', () => {
       status: 'completed',
       filesModified: ['src/fixed.ts'],
     });
+  });
+
+  it('keeps repository-specific engineer instructions in same-session and fresh no-commit follow-up prompts', async () => {
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfigWithRolePrompts(['repo-a'], {
+        'repo-a': {
+          engineer: 'When follow-up runs, keep changes narrowly scoped to repository conventions.',
+        },
+      }) as any
+    );
+
+    const engineerPrompts: string[] = [];
+    let engineerCalls = 0;
+
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        engineerCalls += 1;
+        engineerPrompts.push(params.prompt);
+        if (engineerCalls === 1) {
+          return engineerSuccess(['src/a.ts'], {
+            skipCommit: true,
+            dirtyStatus: ' M src/a.ts',
+            sessionId: 'session-dirty-follow-up',
+          });
+        }
+        if (engineerCalls === 2) {
+          expect(params.resumeSessionId).toBe('session-dirty-follow-up');
+          throw new Error('same-session follow-up failed');
+        }
+        if (engineerCalls === 3) {
+          expect(params.resumeSessionId).toBeUndefined();
+          return engineerSuccess(['src/fixed.ts']);
+        }
+      }
+      if (params.role === 'review') {
+        return reviewApprove();
+      }
+      throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    expect(engineerPrompts).toHaveLength(3);
+    expect(engineerPrompts[1]).toContain('## Repository-Specific Instructions');
+    expect(engineerPrompts[1]).toContain('keep changes narrowly scoped to repository conventions');
+    expect(engineerPrompts[1]).toContain('## Commit Verification');
+    expect(engineerPrompts[2]).toContain('## Repository-Specific Instructions');
+    expect(engineerPrompts[2]).toContain('keep changes narrowly scoped to repository conventions');
+    expect(engineerPrompts[2]).toContain('## Commit Verification');
   });
 
   it('treats dirty no-commit success as no-op when the same-session follow-up cleans the worktree', async () => {
@@ -839,38 +987,61 @@ describe('Worker task-state execution', () => {
     expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
   });
 
-  it('does not run an extra review-fix after the last feedback round', async () => {
+  it('does not run an extra review after the last feedback round and continues to the next task', async () => {
+    mockGetPlan.mockResolvedValue(
+      makePlan([
+        { id: 'T1', title: 'Task 1', repository: 'repo-a' },
+        { id: 'T2', title: 'Task 2', repository: 'repo-a', dependencies: ['T1'] },
+      ]) as any
+    );
+
+    const engineerTasks: string[] = [];
     let reviewCalls = 0;
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer' && params.currentTask === 'T1: Task 1') {
+        engineerTasks.push(params.currentTask);
         return engineerSuccess();
       }
-      if (params.role === 'review') {
+      if (params.role === 'engineer' && params.currentTask === 'T1: review-fix') {
+        engineerTasks.push(params.currentTask);
+        return engineerSuccess();
+      }
+      if (params.role === 'engineer' && params.currentTask === 'T2: Task 2') {
+        engineerTasks.push(params.currentTask);
+        return engineerSuccess(['file-2.ts']);
+      }
+      if (params.role === 'review' && params.currentTask === 'T1: review') {
         reviewCalls += 1;
         return reviewRequestChanges(`fix ${reviewCalls}`);
       }
-      if (params.role === 'engineer' && params.currentTask === 'T1: review-fix') {
-        return engineerSuccess();
+      if (params.role === 'review' && params.currentTask === 'T2: review') {
+        return reviewApprove();
       }
       throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
     });
 
-    await expect(startWorkers(ITEM_ID)).rejects.toThrow(
-      'Review feedback rounds exhausted for repo-a during task T1 after 3 rounds'
-    );
+    await expect(startWorkers(ITEM_ID)).resolves.toBeUndefined();
 
-    expect(reviewCalls).toBe(4);
+    expect(reviewCalls).toBe(3);
     expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
       id: 'T1',
-      status: 'failed',
+      status: 'completed',
+      reviewRounds: 3,
+      reviewExhausted: true,
     });
     const lastCall = mockExecuteAgent.mock.calls[mockExecuteAgent.mock.calls.length - 1];
     expect(lastCall[0].role).toBe('review');
-    expect(lastCall[0].currentTask).toBe('T1: review');
+    expect(lastCall[0].currentTask).toBe('T2: review');
     const reviewFixCalls = mockExecuteAgent.mock.calls.filter(
       (call) => call[0].currentTask === 'T1: review-fix'
     );
     expect(reviewFixCalls).toHaveLength(3);
+    expect(engineerTasks).toContain('T2: Task 2');
+    expect(getRepoTaskState('repo-a').tasks[1]).toMatchObject({
+      id: 'T2',
+      status: 'completed',
+    });
+    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(ITEM_ID, new Set(['repo-a']));
   });
 
   it('resumes an in-review task from hooks and reviewer without rerunning engineer', async () => {
@@ -943,6 +1114,36 @@ describe('Worker task-state execution', () => {
       expect.objectContaining({ repoName: 'repo-a', taskId: 'T1', status: 'in_review', currentPhase: 'review' }),
       expect.objectContaining({ repoName: 'repo-a', taskId: 'T1', status: 'completed', currentPhase: undefined }),
     ]);
+  });
+
+  it('retries when schema validation fails (structured_output absent) and succeeds on second attempt', async () => {
+    let engineerCalls = 0;
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        engineerCalls += 1;
+        if (engineerCalls === 1) {
+          const { ClaudeSchemaValidationError } = await import('../../lib/claude-executor');
+          throw new ClaudeSchemaValidationError(
+            "Claude output does not match expected schema: $: expected type 'object' but got 'string'",
+            '{"type":"result","result":"Task completed successfully."}',
+            ["$: expected type 'object' but got 'string'"],
+            '', 0, 5000
+          );
+        }
+        return engineerSuccess();
+      }
+      if (params.role === 'review') return reviewApprove();
+      throw new Error(`Unexpected role: ${params.role}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    expect(engineerCalls).toBe(2);
+    expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      attempts: 1,
+    });
   });
 
   it('includes plan and changed files sections in reviewer prompts', async () => {

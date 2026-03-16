@@ -24,6 +24,7 @@ vi.mock('../repository-service', () => ({
 
 vi.mock('../../lib/role-loader', () => ({
   sanitizeRepoAllowedTools: vi.fn((_repoName: string, allowedTools?: string[]) => allowedTools),
+  sanitizeRolePrompts: vi.fn((_repoName: string, rolePrompts?: Record<string, string>) => rolePrompts),
 }));
 
 vi.mock('../../lib/yaml', () => ({
@@ -45,12 +46,15 @@ vi.mock('../../lib/paths', () => ({
   getItemEventsPath: vi.fn((itemId: string) => `/items/${itemId}/events.jsonl`),
   getWorkspaceRoot: vi.fn((itemId: string) => `/items/${itemId}/workspace`),
   getRepoWorkspaceDir: vi.fn((itemId: string, repoName: string) => `/items/${itemId}/workspace/${repoName}`),
+  getRepoSetupLogDir: vi.fn((itemId: string, repoName: string) => `/items/${itemId}/setup/${repoName}`),
 }));
 
 vi.mock('../../lib/events', () => ({
   createItemCreatedEvent: vi.fn().mockReturnValue({ type: 'item_created' }),
   createCloneStartedEvent: vi.fn(),
   createCloneCompletedEvent: vi.fn(),
+  createRepoSetupStartedEvent: vi.fn(),
+  createRepoSetupCompletedEvent: vi.fn(),
   createWorkspaceSetupStartedEvent: vi.fn(),
   createWorkspaceSetupCompletedEvent: vi.fn(),
   createErrorEvent: vi.fn(),
@@ -78,6 +82,11 @@ vi.mock('../planner-service', () => ({
 
 vi.mock('../task-state-service', () => ({
   readRepoTaskState: vi.fn(),
+}));
+
+vi.mock('../../lib/command-runner', () => ({
+  COMMAND_TIMEOUT_MS: 15 * 60 * 1000,
+  runShellCommands: vi.fn(),
 }));
 
 import { writeYaml } from '../../lib/yaml';
@@ -127,6 +136,115 @@ describe('createItem hooksMaxAttempts propagation', () => {
           expect.objectContaining({
             name: 'repo-a',
             hooksMaxAttempts: 3,
+          }),
+        ],
+      })
+    );
+  });
+
+  it('copies setup commands from the saved repository into item.yaml runtime config', async () => {
+    mockGetRepository.mockResolvedValue({
+      id: 'REPO-1',
+      name: 'saved-repo',
+      type: 'remote',
+      url: 'https://github.com/example/repo.git',
+      setup: ['yarn install --frozen-lockfile'],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    } as any);
+
+    const item = await createItem({
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        {
+          name: 'repo-a',
+          repositoryId: 'REPO-1',
+        },
+      ],
+    });
+
+    expect(item.repositories[0]).toMatchObject({
+      name: 'repo-a',
+      setup: ['yarn install --frozen-lockfile'],
+    });
+    expect(mockWriteYaml).toHaveBeenCalledWith(
+      '/items/ITEM-testitem/item.yaml',
+      expect.objectContaining({
+        repositories: [
+          expect.objectContaining({
+            name: 'repo-a',
+            setup: ['yarn install --frozen-lockfile'],
+          }),
+        ],
+      })
+    );
+  });
+
+  it('copies rolePrompts from a saved repository into item.yaml runtime config', async () => {
+    mockGetRepository.mockResolvedValue({
+      id: 'REPO-1',
+      name: 'saved-repo',
+      type: 'remote',
+      url: 'https://github.com/example/repo.git',
+      rolePrompts: {
+        planner: 'repo planner prompt',
+        reviewer: 'repo reviewer prompt',
+      },
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    } as any);
+
+    const item = await createItem({
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        {
+          name: 'repo-a',
+          repositoryId: 'REPO-1',
+        },
+      ],
+    });
+
+    expect(item.repositories[0]).toMatchObject({
+      rolePrompts: {
+        planner: 'repo planner prompt',
+        reviewer: 'repo reviewer prompt',
+      },
+    });
+  });
+
+  it('copies rolePrompts from an inline repository config into item.yaml runtime config', async () => {
+    const item = await createItem({
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        {
+          name: 'repo-a',
+          repository: {
+            type: 'local',
+            localPath: '/tmp/repo-a',
+            rolePrompts: {
+              engineer: 'repo engineer prompt',
+            },
+          },
+        },
+      ],
+    });
+
+    expect(item.repositories[0]).toMatchObject({
+      rolePrompts: {
+        engineer: 'repo engineer prompt',
+      },
+    });
+    expect(mockWriteYaml).toHaveBeenCalledWith(
+      '/items/ITEM-testitem/item.yaml',
+      expect.objectContaining({
+        repositories: [
+          expect.objectContaining({
+            rolePrompts: {
+              engineer: 'repo engineer prompt',
+            },
           }),
         ],
       })

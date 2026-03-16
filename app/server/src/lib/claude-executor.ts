@@ -7,6 +7,8 @@ import { homedir } from 'os';
 
 export interface ClaudeExecutionOptions {
   prompt: string;
+  appendSystemPrompt?: string;
+  addDirs?: string[];
   allowedTools: string[];
   jsonSchema: object;
   cwd: string;
@@ -59,6 +61,78 @@ export class ClaudeSchemaValidationError extends Error {
   }
 }
 
+// ─── Lightweight JSON Schema validator ───
+
+/**
+ * プロジェクトの jsonSchema で使用する機能のみ対応する軽量バリデータ。
+ * 対応: type (object/string/number/array), enum, required, properties, items
+ */
+export function validateAgainstSchema(
+  value: unknown,
+  schema: Record<string, unknown>,
+  path: string = '$',
+): string[] {
+  const errors: string[] = [];
+
+  if (Object.keys(schema).length === 0) {
+    return errors;
+  }
+
+  const expectedType = schema.type as string | undefined;
+
+  if (expectedType) {
+    const actualType = getJsonSchemaType(value);
+    if (actualType !== expectedType) {
+      errors.push(`${path}: expected type '${expectedType}' but got '${actualType}'`);
+      return errors;
+    }
+  }
+
+  if (Array.isArray(schema.enum)) {
+    if (!schema.enum.includes(value)) {
+      errors.push(`${path}: value ${JSON.stringify(value)} not in enum [${schema.enum.map((v: unknown) => JSON.stringify(v)).join(', ')}]`);
+    }
+  }
+
+  if (expectedType === 'object' && value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    const obj = value as Record<string, unknown>;
+
+    if (Array.isArray(schema.required)) {
+      for (const key of schema.required as string[]) {
+        if (!(key in obj)) {
+          errors.push(`${path}: missing required field '${key}'`);
+        }
+      }
+    }
+
+    if (schema.properties && typeof schema.properties === 'object') {
+      const props = schema.properties as Record<string, Record<string, unknown>>;
+      for (const [key, propSchema] of Object.entries(props)) {
+        if (key in obj) {
+          errors.push(...validateAgainstSchema(obj[key], propSchema, `${path}.${key}`));
+        }
+      }
+    }
+  }
+
+  if (expectedType === 'array' && Array.isArray(value)) {
+    if (schema.items && typeof schema.items === 'object') {
+      const itemSchema = schema.items as Record<string, unknown>;
+      for (let i = 0; i < value.length; i++) {
+        errors.push(...validateAgainstSchema(value[i], itemSchema, `${path}[${i}]`));
+      }
+    }
+  }
+
+  return errors;
+}
+
+function getJsonSchemaType(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
+}
+
 // ─── Claude path resolution ───
 
 let cachedClaudePath: string | null = null;
@@ -104,6 +178,16 @@ export async function runClaude<T>(options: ClaudeExecutionOptions): Promise<Cla
     '--output-format', 'json',
     '--json-schema', JSON.stringify(options.jsonSchema),
   );
+
+  if (options.appendSystemPrompt) {
+    args.push('--append-system-prompt', options.appendSystemPrompt);
+  }
+
+  if (options.addDirs && options.addDirs.length > 0) {
+    for (const dir of options.addDirs) {
+      args.push('--add-dir', dir);
+    }
+  }
 
   // Add allowed tools (comma-separated to avoid variadic arg consuming the prompt)
   if (options.allowedTools.length > 0) {
@@ -253,6 +337,23 @@ export async function runClaude<T>(options: ClaudeExecutionOptions): Promise<Cla
           stderr,
           exitCode,
           durationMs
+        ));
+        return;
+      }
+
+      // Validate parsed output against jsonSchema before resolving
+      const schemaErrors = validateAgainstSchema(
+        parsed,
+        options.jsonSchema as Record<string, unknown>,
+      );
+      if (schemaErrors.length > 0) {
+        reject(new ClaudeSchemaValidationError(
+          `Claude output does not match expected schema: ${schemaErrors.join('; ')}`,
+          stdout,
+          schemaErrors,
+          stderr,
+          exitCode,
+          durationMs,
         ));
         return;
       }

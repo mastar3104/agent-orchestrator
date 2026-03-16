@@ -6,7 +6,7 @@ import type {
 } from '@agent-orch/shared';
 import { readYamlSafe, writeYaml } from '../lib/yaml';
 import { getRepositoriesPath } from '../lib/paths';
-import { sanitizeRepoAllowedTools } from '../lib/role-loader';
+import { sanitizeRepoAllowedTools, sanitizeRolePrompts } from '../lib/role-loader';
 import { normalizeGitRepository } from '../lib/repository-config';
 
 async function loadRepositories(): Promise<GitRepository[]> {
@@ -40,8 +40,11 @@ export async function createRepository(
   const sanitizedTools = request.allowedTools
     ? sanitizeRepoAllowedTools(request.name, request.allowedTools)
     : undefined;
+  const sanitizedRolePrompts = request.rolePrompts
+    ? sanitizeRolePrompts(request.name, request.rolePrompts)
+    : undefined;
 
-  const repository: GitRepository = {
+  const repository = normalizeGitRepository({
     id: `REPO-${nanoid(8)}`,
     name: request.name,
     type: request.type,
@@ -52,10 +55,12 @@ export async function createRepository(
     linkMode: request.linkMode,
     directoryName: request.directoryName,
     allowedTools: sanitizedTools,
+    rolePrompts: sanitizedRolePrompts,
+    setup: request.setup,
     hooks: request.hooks,
     createdAt: now,
     updatedAt: now,
-  };
+  });
 
   repos.push(repository);
   await saveRepositories(repos);
@@ -81,11 +86,18 @@ export async function updateRepository(
     );
   }
 
-  const updated: GitRepository = {
+  if (Object.prototype.hasOwnProperty.call(request, 'rolePrompts')) {
+    request.rolePrompts = sanitizeRolePrompts(
+      request.name ?? repos[index].name,
+      request.rolePrompts
+    );
+  }
+
+  const updated = normalizeGitRepository({
     ...repos[index],
     ...request,
     updatedAt: new Date().toISOString(),
-  };
+  });
 
   repos[index] = updated;
   await saveRepositories(repos);

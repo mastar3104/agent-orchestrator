@@ -1,7 +1,5 @@
 import { spawn } from 'child_process';
-import { createWriteStream } from 'fs';
 import { readFile, mkdir, writeFile } from 'fs/promises';
-import { finished } from 'stream/promises';
 import { resolve, join } from 'path';
 import type {
   Plan,
@@ -38,6 +36,8 @@ import {
   type ReviewComment,
 } from '../lib/claude-schemas';
 import { getRole, mergeAllowedTools } from '../lib/role-loader';
+import { composeRepositoryRolePrompt } from '../lib/repository-role-prompts';
+import { COMMAND_TIMEOUT_MS, runShellCommands } from '../lib/command-runner';
 import {
   ensureTaskStatesForPlan,
   readRepoTaskState,
@@ -53,8 +53,7 @@ const MAX_DIFF_LINES = 20000;
 const REVIEW_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const ENGINEER_TIMEOUT_MS = 50 * 60 * 1000; // 50 minutes
 const AGENT_MAX_RETRIES = 2;
-const HOOK_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes per command
-const MAX_OUTPUT_LENGTH = 2000;
+const HOOK_TIMEOUT_MS = COMMAND_TIMEOUT_MS;
 
 function getRoleDescription(role: string): string {
   const descriptions: Record<string, string> = {
@@ -150,7 +149,9 @@ interface RunEngineerAttemptOptions {
   repoName: string;
   currentTask: string;
   prompt: string;
+  appendSystemPrompt: string;
   workingDir: string;
+  rolePrompts?: ItemRepositoryConfig['rolePrompts'];
   allowedTools: string[];
   jsonSchema: object;
   timeoutMs: number;
@@ -181,12 +182,19 @@ async function executeSuccessfulEngineerAttempt(
   resumeSessionId?: string,
   emitErrorEvent: boolean = true
 ): Promise<{ sessionId?: string }> {
+  const composedPrompt = composeRepositoryRolePrompt(
+    prompt,
+    options.rolePrompts,
+    'engineer'
+  );
+
   const { result } = await executeAgent<EngineerResponse>({
     itemId: options.itemId,
     role: 'engineer',
     repoName: options.repoName,
     currentTask: options.currentTask,
-    prompt,
+    prompt: composedPrompt,
+    appendSystemPrompt: options.appendSystemPrompt,
     workingDir: options.workingDir,
     allowedTools: options.allowedTools,
     jsonSchema: options.jsonSchema,
@@ -450,10 +458,6 @@ function buildPlanTaskIndex(plan: Plan): Map<string, PlanTask> {
   return new Map(plan.tasks.map((task) => [task.id, task]));
 }
 
-function isHooksFailedTask(taskState: RepoTaskStateTask | undefined): boolean {
-  return taskState?.status === 'failed' && taskState.currentPhase === 'hooks';
-}
-
 function areDependenciesCompleted(
   task: PlanTask,
   taskStateIndex: Map<string, RepoTaskStateTask>
@@ -557,77 +561,6 @@ function selectNextFailedTask(
   return null;
 }
 
-function isPendingTaskBlockedByHookFailures(
-  task: PlanTask,
-  planTaskIndex: Map<string, PlanTask>,
-  taskStateIndex: Map<string, RepoTaskStateTask>,
-  visiting: Set<string> = new Set()
-): boolean {
-  const taskState = taskStateIndex.get(task.id);
-  if (taskState?.status !== 'pending') {
-    return false;
-  }
-
-  const dependencies = task.dependencies || [];
-  if (dependencies.length === 0 || visiting.has(task.id)) {
-    return false;
-  }
-
-  visiting.add(task.id);
-  let hasBlockingDependency = false;
-
-  for (const dependencyId of dependencies) {
-    const dependencyState = taskStateIndex.get(dependencyId);
-    if (!dependencyState) {
-      visiting.delete(task.id);
-      return false;
-    }
-
-    if (dependencyState.status === 'completed') {
-      continue;
-    }
-
-    if (isHooksFailedTask(dependencyState)) {
-      hasBlockingDependency = true;
-      continue;
-    }
-
-    if (dependencyState.status === 'pending') {
-      const dependencyTask = planTaskIndex.get(dependencyId);
-      if (
-        dependencyTask &&
-        isPendingTaskBlockedByHookFailures(dependencyTask, planTaskIndex, taskStateIndex, visiting)
-      ) {
-        hasBlockingDependency = true;
-        continue;
-      }
-    }
-
-    visiting.delete(task.id);
-    return false;
-  }
-
-  visiting.delete(task.id);
-  return hasBlockingDependency;
-}
-
-function canIgnoreRemainingTasksAfterHookFailures(
-  plan: Plan,
-  statesByRepo: Map<string, RepoTaskStateFile>,
-  remainingTasks: PlanTask[]
-): boolean {
-  const taskStateIndex = buildTaskStateIndex(statesByRepo);
-  const planTaskIndex = buildPlanTaskIndex(plan);
-
-  return remainingTasks.every((task) => {
-    const taskState = taskStateIndex.get(task.id);
-    return (
-      isHooksFailedTask(taskState) ||
-      isPendingTaskBlockedByHookFailures(task, planTaskIndex, taskStateIndex)
-    );
-  });
-}
-
 async function markTaskInProgress(
   itemId: string,
   repoName: string,
@@ -640,6 +573,8 @@ async function markTaskInProgress(
     task.attempts += 1;
     task.phaseBase = phaseBase;
     task.reviewRounds = 0;
+    task.reviewExhausted = undefined;
+    task.hooksExhausted = undefined;
     task.lastStartedAt = new Date().toISOString();
     task.completedAt = undefined;
     task.lastError = undefined;
@@ -667,7 +602,8 @@ async function markTaskCompleted(
   itemId: string,
   repoName: string,
   taskId: string,
-  commitHash: string
+  commitHash: string,
+  options: { reviewExhausted?: boolean; hooksExhausted?: boolean } = {}
 ): Promise<RepoTaskStateFile> {
   return mutateVisibleTaskState(itemId, repoName, taskId, (task) => {
     task.status = 'completed';
@@ -675,6 +611,12 @@ async function markTaskCompleted(
     task.completedAt = new Date().toISOString();
     task.lastError = undefined;
     task.commitHash = commitHash;
+    if (options.reviewExhausted !== undefined) {
+      task.reviewExhausted = options.reviewExhausted ? true : undefined;
+    }
+    if (options.hooksExhausted !== undefined) {
+      task.hooksExhausted = options.hooksExhausted ? true : undefined;
+    }
   });
 }
 
@@ -701,6 +643,18 @@ async function incrementTaskReviewRounds(
   });
 }
 
+async function setTaskHooksExhausted(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  hooksExhausted: boolean
+): Promise<RepoTaskStateFile> {
+  return mutateRepoTaskState(itemId, repoName, (state) => {
+    const task = getRepoTaskEntry(state, taskId);
+    task.hooksExhausted = hooksExhausted ? true : undefined;
+  });
+}
+
 async function markTaskFailed(
   itemId: string,
   repoName: string,
@@ -717,11 +671,6 @@ async function markTaskFailed(
 
 // ─── Hooks execution ───
 
-function truncateOutput(output: string, maxLength: number = MAX_OUTPUT_LENGTH): string {
-  if (output.length <= maxLength) return output;
-  return output.slice(0, maxLength) + '...(truncated)';
-}
-
 async function runHooks(
   commands: string[],
   cwd: string,
@@ -729,111 +678,11 @@ async function runHooks(
   attempt: number,
   timeoutMs: number = HOOK_TIMEOUT_MS
 ): Promise<HookResult[]> {
-  const attemptDir = join(logDir, `attempt-${attempt}`);
-  await mkdir(attemptDir, { recursive: true });
-  const results: HookResult[] = [];
-
-  for (let i = 0; i < commands.length; i++) {
-    const command = commands[i];
-    const stdoutPath = join(attemptDir, `hook-${i}.stdout.log`);
-    const stderrPath = join(attemptDir, `hook-${i}.stderr.log`);
-    const startTime = Date.now();
-
-    try {
-      const result = await new Promise<HookResult>((resolve) => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-        const stdoutStream = createWriteStream(stdoutPath);
-        const stderrStream = createWriteStream(stderrPath);
-
-        let stdoutBuf = '';
-        let stderrBuf = '';
-
-        const proc = spawn('sh', ['-c', command], {
-          cwd,
-          stdio: 'pipe',
-          signal: controller.signal,
-        });
-
-        proc.stdout?.on('data', (d: Buffer) => {
-          const chunk = d.toString();
-          if (stdoutBuf.length < MAX_OUTPUT_LENGTH) stdoutBuf += chunk;
-        });
-        proc.stderr?.on('data', (d: Buffer) => {
-          const chunk = d.toString();
-          if (stderrBuf.length < MAX_OUTPUT_LENGTH) stderrBuf += chunk;
-        });
-
-        proc.stdout?.pipe(stdoutStream);
-        proc.stderr?.pipe(stderrStream);
-
-        proc.on('close', async (code, signal) => {
-          clearTimeout(timer);
-          stdoutStream.end();
-          stderrStream.end();
-          try {
-            await Promise.all([finished(stdoutStream), finished(stderrStream)]);
-          } catch {
-            // Log write failure is not fatal
-          }
-          resolve({
-            command,
-            exitCode: code,
-            stdout: truncateOutput(stdoutBuf),
-            stderr: truncateOutput(stderrBuf),
-            stdoutLogPath: stdoutPath,
-            stderrLogPath: stderrPath,
-            durationMs: Date.now() - startTime,
-            timedOut: false,
-            signal: signal || undefined,
-          });
-        });
-
-        proc.on('error', async (err) => {
-          clearTimeout(timer);
-          stdoutStream.end();
-          stderrStream.end();
-          try {
-            await Promise.all([finished(stdoutStream), finished(stderrStream)]);
-          } catch {
-            // Log write failure is not fatal
-          }
-          const isAbort = err.name === 'AbortError' || (err as any).code === 'ABORT_ERR';
-          if (isAbort) {
-            await writeFile(stderrPath, `Timed out after ${timeoutMs}ms`).catch(() => {});
-          }
-          resolve({
-            command,
-            exitCode: null,
-            stdout: truncateOutput(stdoutBuf),
-            stderr: truncateOutput(isAbort ? `Timed out after ${timeoutMs}ms` : err.message),
-            stdoutLogPath: stdoutPath,
-            stderrLogPath: stderrPath,
-            durationMs: Date.now() - startTime,
-            timedOut: isAbort,
-            signal: isAbort ? 'SIGTERM' : undefined,
-          });
-        });
-      });
-
-      results.push(result);
-    } catch (err) {
-      await writeFile(stderrPath, err instanceof Error ? err.message : String(err)).catch(() => {});
-      results.push({
-        command,
-        exitCode: null,
-        stdout: '',
-        stderr: truncateOutput(err instanceof Error ? err.message : String(err)),
-        stdoutLogPath: stdoutPath,
-        stderrLogPath: stderrPath,
-        durationMs: Date.now() - startTime,
-        timedOut: false,
-      });
-    }
-  }
-
-  return results;
+  return runShellCommands(commands, cwd, {
+    logDir,
+    attempt,
+    timeoutMs,
+  });
 }
 
 function buildHooksFixPrompt(hookResults: HookResult[]): string {
@@ -883,6 +732,34 @@ async function failTaskWithError(
   return { state: failedState, errorMessage: errorEvent.message };
 }
 
+interface HooksPhaseResult {
+  state: RepoTaskStateFile;
+  exhausted: boolean;
+  hookResults: HookResult[];
+}
+
+function summarizeHookFailures(hookResults: HookResult[]): string {
+  const failedHooks = hookResults.filter((result) => result.exitCode !== 0);
+  if (failedHooks.length === 0) {
+    return 'All hooks passed.';
+  }
+
+  return failedHooks.map((result) => {
+    const parts = [`- ${result.command}`];
+    if (result.exitCode !== null) {
+      parts.push(`exit=${result.exitCode}`);
+    } else if (result.timedOut) {
+      parts.push('timed out');
+    } else {
+      parts.push('execution error');
+    }
+    if (result.stderrLogPath) {
+      parts.push(`stderr=${result.stderrLogPath}`);
+    }
+    return parts.join(' | ');
+  }).join('\n');
+}
+
 async function runTaskHooksPhase(
   itemId: string,
   repo: ItemRepositoryConfig,
@@ -890,14 +767,14 @@ async function runTaskHooksPhase(
   agentWorkdir: string,
   effectiveTools: string[],
   reviewRound: number
-): Promise<RepoTaskStateFile> {
+): Promise<HooksPhaseResult> {
   const hooks = repo.hooks;
   if (!hooks || hooks.length === 0) {
     const currentState = await readRepoTaskState(itemId, repo.name);
     if (!currentState) {
       throw new Error(`Task state missing for repo ${repo.name}`);
     }
-    return currentState;
+    return { state: currentState, exhausted: false, hookResults: [] };
   }
 
   const engineerRole = getRole('engineer');
@@ -908,12 +785,14 @@ async function runTaskHooksPhase(
   }
 
   const hooksMaxAttempts = resolveHooksMaxAttempts(repo.hooksMaxAttempts);
+  let lastHookResults: HookResult[] = [];
 
   for (let hookAttempt = 1; hookAttempt <= hooksMaxAttempts; hookAttempt++) {
     console.log(
       `[${itemId}/${repo.name}] Running hooks for ${task.id} (attempt ${hookAttempt}/${hooksMaxAttempts})`
     );
     const hookResults = await runHooks(hooks, agentWorkdir, hookLogDir, hookAttempt);
+    lastHookResults = hookResults;
     const allPassed = hookResults.every((result) => result.exitCode === 0);
 
     const hooksEvent = createHooksExecutedEvent(itemId, repo.name, hookResults, allPassed, hookAttempt);
@@ -921,7 +800,8 @@ async function runTaskHooksPhase(
     eventBus.publish(itemId, hooksEvent);
 
     if (allPassed) {
-      return latestState;
+      latestState = await setTaskHooksExhausted(itemId, repo.name, task.id, false);
+      return { state: latestState, exhausted: false, hookResults };
     }
 
     if (hookAttempt < hooksMaxAttempts) {
@@ -932,7 +812,9 @@ async function runTaskHooksPhase(
           repoName: repo.name,
           currentTask: `${task.id}: hooks-fix`,
           prompt: fixPrompt,
+          appendSystemPrompt: engineerRole.systemPrompt,
           workingDir: agentWorkdir,
+          rolePrompts: repo.rolePrompts,
           allowedTools: effectiveTools,
           jsonSchema: engineerRole.jsonSchema,
           timeoutMs: ENGINEER_TIMEOUT_MS,
@@ -952,9 +834,33 @@ async function runTaskHooksPhase(
     }
   }
 
-  throw new Error(
-    `Hooks validation failed for ${repo.name} during task ${task.id} after ${hooksMaxAttempts} attempts`
-  );
+  latestState = await setTaskHooksExhausted(itemId, repo.name, task.id, true);
+  return { state: latestState, exhausted: true, hookResults: lastHookResults };
+}
+
+async function runFinalNonFatalHooksPass(
+  itemId: string,
+  repo: ItemRepositoryConfig,
+  task: PlanTask,
+  agentWorkdir: string,
+  reviewRound: number
+): Promise<HooksPhaseResult> {
+  const hooks = repo.hooks;
+  if (!hooks || hooks.length === 0) {
+    const currentState = await setTaskHooksExhausted(itemId, repo.name, task.id, false);
+    return { state: currentState, exhausted: false, hookResults: [] };
+  }
+
+  const hookLogDir = join(getHookLogDir(itemId, repo.name), task.id, `review-round-${reviewRound + 1}`);
+  const hookResults = await runHooks(hooks, agentWorkdir, hookLogDir, 1);
+  const allPassed = hookResults.every((result) => result.exitCode === 0);
+
+  const hooksEvent = createHooksExecutedEvent(itemId, repo.name, hookResults, allPassed, 1);
+  await appendJsonl(getItemEventsPath(itemId), hooksEvent);
+  eventBus.publish(itemId, hooksEvent);
+
+  const currentState = await setTaskHooksExhausted(itemId, repo.name, task.id, !allPassed);
+  return { state: currentState, exhausted: !allPassed, hookResults };
 }
 
 async function runTaskReviewPhase(
@@ -985,8 +891,9 @@ async function runTaskReviewPhase(
       );
     }
 
+    let hookPhase: HooksPhaseResult;
     try {
-      currentState = await runTaskHooksPhase(
+      hookPhase = await runTaskHooksPhase(
         itemId,
         repo,
         task,
@@ -994,6 +901,7 @@ async function runTaskReviewPhase(
         effectiveTools,
         currentTaskState.reviewRounds || 0
       );
+      currentState = hookPhase.state;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const failure = await failTaskWithError(itemId, repo.name, task.id, 'hooks', message);
@@ -1012,10 +920,14 @@ async function runTaskReviewPhase(
       agentWorkdir,
       phaseBase,
       currentHead,
-      task
+      task,
+      hookPhase.exhausted ? summarizeHookFailures(hookPhase.hookResults) : undefined
     );
-    const reviewPrompt = `${reviewerRole.promptTemplate}\n\n${reviewContext}`;
-
+    const reviewerPrompt = composeRepositoryRolePrompt(
+      reviewContext,
+      repo.rolePrompts,
+      'reviewer'
+    );
     let reviewResponse: ReviewerResponse | null = null;
     let reviewError = 'Reviewer failed';
     for (let attempt = 0; attempt <= AGENT_MAX_RETRIES; attempt++) {
@@ -1025,7 +937,8 @@ async function runTaskReviewPhase(
           role: 'review',
           repoName: repo.name,
           currentTask: `${task.id}: review`,
-          prompt: reviewPrompt,
+          prompt: reviewerPrompt,
+          appendSystemPrompt: reviewerRole.systemPrompt,
           workingDir: agentWorkdir,
           allowedTools: reviewerRole.allowedTools,
           jsonSchema: reviewerRole.jsonSchema,
@@ -1079,21 +992,14 @@ async function runTaskReviewPhase(
     eventBus.publish(itemId, findingsEvent);
 
     if (reviewResponse.review_status === 'approve') {
-      currentState = await markTaskCompleted(itemId, repo.name, task.id, currentHead);
+      currentState = await markTaskCompleted(itemId, repo.name, task.id, currentHead, {
+        hooksExhausted: taskStateAfterHooks.hooksExhausted,
+      });
       return { state: currentState };
     }
 
     const completedFeedbackRounds = taskStateAfterHooks.reviewRounds || 0;
-    if (completedFeedbackRounds >= MAX_FEEDBACK_ROUNDS) {
-      const failure = await failTaskWithError(
-        itemId,
-        repo.name,
-        task.id,
-        'review',
-        `Review feedback rounds exhausted for ${repo.name} during task ${task.id} after ${MAX_FEEDBACK_ROUNDS} rounds`
-      );
-      return { state: failure.state, errorMessage: failure.errorMessage, shouldAbortRun: true };
-    }
+    const isFinalFeedbackRound = completedFeedbackRounds + 1 >= MAX_FEEDBACK_ROUNDS;
 
     let feedbackDiff: string;
     try {
@@ -1119,7 +1025,9 @@ async function runTaskReviewPhase(
           repoName: repo.name,
           currentTask: `${task.id}: review-fix`,
           prompt: feedbackPrompt,
+          appendSystemPrompt: engineerRole.systemPrompt,
           workingDir: agentWorkdir,
+          rolePrompts: repo.rolePrompts,
           allowedTools: effectiveTools,
           jsonSchema: engineerRole.jsonSchema,
           timeoutMs: ENGINEER_TIMEOUT_MS,
@@ -1155,6 +1063,32 @@ async function runTaskReviewPhase(
         `Review feedback handling failed for ${repo.name} during task ${task.id}: ${feedbackError}`
       );
       return { state: failure.state, errorMessage: failure.errorMessage, shouldAbortRun: true };
+    }
+
+    if (isFinalFeedbackRound) {
+      const finalTaskState = getRepoTaskEntry(currentState, task.id);
+      let finalHooks: HooksPhaseResult;
+      try {
+        finalHooks = await runFinalNonFatalHooksPass(
+          itemId,
+          repo,
+          task,
+          agentWorkdir,
+          finalTaskState.reviewRounds || 0
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const failure = await failTaskWithError(itemId, repo.name, task.id, 'hooks', message);
+        return { state: failure.state, errorMessage: failure.errorMessage, shouldAbortRun: false };
+      }
+
+      currentState = finalHooks.state;
+      const finalHead = await getGitHead(agentWorkdir);
+      currentState = await markTaskCompleted(itemId, repo.name, task.id, finalHead, {
+        reviewExhausted: true,
+        hooksExhausted: finalHooks.exhausted,
+      });
+      return { state: currentState };
     }
   }
 }
@@ -1266,7 +1200,7 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
       const inProgressState = await markTaskInProgress(itemId, repo.name, nextTask.id, phaseBase);
       statesByRepo.set(repo.name, inProgressState);
 
-      const prompt = `${engineerRole.promptTemplate}\n\n${buildWorkerContext('engineer', repo.name, [nextTask], plan)}`;
+      const prompt = buildWorkerContext('engineer', repo.name, [nextTask], plan);
 
       let taskSucceeded = false;
       let lastError = 'Engineer failed';
@@ -1277,7 +1211,9 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
             repoName: repo.name,
             currentTask: `${nextTask.id}: ${nextTask.title}`,
             prompt,
+            appendSystemPrompt: engineerRole.systemPrompt,
             workingDir: agentWorkdir,
+            rolePrompts: repo.rolePrompts,
             allowedTools: effectiveTools,
             jsonSchema: engineerRole.jsonSchema,
             timeoutMs: ENGINEER_TIMEOUT_MS,
@@ -1389,9 +1325,6 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
   });
 
   if (remainingTasks.length > 0) {
-    if (canIgnoreRemainingTasksAfterHookFailures(plan, statesByRepo, remainingTasks)) {
-      return;
-    }
     throw new Error(
       `No runnable tasks remain for item ${itemId}: ${remainingTasks.map((task) => task.id).join(', ')}`
     );
@@ -1527,7 +1460,8 @@ async function buildReviewContext(
   agentWorkdir: string,
   phaseBase: string,
   currentHead: string,
-  reviewTask: PlanTask
+  reviewTask: PlanTask,
+  hookWarningSummary?: string
 ): Promise<string> {
   const taskDescriptions = `### Task: ${reviewTask.id} - ${reviewTask.title}
 ${reviewTask.description}`;
@@ -1550,7 +1484,12 @@ ${reviewTask.description}`;
     // Fallback: return minimal context
     return `## Repository: ${repoName}
 
-## Plan
+${hookWarningSummary ? `## Hook Status Warning
+Hooks exhausted their allowed attempts before this review. Review the current code with that context.
+
+${hookWarningSummary}
+
+` : ''}## Plan
 \`\`\`yaml
 ${planContent}
 \`\`\`
@@ -1615,7 +1554,12 @@ ${content}
 
   return `## Repository: ${repoName}
 
-## Plan
+${hookWarningSummary ? `## Hook Status Warning
+Hooks exhausted their allowed attempts before this review. Review the current code with that context.
+
+${hookWarningSummary}
+
+` : ''}## Plan
 \`\`\`yaml
 ${planContent}
 \`\`\`
@@ -1637,8 +1581,6 @@ function buildFeedbackPrompt(
   diff: string,
   originalTasks: PlanTask[]
 ): string {
-  const role = getRole('engineer');
-
   const taskList = originalTasks
     .map(t => `- ${t.id}: ${t.title}`)
     .join('\n');
@@ -1669,7 +1611,7 @@ Before returning, stage your intentional fixes with \`git add -A -- <paths>\`, c
 Return {"status": "success"} when done.
 If you encounter an error, return {"status": "failure"}.`;
 
-  return `${role.promptTemplate}\n\n${context}`;
+  return context;
 }
 
 export async function getWorkerStatus(

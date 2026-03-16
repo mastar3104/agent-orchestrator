@@ -1,5 +1,5 @@
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, render } from '@testing-library/react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { ItemDetail } from '@agent-orch/shared';
 import { ItemDetailPage } from '../ItemDetailPage';
@@ -17,6 +17,7 @@ import { useWebSocket } from '../../hooks/useWebSocket';
 
 const mockUseItem = vi.mocked(useItem);
 const mockUseWebSocket = vi.mocked(useWebSocket);
+const startPlanner = vi.fn();
 const startWorkers = vi.fn();
 
 function makeItem(overrides: Partial<ItemDetail> = {}): ItemDetail {
@@ -108,7 +109,7 @@ function makeItem(overrides: Partial<ItemDetail> = {}): ItemDetail {
     ...base,
     ...overrides,
     repositories: overrides.repositories ?? base.repositories,
-    plan: overrides.plan ?? base.plan,
+    plan: Object.prototype.hasOwnProperty.call(overrides, 'plan') ? overrides.plan : base.plan,
     repos: overrides.repos ?? base.repos,
     workflow: overrides.workflow ?? base.workflow,
   };
@@ -129,13 +130,14 @@ describe('ItemDetailPage workflow UI', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    startPlanner.mockReset();
     startWorkers.mockReset();
     mockUseItem.mockReturnValue({
       item: makeItem(),
       loading: false,
       error: null,
       refresh,
-      startPlanner: vi.fn(),
+      startPlanner,
       startWorkers,
       stopAgent: vi.fn(),
       startReviewReceive: vi.fn(),
@@ -153,17 +155,17 @@ describe('ItemDetailPage workflow UI', () => {
   });
 
   it('renders workflow strip, current activity, and job cards', () => {
-    renderPage();
+    const view = renderPage();
 
-    expect(screen.getByText('Workflow')).toBeInTheDocument();
-    expect(screen.getByText('Current Activity')).toBeInTheDocument();
-    expect(screen.getByText('Jobs')).toBeInTheDocument();
-    expect(screen.getByText('Workspace')).toBeInTheDocument();
-    expect(screen.getByText('Execution')).toBeInTheDocument();
-    expect(screen.getByText('repo-a: T1: Implement workflow (Hooks)')).toBeInTheDocument();
-    expect(screen.getByText('0 / 1 steps')).toBeInTheDocument();
-    expect(screen.getAllByText('Hooks').length).toBeGreaterThan(0);
-    expect(screen.getByText('PR #1')).toBeInTheDocument();
+    expect(view.getByText('Workflow')).toBeInTheDocument();
+    expect(view.getByText('Current Activity')).toBeInTheDocument();
+    expect(view.getByText('Jobs')).toBeInTheDocument();
+    expect(view.getByText('Workspace')).toBeInTheDocument();
+    expect(view.getByText('Execution')).toBeInTheDocument();
+    expect(view.getByText('repo-a: T1: Implement workflow (Hooks)')).toBeInTheDocument();
+    expect(view.getByText('0 / 1 steps')).toBeInTheDocument();
+    expect(view.getAllByText('Hooks').length).toBeGreaterThan(0);
+    expect(view.getByText('PR #1')).toBeInTheDocument();
   });
 
   it('refreshes when task_state_changed is received', () => {
@@ -203,7 +205,7 @@ describe('ItemDetailPage workflow UI', () => {
       loading: false,
       error: null,
       refresh,
-      startPlanner: vi.fn(),
+      startPlanner,
       startWorkers,
       stopAgent: vi.fn(),
       startReviewReceive: vi.fn(),
@@ -213,8 +215,8 @@ describe('ItemDetailPage workflow UI', () => {
       planFeedbackError: null,
     });
 
-    renderPage();
-    fireEvent.click(screen.getByRole('button', { name: 'Retry Failed (repo-a)' }));
+    const view = renderPage();
+    view.getByRole('button', { name: 'Retry Failed (repo-a)' }).click();
 
     expect(startWorkers).toHaveBeenCalledWith({ repos: ['repo-a'], mode: 'retry_failed' });
   });
@@ -235,7 +237,7 @@ describe('ItemDetailPage workflow UI', () => {
       loading: false,
       error: null,
       refresh,
-      startPlanner: vi.fn(),
+      startPlanner,
       startWorkers,
       stopAgent: vi.fn(),
       startReviewReceive: vi.fn(),
@@ -245,9 +247,248 @@ describe('ItemDetailPage workflow UI', () => {
       planFeedbackError: null,
     });
 
-    renderPage();
-    fireEvent.click(screen.getByRole('button', { name: 'Start Workers' }));
+    const view = renderPage();
+    view.getByRole('button', { name: 'Start Workers' }).click();
 
     expect(startWorkers).toHaveBeenCalledWith();
+  });
+
+  it('shows Start Planner when the item is errored and has no plan', () => {
+    mockUseItem.mockReturnValue({
+      item: makeItem({
+        status: 'error',
+        plan: undefined,
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'running',
+            noChanges: false,
+            inCurrentPlan: false,
+          },
+        ],
+      }),
+      loading: false,
+      error: null,
+      refresh,
+      startPlanner,
+      startWorkers,
+      stopAgent: vi.fn(),
+      startReviewReceive: vi.fn(),
+      reviewReceiveError: null,
+      submitPlanFeedback: vi.fn(),
+      planFeedbackSubmitting: false,
+      planFeedbackError: null,
+    });
+
+    const view = renderPage();
+
+    expect(view.getByRole('button', { name: 'Start Planner' })).toBeInTheDocument();
+  });
+
+  it('shows a review exhausted badge for completed steps that hit the review cap', () => {
+    const baseItem = makeItem();
+    mockUseItem.mockReturnValue({
+      item: makeItem({
+        workflow: {
+          ...baseItem.workflow,
+          jobs: [
+            {
+              repoName: 'repo-a',
+              status: 'completed',
+              totalSteps: 1,
+              completedSteps: 1,
+              failedSteps: 0,
+              steps: [
+                {
+                  taskId: 'T1',
+                  title: 'Implement workflow',
+                  status: 'completed',
+                  attempts: 1,
+                  reviewRounds: 3,
+                  reviewExhausted: true,
+                },
+              ],
+            },
+          ],
+          overall: {
+            totalSteps: 1,
+            completedSteps: 1,
+            failedSteps: 0,
+          },
+          currentActivity: undefined,
+        },
+      }),
+      loading: false,
+      error: null,
+      refresh,
+      startPlanner,
+      startWorkers,
+      stopAgent: vi.fn(),
+      startReviewReceive: vi.fn(),
+      reviewReceiveError: null,
+      submitPlanFeedback: vi.fn(),
+      planFeedbackSubmitting: false,
+      planFeedbackError: null,
+    });
+
+    const view = renderPage();
+
+    expect(view.getByText('review exhausted')).toBeInTheDocument();
+    expect(view.queryByText('hooks exhausted')).not.toBeInTheDocument();
+  });
+
+  it('shows a hooks exhausted badge for completed steps that exhausted hooks retries', () => {
+    const baseItem = makeItem();
+    mockUseItem.mockReturnValue({
+      item: makeItem({
+        workflow: {
+          ...baseItem.workflow,
+          jobs: [
+            {
+              repoName: 'repo-a',
+              status: 'completed',
+              totalSteps: 1,
+              completedSteps: 1,
+              failedSteps: 0,
+              steps: [
+                {
+                  taskId: 'T1',
+                  title: 'Implement workflow',
+                  status: 'completed',
+                  attempts: 1,
+                  hooksExhausted: true,
+                },
+              ],
+            },
+          ],
+          overall: {
+            totalSteps: 1,
+            completedSteps: 1,
+            failedSteps: 0,
+          },
+          currentActivity: undefined,
+        },
+      }),
+      loading: false,
+      error: null,
+      refresh,
+      startPlanner,
+      startWorkers,
+      stopAgent: vi.fn(),
+      startReviewReceive: vi.fn(),
+      reviewReceiveError: null,
+      submitPlanFeedback: vi.fn(),
+      planFeedbackSubmitting: false,
+      planFeedbackError: null,
+    });
+
+    const view = renderPage();
+
+    expect(view.getByText('hooks exhausted')).toBeInTheDocument();
+    expect(view.queryByText('review exhausted')).not.toBeInTheDocument();
+  });
+
+  it('shows both warning badges when review and hooks both exhaust', () => {
+    const baseItem = makeItem();
+    mockUseItem.mockReturnValue({
+      item: makeItem({
+        workflow: {
+          ...baseItem.workflow,
+          jobs: [
+            {
+              repoName: 'repo-a',
+              status: 'completed',
+              totalSteps: 1,
+              completedSteps: 1,
+              failedSteps: 0,
+              steps: [
+                {
+                  taskId: 'T1',
+                  title: 'Implement workflow',
+                  status: 'completed',
+                  attempts: 1,
+                  reviewRounds: 3,
+                  reviewExhausted: true,
+                  hooksExhausted: true,
+                },
+              ],
+            },
+          ],
+          overall: {
+            totalSteps: 1,
+            completedSteps: 1,
+            failedSteps: 0,
+          },
+          currentActivity: undefined,
+        },
+      }),
+      loading: false,
+      error: null,
+      refresh,
+      startPlanner,
+      startWorkers,
+      stopAgent: vi.fn(),
+      startReviewReceive: vi.fn(),
+      reviewReceiveError: null,
+      submitPlanFeedback: vi.fn(),
+      planFeedbackSubmitting: false,
+      planFeedbackError: null,
+    });
+
+    const view = renderPage();
+
+    expect(view.getByText('review exhausted')).toBeInTheDocument();
+    expect(view.getByText('hooks exhausted')).toBeInTheDocument();
+  });
+
+  it('does not show a review exhausted badge for normally completed steps', () => {
+    const baseItem = makeItem();
+    mockUseItem.mockReturnValue({
+      item: makeItem({
+        workflow: {
+          ...baseItem.workflow,
+          jobs: [
+            {
+              repoName: 'repo-a',
+              status: 'completed',
+              totalSteps: 1,
+              completedSteps: 1,
+              failedSteps: 0,
+              steps: [
+                {
+                  taskId: 'T1',
+                  title: 'Implement workflow',
+                  status: 'completed',
+                  attempts: 1,
+                  reviewRounds: 1,
+                },
+              ],
+            },
+          ],
+          overall: {
+            totalSteps: 1,
+            completedSteps: 1,
+            failedSteps: 0,
+          },
+          currentActivity: undefined,
+        },
+      }),
+      loading: false,
+      error: null,
+      refresh,
+      startPlanner,
+      startWorkers,
+      stopAgent: vi.fn(),
+      startReviewReceive: vi.fn(),
+      reviewReceiveError: null,
+      submitPlanFeedback: vi.fn(),
+      planFeedbackSubmitting: false,
+      planFeedbackError: null,
+    });
+
+    const view = renderPage();
+
+    expect(view.queryByText('review exhausted')).not.toBeInTheDocument();
+    expect(view.queryByText('hooks exhausted')).not.toBeInTheDocument();
   });
 });

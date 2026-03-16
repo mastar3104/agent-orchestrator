@@ -209,7 +209,7 @@ tasks:
 Worker の起動時、以下の流れで処理される:
 
 1. **Task Execution** — `plan.yaml` の task を依存関係を見ながら 1 件ずつ直列実行。Engineer が task を実装しコミット
-2. **Task Review Loop** — 各 task の直後に hooks と reviewer を実行し、`approve` されるまで同じ task を修正し続ける。`request_changes` は最大 3 回まで feedback fix を試し、それでも reject され続けた task は failed になる
+2. **Task Review Loop** — 各 task の直後に hooks と reviewer を実行し、`approve` されるまで同じ task を修正し続ける。hooks は通常の engineer 後も review-fix 後も走り、失敗して retry を使い切っても task failure にはせず `hooks exhausted` warning として reviewer へ進む。`request_changes` は最大 3 回まで feedback fix を試し、最後の review-fix が終わった時点で再度 reviewer は起動せず、その直後に hooks を 1 回だけ流して task を完了させる。そこで hooks が失敗しても `review exhausted` / `hooks exhausted` warning 付きの completed として次へ進む
 3. **Push & PR** — その repository の task がすべて完了したら `gh` CLI で Draft PR を作成
 
 ### Git 差分管理
@@ -252,12 +252,37 @@ Planner が生成した `plan.yaml` に対して、タスク単位でフィー�
 - フィードバックに含まれないタスクは保持するよう Planner に指示される
 - `plan_created` イベント受信時、エディタが未編集なら自動リロード、編集中ならリロード確認バナーを表示
 
+### Repository Setup Commands
+
+保存済み remote repository ごとに、clone 完了後に 1 回だけ実行するセットアップコマンドを設定できる。
+
+- **設定箇所**: 保存済みリポジトリ設定の `setup` フィールド（文字列配列）
+- **対象**: remote repository のみ。local repository では設定不可
+- **実行タイミング**: `git clone` と work branch 作成の完了後、Planner 起動の前
+- **実行順**: `clone` → `work branch checkout` → `setup` → `planner`
+- **実行場所**: clone された repository 直下
+- **失敗時**: 最初の失敗コマンドで打ち切るが、Planner は継続して起動する
+- **retry**: `POST /items/:id/clone` で clone/setup を再実行すると、item.yaml にスナップショットされた `setup` が再度使われる
+- **イベント**: `repo_setup_started` / `repo_setup_completed`
+
+```yaml
+# data/repositories.yaml の例
+- id: REPO-12345678
+  name: backend
+  type: remote
+  url: https://github.com/example/backend.git
+  setup:
+    - "yarn install --frozen-lockfile"
+    - "yarn prisma generate"
+```
+
 ### Hooks (リポジトリ別コマンド実行)
 
 リポジトリごとに、Engineer の実装完了後に自動実行するシェルコマンド（lint, test, build など）を設定できる。
 
 - **設定箇所**: リポジトリ設定の `hooks` フィールド（文字列配列）
 - **実行タイミング**: Engineer Agent がコミット完了後、Review Phase の前
+- **setup との違い**: `setup` は clone 後に 1 回、`hooks` は各 task の Engineer 完了後に毎回実行される
 - **試行回数**: `hooksMaxAttempts` で初回を含む総試行回数を指定できる（saved repository YAML からのみ注入、未指定または不正値は `2`）
 - **リトライ**: hooks が失敗した場合、失敗出力を Engineer にフィードバックして修正を依頼する
 - **全試行失敗時**: その task は `failed` のまま残り、`currentPhase='hooks'` のエラーイベントが記録される。依存関係を満たす独立 task があれば同じ run 内で継続する
@@ -275,7 +300,7 @@ repositories:
     hooksMaxAttempts: 3
 ```
 
-保存済みリポジトリ (`data/repositories.yaml`) にも `hooks` / `hooksMaxAttempts` を設定でき、Item 作成時に引き継がれる。
+保存済みリポジトリ (`data/repositories.yaml`) には `setup` / `hooks` / `hooksMaxAttempts` を設定でき、Item 作成時に引き継がれる。
 
 ### Agent ID フォーマット
 
@@ -295,6 +320,7 @@ repositories:
 | `agent_started` / `agent_exited` | エージェントのライフサイクル |
 | `claude_execution` | Claude -p 実行結果 (exitCode, durationMs, attempt, success) |
 | `plan_created` | plan.yaml 生成完了 |
+| `repo_setup_started` / `repo_setup_completed` | clone 後 setup 実行 |
 | `review_findings_extracted` | レビュー結果 (findings, overallAssessment) |
 | `hooks_executed` | Hooks 実行結果 (allPassed, attempt) |
 | `pr_created` / `repo_no_changes` | PR 作成結果 |
