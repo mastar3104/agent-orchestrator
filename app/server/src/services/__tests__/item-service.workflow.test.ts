@@ -3,6 +3,7 @@ import type {
   AgentInfo,
   ItemConfig,
   ItemEvent,
+  TestPlanApprovalState,
   Plan,
   PrCreatedEvent,
   RepoNoChangesEvent,
@@ -89,11 +90,13 @@ function buildSummary(params: {
   noChangesEvents?: RepoNoChangesEvent[];
   taskStates?: Map<string, RepoTaskStateFile>;
   config?: ItemConfig;
+  testPlanApproval?: TestPlanApprovalState;
 }) {
   return buildWorkflowSummary({
     config: params.config || makeConfig(),
     itemStatus: params.itemStatus || 'created',
     plan: params.plan ?? null,
+    testPlanApproval: params.testPlanApproval || { status: 'missing' },
     events: params.events || [],
     agents: params.agents || [],
     repoStatuses: params.repoStatuses || new Map(),

@@ -1,5 +1,9 @@
 import type { ItemConfig, ItemSummary, ItemDetail } from './item';
-import type { Plan } from './plan';
+import type {
+  Plan,
+  TestPlan,
+  TestPlanApprovalState,
+} from './plan';
 import type { AgentInfo } from './agent';
 import type { ItemEvent } from './events';
 
@@ -7,6 +11,7 @@ import type { RolePrompts } from './repository';
 
 export const GLOBAL_ROLE_TOOL_KEYS = [
   'planner',
+  'testPlanner',
   'engineer',
   'reviewer',
   'reviewReceiver',
@@ -72,6 +77,15 @@ export interface PlanFeedbackRequest {
   feedbacks: PlanFeedbackItem[];
 }
 
+export interface TestPlanFeedbackItem {
+  scenarioId: string;
+  feedback: string;
+}
+
+export interface TestPlanFeedbackRequest {
+  feedbacks: TestPlanFeedbackItem[];
+}
+
 export type StartWorkersMode = 'all' | 'retry_failed';
 
 export interface StartWorkersRequest {
@@ -117,6 +131,35 @@ export interface AgentStatusResponse {
 export interface UpdatePlanResponse {
   plan: Plan;
   content: string;
+}
+
+export interface GetPlanContentResponse {
+  content: string | null;
+}
+
+export interface GetTestPlanResponse {
+  testPlan: TestPlan | null;
+}
+
+export interface GetTestPlanContentResponse {
+  content: string | null;
+}
+
+export interface UpdateTestPlanRequest {
+  content: string;
+}
+
+export interface UpdateTestPlanResponse {
+  testPlan: TestPlan;
+  content: string;
+}
+
+export interface TestPlanApprovalResponse {
+  approval: TestPlanApprovalState;
+}
+
+export interface StartAsyncResponse {
+  started: boolean;
 }
 
 // WebSocket message types

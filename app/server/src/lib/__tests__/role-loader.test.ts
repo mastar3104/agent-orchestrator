@@ -24,6 +24,7 @@ describe('role-loader', () => {
 
     expect(Object.keys(roles)).toEqual([
       'planner',
+      'testPlanner',
       'engineer',
       'reviewer',
       'reviewReceiver',

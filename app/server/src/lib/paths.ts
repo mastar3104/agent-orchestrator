@@ -24,6 +24,10 @@ export function getItemPlanPath(itemId: string): string {
   return join(getWorkspaceRoot(itemId), 'plan.yaml');
 }
 
+export function getItemTestPlanPath(itemId: string): string {
+  return join(getWorkspaceRoot(itemId), 'test-plan.yaml');
+}
+
 export function getItemEventsPath(itemId: string): string {
   return join(getItemDir(itemId), 'events.jsonl');
 }

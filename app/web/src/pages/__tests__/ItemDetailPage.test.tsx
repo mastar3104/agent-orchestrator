@@ -18,7 +18,14 @@ import { useWebSocket } from '../../hooks/useWebSocket';
 const mockUseItem = vi.mocked(useItem);
 const mockUseWebSocket = vi.mocked(useWebSocket);
 const startPlanner = vi.fn();
+const startTestPlanner = vi.fn();
 const startWorkers = vi.fn();
+const submitPlanFeedback = vi.fn();
+const submitTestPlanFeedback = vi.fn();
+const approveCurrentTestPlan = vi.fn();
+const refresh = vi.fn();
+
+type UseItemResult = ReturnType<typeof useItem>;
 
 function makeItem(overrides: Partial<ItemDetail> = {}): ItemDetail {
   const base: ItemDetail = {
@@ -49,6 +56,9 @@ function makeItem(overrides: Partial<ItemDetail> = {}): ItemDetail {
     },
     agents: [],
     pendingApprovals: [],
+    testPlanApproval: {
+      status: 'missing',
+    },
     repos: [
       {
         repoName: 'repo-a',
@@ -115,6 +125,32 @@ function makeItem(overrides: Partial<ItemDetail> = {}): ItemDetail {
   };
 }
 
+function makeUseItemResult(overrides: Partial<UseItemResult> = {}): UseItemResult {
+  return {
+    item: makeItem(),
+    loading: false,
+    error: null,
+    refresh,
+    startPlanner,
+    startTestPlanner,
+    startWorkers,
+    stopAgent: vi.fn(),
+    startReviewReceive: vi.fn(),
+    reviewReceiveError: null,
+    testPlannerError: null,
+    submitPlanFeedback,
+    planFeedbackSubmitting: false,
+    planFeedbackError: null,
+    submitTestPlanFeedback,
+    testPlanFeedbackSubmitting: false,
+    testPlanFeedbackError: null,
+    approveCurrentTestPlan,
+    testPlanApproveSubmitting: false,
+    testPlanApproveError: null,
+    ...overrides,
+  };
+}
+
 function renderPage() {
   return render(
     <MemoryRouter initialEntries={['/items/ITEM-1']}>
@@ -126,26 +162,15 @@ function renderPage() {
 }
 
 describe('ItemDetailPage workflow UI', () => {
-  const refresh = vi.fn();
-
   beforeEach(() => {
     vi.clearAllMocks();
     startPlanner.mockReset();
+    startTestPlanner.mockReset();
     startWorkers.mockReset();
-    mockUseItem.mockReturnValue({
-      item: makeItem(),
-      loading: false,
-      error: null,
-      refresh,
-      startPlanner,
-      startWorkers,
-      stopAgent: vi.fn(),
-      startReviewReceive: vi.fn(),
-      reviewReceiveError: null,
-      submitPlanFeedback: vi.fn(),
-      planFeedbackSubmitting: false,
-      planFeedbackError: null,
-    });
+    submitPlanFeedback.mockReset();
+    submitTestPlanFeedback.mockReset();
+    approveCurrentTestPlan.mockReset();
+    mockUseItem.mockReturnValue(makeUseItemResult());
     mockUseWebSocket.mockReturnValue({
       isConnected: true,
       lastEvent: null,
@@ -189,7 +214,7 @@ describe('ItemDetailPage workflow UI', () => {
   });
 
   it('sends retry_failed mode when Retry Failed is clicked', () => {
-    mockUseItem.mockReturnValue({
+    mockUseItem.mockReturnValue(makeUseItemResult({
       item: makeItem({
         status: 'error',
         repos: [
@@ -202,18 +227,7 @@ describe('ItemDetailPage workflow UI', () => {
           },
         ],
       }),
-      loading: false,
-      error: null,
-      refresh,
-      startPlanner,
-      startWorkers,
-      stopAgent: vi.fn(),
-      startReviewReceive: vi.fn(),
-      reviewReceiveError: null,
-      submitPlanFeedback: vi.fn(),
-      planFeedbackSubmitting: false,
-      planFeedbackError: null,
-    });
+    }));
 
     const view = renderPage();
     view.getByRole('button', { name: 'Retry Failed (repo-a)' }).click();
@@ -222,9 +236,12 @@ describe('ItemDetailPage workflow UI', () => {
   });
 
   it('starts workers without retry mode for ready items', () => {
-    mockUseItem.mockReturnValue({
+    mockUseItem.mockReturnValue(makeUseItemResult({
       item: makeItem({
         status: 'ready',
+        testPlanApproval: {
+          status: 'approved',
+        },
         repos: [
           {
             repoName: 'repo-a',
@@ -234,18 +251,7 @@ describe('ItemDetailPage workflow UI', () => {
           },
         ],
       }),
-      loading: false,
-      error: null,
-      refresh,
-      startPlanner,
-      startWorkers,
-      stopAgent: vi.fn(),
-      startReviewReceive: vi.fn(),
-      reviewReceiveError: null,
-      submitPlanFeedback: vi.fn(),
-      planFeedbackSubmitting: false,
-      planFeedbackError: null,
-    });
+    }));
 
     const view = renderPage();
     view.getByRole('button', { name: 'Start Workers' }).click();
@@ -254,7 +260,7 @@ describe('ItemDetailPage workflow UI', () => {
   });
 
   it('shows Start Planner when the item is errored and has no plan', () => {
-    mockUseItem.mockReturnValue({
+    mockUseItem.mockReturnValue(makeUseItemResult({
       item: makeItem({
         status: 'error',
         plan: undefined,
@@ -267,18 +273,7 @@ describe('ItemDetailPage workflow UI', () => {
           },
         ],
       }),
-      loading: false,
-      error: null,
-      refresh,
-      startPlanner,
-      startWorkers,
-      stopAgent: vi.fn(),
-      startReviewReceive: vi.fn(),
-      reviewReceiveError: null,
-      submitPlanFeedback: vi.fn(),
-      planFeedbackSubmitting: false,
-      planFeedbackError: null,
-    });
+    }));
 
     const view = renderPage();
 
@@ -287,7 +282,7 @@ describe('ItemDetailPage workflow UI', () => {
 
   it('shows a review exhausted badge for completed steps that hit the review cap', () => {
     const baseItem = makeItem();
-    mockUseItem.mockReturnValue({
+    mockUseItem.mockReturnValue(makeUseItemResult({
       item: makeItem({
         workflow: {
           ...baseItem.workflow,
@@ -318,18 +313,7 @@ describe('ItemDetailPage workflow UI', () => {
           currentActivity: undefined,
         },
       }),
-      loading: false,
-      error: null,
-      refresh,
-      startPlanner,
-      startWorkers,
-      stopAgent: vi.fn(),
-      startReviewReceive: vi.fn(),
-      reviewReceiveError: null,
-      submitPlanFeedback: vi.fn(),
-      planFeedbackSubmitting: false,
-      planFeedbackError: null,
-    });
+    }));
 
     const view = renderPage();
 
@@ -339,7 +323,7 @@ describe('ItemDetailPage workflow UI', () => {
 
   it('shows a hooks exhausted badge for completed steps that exhausted hooks retries', () => {
     const baseItem = makeItem();
-    mockUseItem.mockReturnValue({
+    mockUseItem.mockReturnValue(makeUseItemResult({
       item: makeItem({
         workflow: {
           ...baseItem.workflow,
@@ -369,18 +353,7 @@ describe('ItemDetailPage workflow UI', () => {
           currentActivity: undefined,
         },
       }),
-      loading: false,
-      error: null,
-      refresh,
-      startPlanner,
-      startWorkers,
-      stopAgent: vi.fn(),
-      startReviewReceive: vi.fn(),
-      reviewReceiveError: null,
-      submitPlanFeedback: vi.fn(),
-      planFeedbackSubmitting: false,
-      planFeedbackError: null,
-    });
+    }));
 
     const view = renderPage();
 
@@ -390,7 +363,7 @@ describe('ItemDetailPage workflow UI', () => {
 
   it('shows both warning badges when review and hooks both exhaust', () => {
     const baseItem = makeItem();
-    mockUseItem.mockReturnValue({
+    mockUseItem.mockReturnValue(makeUseItemResult({
       item: makeItem({
         workflow: {
           ...baseItem.workflow,
@@ -422,18 +395,7 @@ describe('ItemDetailPage workflow UI', () => {
           currentActivity: undefined,
         },
       }),
-      loading: false,
-      error: null,
-      refresh,
-      startPlanner,
-      startWorkers,
-      stopAgent: vi.fn(),
-      startReviewReceive: vi.fn(),
-      reviewReceiveError: null,
-      submitPlanFeedback: vi.fn(),
-      planFeedbackSubmitting: false,
-      planFeedbackError: null,
-    });
+    }));
 
     const view = renderPage();
 
@@ -443,7 +405,7 @@ describe('ItemDetailPage workflow UI', () => {
 
   it('does not show a review exhausted badge for normally completed steps', () => {
     const baseItem = makeItem();
-    mockUseItem.mockReturnValue({
+    mockUseItem.mockReturnValue(makeUseItemResult({
       item: makeItem({
         workflow: {
           ...baseItem.workflow,
@@ -473,18 +435,7 @@ describe('ItemDetailPage workflow UI', () => {
           currentActivity: undefined,
         },
       }),
-      loading: false,
-      error: null,
-      refresh,
-      startPlanner,
-      startWorkers,
-      stopAgent: vi.fn(),
-      startReviewReceive: vi.fn(),
-      reviewReceiveError: null,
-      submitPlanFeedback: vi.fn(),
-      planFeedbackSubmitting: false,
-      planFeedbackError: null,
-    });
+    }));
 
     const view = renderPage();
 

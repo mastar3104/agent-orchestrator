@@ -5,6 +5,8 @@ import type {
   OutputEvent,
   StatusChangedEvent,
   PlanCreatedEvent,
+  TestPlanCreatedEvent,
+  TestPlanApprovedEvent,
   ApprovalRequestEvent,
   ApprovalDecisionEvent,
   ApprovalFlags,
@@ -196,6 +198,40 @@ export function createPlanCreatedEvent(
     timestamp: timestamp(),
     itemId,
     planPath,
+  };
+}
+
+export function createTestPlanCreatedEvent(
+  itemId: string,
+  testPlanPath: string,
+  planFingerprint: string,
+  testPlanFingerprint: string
+): TestPlanCreatedEvent {
+  return {
+    id: createEventId(),
+    type: 'test_plan_created',
+    timestamp: timestamp(),
+    itemId,
+    testPlanPath,
+    planFingerprint,
+    testPlanFingerprint,
+  };
+}
+
+export function createTestPlanApprovedEvent(
+  itemId: string,
+  planFingerprint: string,
+  testPlanFingerprint: string,
+  approvedBy: 'user' | 'auto'
+): TestPlanApprovedEvent {
+  return {
+    id: createEventId(),
+    type: 'test_plan_approved',
+    timestamp: timestamp(),
+    itemId,
+    planFingerprint,
+    testPlanFingerprint,
+    approvedBy,
   };
 }
 

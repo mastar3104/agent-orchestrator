@@ -63,6 +63,10 @@ vi.mock('../planner-service', () => ({
   finalizeGeneratedPlan: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../test-planner-service', () => ({
+  synchronizeTestPlan: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('../state-service', () => ({
   deriveRepoStatuses: vi.fn(),
 }));

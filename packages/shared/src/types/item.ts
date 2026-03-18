@@ -59,6 +59,7 @@ export type TaskProgressPhase = 'engineer' | 'hooks' | 'review';
 export type WorkflowStageId =
   | 'workspace'
   | 'planning'
+  | 'test_planning'
   | 'execution'
   | 'publish'
   | 'review_receive';
@@ -140,6 +141,8 @@ export interface ItemWorkflowSummary {
 export interface ItemDetail extends ItemConfig {
   status: ItemStatus;
   plan?: import('./plan').Plan;
+  testPlan?: import('./plan').TestPlan;
+  testPlanApproval: import('./plan').TestPlanApprovalState;
   agents: import('./agent').AgentInfo[];
   pendingApprovals: import('./events').ApprovalRequestEvent[];
   repos: RepoSummary[];  // 変更: prUrl/prNumber を置換

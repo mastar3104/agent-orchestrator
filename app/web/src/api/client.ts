@@ -6,10 +6,19 @@ import type {
   ListItemsResponse,
   GetItemResponse,
   Plan,
+  TestPlan,
   StartWorkersRequest,
   ItemConfig,
   UpdatePlanRequest,
   UpdatePlanResponse,
+  GetPlanContentResponse,
+  GetTestPlanResponse,
+  GetTestPlanContentResponse,
+  UpdateTestPlanRequest,
+  UpdateTestPlanResponse,
+  TestPlanApprovalResponse,
+  StartAsyncResponse,
+  TestPlanFeedbackItem,
 } from '@agent-orch/shared';
 
 const API_BASE = '/api';
@@ -76,15 +85,15 @@ export async function deleteItem(id: string): Promise<{ deleted: boolean }> {
 }
 
 export async function retryClone(id: string): Promise<{ started: boolean }> {
-  return request<{ started: boolean }>(`/items/${id}/clone`, {
+  return request<StartAsyncResponse>(`/items/${id}/clone`, {
     method: 'POST',
     body: JSON.stringify({}),
   });
 }
 
 // Planner
-export async function startPlanner(itemId: string): Promise<{ started: boolean }> {
-  return request<{ started: boolean }>(`/items/${itemId}/planner/start`, {
+export async function startPlanner(itemId: string): Promise<StartAsyncResponse> {
+  return request<StartAsyncResponse>(`/items/${itemId}/planner/start`, {
     method: 'POST',
     body: JSON.stringify({}),
   });
@@ -96,8 +105,8 @@ export async function getPlan(itemId: string): Promise<{ plan: Plan | null }> {
 
 export async function getPlanContent(
   itemId: string
-): Promise<{ content: string | null }> {
-  return request<{ content: string | null }>(`/items/${itemId}/plan/content`);
+): Promise<GetPlanContentResponse> {
+  return request<GetPlanContentResponse>(`/items/${itemId}/plan/content`);
 }
 
 export async function updatePlan(
@@ -114,8 +123,8 @@ export async function updatePlan(
 export async function startWorkers(
   itemId: string,
   data: StartWorkersRequest = {}
-): Promise<{ started: boolean }> {
-  return request<{ started: boolean }>(`/items/${itemId}/workers/start`, {
+): Promise<StartAsyncResponse> {
+  return request<StartAsyncResponse>(`/items/${itemId}/workers/start`, {
     method: 'POST',
     body: JSON.stringify(data),
   });
@@ -157,8 +166,8 @@ export async function getAgentOutput(
 export async function submitPlanFeedback(
   itemId: string,
   feedbacks: { taskId: string; feedback: string }[]
-): Promise<{ started: boolean }> {
-  return request<{ started: boolean }>(
+): Promise<StartAsyncResponse> {
+  return request<StartAsyncResponse>(
     `/items/${itemId}/plan/feedback`,
     {
       method: 'POST',
@@ -167,12 +176,58 @@ export async function submitPlanFeedback(
   );
 }
 
+export async function startTestPlanner(itemId: string): Promise<StartAsyncResponse> {
+  return request<StartAsyncResponse>(`/items/${itemId}/test-planner/start`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function getTestPlan(itemId: string): Promise<GetTestPlanResponse> {
+  return request<GetTestPlanResponse>(`/items/${itemId}/test-plan`);
+}
+
+export async function getTestPlanContent(
+  itemId: string
+): Promise<GetTestPlanContentResponse> {
+  return request<GetTestPlanContentResponse>(`/items/${itemId}/test-plan/content`);
+}
+
+export async function updateTestPlan(
+  itemId: string,
+  data: UpdateTestPlanRequest
+): Promise<UpdateTestPlanResponse> {
+  return request<UpdateTestPlanResponse>(`/items/${itemId}/test-plan`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function submitTestPlanFeedback(
+  itemId: string,
+  feedbacks: TestPlanFeedbackItem[]
+): Promise<StartAsyncResponse> {
+  return request<StartAsyncResponse>(`/items/${itemId}/test-plan/feedback`, {
+    method: 'POST',
+    body: JSON.stringify({ feedbacks }),
+  });
+}
+
+export async function approveTestPlan(
+  itemId: string
+): Promise<TestPlanApprovalResponse> {
+  return request<TestPlanApprovalResponse>(`/items/${itemId}/test-plan/approve`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
 // Review Receive
 export async function startReviewReceive(
   itemId: string,
   repoName?: string
-): Promise<{ started: boolean }> {
-  return request<{ started: boolean }>(
+): Promise<StartAsyncResponse> {
+  return request<StartAsyncResponse>(
     `/items/${itemId}/review-receive/start`,
     {
       method: 'POST',

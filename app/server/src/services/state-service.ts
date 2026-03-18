@@ -24,6 +24,7 @@ import { getItemEventsPath, getAgentEventsPath, getItemPlanPath, getWorkspaceRoo
 import { readYamlSafe } from '../lib/yaml';
 import type { Plan } from '@agent-orch/shared';
 import { readRepoTaskState, type RepoTaskStateFile } from './task-state-service';
+import { deriveTestPlanApproval } from './test-planner-service';
 
 /**
  * Map old agent statuses to new ones for backward compat with persisted events.
@@ -564,12 +565,16 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
     }
   }
 
-  // 3. Planner running
-  const hasPlan = events.some(e => e.type === 'plan_created');
+  // 3. Planner / test planner state
+  const currentPlan = await readYamlSafe<Plan>(getItemPlanPath(itemId));
+  const hasCurrentPlan = Boolean(currentPlan);
+  const testPlanApproval = await deriveTestPlanApproval(itemId, currentPlan);
   const agentRoles = new Map<string, string>();
   const agentStates = new Map<string, AgentStatus>();
   let latestPlannerStatus: AgentStatus | undefined;
+  let latestTestPlannerStatus: AgentStatus | undefined;
   let hasPlannerSignal = false;
+  let hasTestPlannerSignal = false;
   for (const event of events) {
     if (event.type === 'agent_started') {
       const e = event as AgentStartedEvent;
@@ -578,6 +583,9 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
       if (e.role === 'planner') {
         latestPlannerStatus = 'running';
         hasPlannerSignal = true;
+      } else if (e.role === 'test-planner') {
+        latestTestPlannerStatus = 'running';
+        hasTestPlannerSignal = true;
       }
     } else if (event.type === 'agent_exited' && event.agentId) {
       const e = event as AgentExitedEvent;
@@ -588,6 +596,9 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
         if (agentRoles.get(event.agentId) === 'planner') {
           latestPlannerStatus = nextStatus;
           hasPlannerSignal = true;
+        } else if (agentRoles.get(event.agentId) === 'test-planner') {
+          latestTestPlannerStatus = nextStatus;
+          hasTestPlannerSignal = true;
         }
       }
     } else if (event.type === 'status_changed' && event.agentId) {
@@ -599,6 +610,9 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
         if (agentRoles.get(event.agentId) === 'planner') {
           latestPlannerStatus = nextStatus;
           hasPlannerSignal = true;
+        } else if (agentRoles.get(event.agentId) === 'test-planner') {
+          latestTestPlannerStatus = nextStatus;
+          hasTestPlannerSignal = true;
         }
       }
     } else if (event.type === 'error') {
@@ -606,21 +620,47 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
       if (e.phase === 'planner') {
         latestPlannerStatus = 'error';
         hasPlannerSignal = true;
+      } else if (e.phase === 'test_planner') {
+        latestTestPlannerStatus = 'error';
+        hasTestPlannerSignal = true;
       }
     }
   }
 
-  if (latestPlannerStatus === 'running') {
+  if (latestPlannerStatus === 'running' || latestTestPlannerStatus === 'running') {
     return 'planning';
   }
 
   // 4. Planner failed & no current plan
-  if (!hasPlan && latestPlannerStatus === 'error') {
+  if (!hasCurrentPlan && latestPlannerStatus === 'error') {
     return 'error';
   }
 
-  if (hasWorkspaceStarted && !hasPlannerSignal && !hasPlan && allRepos.some((r) => r.status === 'running')) {
+  if (
+    hasCurrentPlan &&
+    latestTestPlannerStatus === 'error' &&
+    testPlanApproval.status !== 'approved'
+  ) {
+    return 'error';
+  }
+
+  if (
+    hasWorkspaceStarted &&
+    !hasPlannerSignal &&
+    !hasCurrentPlan &&
+    allRepos.some((r) => r.status === 'running')
+  ) {
     return 'cloning';
+  }
+
+  if (
+    hasCurrentPlan &&
+    (testPlanApproval.status === 'missing' ||
+      testPlanApproval.status === 'stale' ||
+      testPlanApproval.status === 'pending' ||
+      (!hasTestPlannerSignal && hasPlannerSignal))
+  ) {
+    return 'planning';
   }
 
   // 5. Any repo review_receiving
@@ -680,7 +720,7 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
   }
 
   // 12. Default
-  if (hasPlan) {
+  if (hasCurrentPlan && testPlanApproval.status === 'approved') {
     return 'ready';
   }
 

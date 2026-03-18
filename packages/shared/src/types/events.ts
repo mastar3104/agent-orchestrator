@@ -7,6 +7,8 @@ export type EventType =
   | 'stderr'
   | 'status_changed'
   | 'plan_created'
+  | 'test_plan_created'
+  | 'test_plan_approved'
   | 'approval_requested'
   | 'approval_decision'
   | 'git_snapshot'
@@ -68,6 +70,20 @@ export interface StatusChangedEvent extends BaseEvent {
 export interface PlanCreatedEvent extends BaseEvent {
   type: 'plan_created';
   planPath: string;
+}
+
+export interface TestPlanCreatedEvent extends BaseEvent {
+  type: 'test_plan_created';
+  testPlanPath: string;
+  planFingerprint: string;
+  testPlanFingerprint: string;
+}
+
+export interface TestPlanApprovedEvent extends BaseEvent {
+  type: 'test_plan_approved';
+  planFingerprint: string;
+  testPlanFingerprint: string;
+  approvedBy: 'user' | 'auto';
 }
 
 export type ApprovalTool = 'bash' | 'read' | 'write' | 'edit' | 'unknown';
@@ -171,7 +187,16 @@ export interface RepoSetupCompletedEvent extends BaseEvent {
   allPassed: boolean;
 }
 
-export type ErrorPhase = 'planner' | 'clone' | 'workspace_setup' | 'engineer' | 'hooks' | 'review' | 'pr' | 'review_receive';
+export type ErrorPhase =
+  | 'planner'
+  | 'test_planner'
+  | 'clone'
+  | 'workspace_setup'
+  | 'engineer'
+  | 'hooks'
+  | 'review'
+  | 'pr'
+  | 'review_receive';
 
 export interface ErrorEvent extends BaseEvent {
   type: 'error';
@@ -295,6 +320,8 @@ export type ItemEvent =
   | RepoSetupStartedEvent
   | RepoSetupCompletedEvent
   | PlanCreatedEvent
+  | TestPlanCreatedEvent
+  | TestPlanApprovedEvent
   | StatusChangedEvent
   | ErrorEvent
   | PrCreatedEvent

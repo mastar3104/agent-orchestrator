@@ -7,7 +7,17 @@ import type {
   AgentExecutionOutput,
   Plan,
   PlanFeedbackItem,
+  TestPlanFeedbackItem,
   StartWorkersRequest,
+  GetPlanContentResponse,
+  GetTestPlanResponse,
+  GetTestPlanContentResponse,
+  UpdatePlanRequest,
+  UpdatePlanResponse,
+  UpdateTestPlanRequest,
+  UpdateTestPlanResponse,
+  StartAsyncResponse,
+  TestPlanApprovalResponse,
 } from '@agent-orch/shared';
 import {
   stopAgent,
@@ -23,12 +33,36 @@ import { createErrorEvent } from '../lib/events';
 import { appendJsonl } from '../lib/jsonl';
 import { eventBus } from '../services/event-bus';
 import { stopAllGitSnapshots } from '../services/git-snapshot-service';
+import {
+  approveTestPlan,
+  deriveTestPlanApproval,
+  getTestPlan,
+  getTestPlanContent,
+  startTestPlanner,
+  testPlanFeedback,
+  updateTestPlanContent,
+  validateTestPlanFeedback,
+} from '../services/test-planner-service';
+
+async function recordBackgroundError(
+  itemId: string,
+  message: string,
+  phase?: import('@agent-orch/shared').ErrorPhase
+): Promise<void> {
+  try {
+    const errorEvent = createErrorEvent(itemId, message, { phase });
+    await appendJsonl(getItemEventsPath(itemId), errorEvent);
+    eventBus.emit('event', { itemId, event: errorEvent });
+  } catch {
+    // best-effort
+  }
+}
 
 export const agentRoutes: FastifyPluginAsync = async (fastify) => {
   // Start planner for an item (async — returns 202 immediately)
   fastify.post<{
     Params: { id: string };
-    Reply: ApiResponse<{ started: boolean }>;
+    Reply: ApiResponse<StartAsyncResponse>;
   }>('/items/:id/planner/start', async (request, reply) => {
     const itemId = request.params.id;
 
@@ -43,11 +77,7 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
     withItemLock(itemId, () => startPlanner(itemId)).catch(async (err) => {
       const message = err instanceof Error ? err.message : 'Unknown error';
       console.error(`[${itemId}] Planner failed:`, message);
-      try {
-        const errorEvent = createErrorEvent(itemId, message, { phase: 'planner' });
-        await appendJsonl(getItemEventsPath(itemId), errorEvent);
-        eventBus.emit('event', { itemId, event: errorEvent });
-      } catch { /* best-effort */ }
+      await recordBackgroundError(itemId, message, 'planner');
     });
 
     return reply.status(202).send({
@@ -79,7 +109,7 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
   // Get plan content for an item
   fastify.get<{
     Params: { id: string };
-    Reply: ApiResponse<{ content: string | null }>;
+    Reply: ApiResponse<GetPlanContentResponse>;
   }>('/items/:id/plan/content', async (request, reply) => {
     try {
       const content = await getPlanContent(request.params.id);
@@ -99,11 +129,12 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
   // Update plan for an item
   fastify.put<{
     Params: { id: string };
-    Body: { content: string };
-    Reply: ApiResponse<{ plan: import('@agent-orch/shared').Plan; content: string }>;
+    Body: UpdatePlanRequest;
+    Reply: ApiResponse<UpdatePlanResponse>;
   }>('/items/:id/plan', async (request, reply) => {
     try {
-      if (isItemLocked(request.params.id)) {
+      const itemId = request.params.id;
+      if (isItemLocked(itemId)) {
         return reply.status(409).send({
           success: false,
           error: 'Operation already in progress for this item',
@@ -111,9 +142,18 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
       }
 
       const { content } = request.body;
-      const updated = await withItemLock(request.params.id, () =>
-        updatePlanContent(request.params.id, content)
+      const updated = await withItemLock(itemId, () =>
+        updatePlanContent(itemId, content)
       );
+
+      queueMicrotask(() => {
+        withItemLock(itemId, () => startTestPlanner(itemId)).catch(async (err) => {
+          const message = err instanceof Error ? err.message : 'Unknown error';
+          console.error(`[${itemId}] Test planner failed after manual plan update:`, message);
+          await recordBackgroundError(itemId, message, 'test_planner');
+        });
+      });
+
       return reply.send({
         success: true,
         data: updated,
@@ -131,7 +171,7 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.post<{
     Params: { id: string };
     Body: { feedbacks: PlanFeedbackItem[] };
-    Reply: ApiResponse<{ started: boolean }>;
+    Reply: ApiResponse<StartAsyncResponse>;
   }>('/items/:id/plan/feedback', async (request, reply) => {
     const itemId = request.params.id;
     const { feedbacks } = request.body || {};
@@ -221,11 +261,7 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
     withItemLock(itemId, () => planFeedback(itemId, feedbacks)).catch(async (err) => {
       const message = err instanceof Error ? err.message : 'Unknown error';
       console.error(`[${itemId}] Plan feedback failed:`, message);
-      try {
-        const errorEvent = createErrorEvent(itemId, message, { phase: 'planner' });
-        await appendJsonl(getItemEventsPath(itemId), errorEvent);
-        eventBus.emit('event', { itemId, event: errorEvent });
-      } catch { /* best-effort */ }
+      await recordBackgroundError(itemId, message, 'planner');
     });
 
     return reply.status(202).send({
@@ -234,11 +270,224 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
     });
   });
 
+  fastify.post<{
+    Params: { id: string };
+    Reply: ApiResponse<StartAsyncResponse>;
+  }>('/items/:id/test-planner/start', async (request, reply) => {
+    const itemId = request.params.id;
+
+    if (isItemLocked(itemId)) {
+      return reply.status(409).send({
+        success: false,
+        error: 'Operation already in progress for this item',
+      });
+    }
+
+    withItemLock(itemId, () => startTestPlanner(itemId)).catch(async (err) => {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      console.error(`[${itemId}] Test planner failed:`, message);
+      await recordBackgroundError(itemId, message, 'test_planner');
+    });
+
+    return reply.status(202).send({
+      success: true,
+      data: { started: true },
+    });
+  });
+
+  fastify.get<{
+    Params: { id: string };
+    Reply: ApiResponse<GetTestPlanResponse>;
+  }>('/items/:id/test-plan', async (request, reply) => {
+    try {
+      const testPlan = await getTestPlan(request.params.id);
+      return reply.send({
+        success: true,
+        data: { testPlan },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return reply.status(500).send({
+        success: false,
+        error: message,
+      });
+    }
+  });
+
+  fastify.get<{
+    Params: { id: string };
+    Reply: ApiResponse<GetTestPlanContentResponse>;
+  }>('/items/:id/test-plan/content', async (request, reply) => {
+    try {
+      const content = await getTestPlanContent(request.params.id);
+      return reply.send({
+        success: true,
+        data: { content },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return reply.status(500).send({
+        success: false,
+        error: message,
+      });
+    }
+  });
+
+  fastify.put<{
+    Params: { id: string };
+    Body: UpdateTestPlanRequest;
+    Reply: ApiResponse<UpdateTestPlanResponse>;
+  }>('/items/:id/test-plan', async (request, reply) => {
+    try {
+      const itemId = request.params.id;
+      if (isItemLocked(itemId)) {
+        return reply.status(409).send({
+          success: false,
+          error: 'Operation already in progress for this item',
+        });
+      }
+
+      const updated = await withItemLock(itemId, () =>
+        updateTestPlanContent(itemId, request.body.content)
+      );
+      return reply.send({
+        success: true,
+        data: {
+          testPlan: updated.testPlan,
+          content: updated.content,
+        },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return reply.status(400).send({
+        success: false,
+        error: message,
+      });
+    }
+  });
+
+  fastify.post<{
+    Params: { id: string };
+    Body: { feedbacks: TestPlanFeedbackItem[] };
+    Reply: ApiResponse<StartAsyncResponse>;
+  }>('/items/:id/test-plan/feedback', async (request, reply) => {
+    const itemId = request.params.id;
+    const { feedbacks } = request.body || {};
+
+    if (isItemLocked(itemId)) {
+      return reply.status(409).send({
+        success: false,
+        error: 'Operation already in progress for this item',
+      });
+    }
+
+    if (!Array.isArray(feedbacks) || feedbacks.length === 0) {
+      return reply.status(400).send({
+        success: false,
+        error: 'feedbacks must not be empty',
+      });
+    }
+
+    for (const feedback of feedbacks) {
+      if (
+        !feedback ||
+        typeof feedback !== 'object' ||
+        typeof feedback.scenarioId !== 'string' ||
+        typeof feedback.feedback !== 'string'
+      ) {
+        return reply.status(400).send({
+          success: false,
+          error: 'Each feedback must have string scenarioId and feedback',
+        });
+      }
+      if (!feedback.scenarioId.trim()) {
+        return reply.status(400).send({
+          success: false,
+          error: 'scenarioId must not be empty',
+        });
+      }
+      if (!feedback.feedback.trim()) {
+        return reply.status(400).send({
+          success: false,
+          error: 'feedback must not be empty',
+        });
+      }
+    }
+
+    const scenarioIds = feedbacks.map((feedback) => feedback.scenarioId.trim());
+    if (new Set(scenarioIds).size !== scenarioIds.length) {
+      return reply.status(400).send({
+        success: false,
+        error: 'Duplicate scenarioId in feedbacks',
+      });
+    }
+
+    try {
+      const currentTestPlan = await getTestPlan(itemId);
+      if (!currentTestPlan) {
+        return reply.status(400).send({
+          success: false,
+          error: 'No test plan exists yet',
+        });
+      }
+      const validationErrors = validateTestPlanFeedback(feedbacks, currentTestPlan);
+      if (validationErrors.length > 0) {
+        return reply.status(400).send({
+          success: false,
+          error: validationErrors.join('; '),
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to read test plan';
+      return reply.status(400).send({
+        success: false,
+        error: message,
+      });
+    }
+
+    withItemLock(itemId, () => testPlanFeedback(itemId, feedbacks)).catch(async (err) => {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      console.error(`[${itemId}] Test plan feedback failed:`, message);
+      await recordBackgroundError(itemId, message, 'test_planner');
+    });
+
+    return reply.status(202).send({
+      success: true,
+      data: { started: true },
+    });
+  });
+
+  fastify.post<{
+    Params: { id: string };
+    Reply: ApiResponse<TestPlanApprovalResponse>;
+  }>('/items/:id/test-plan/approve', async (request, reply) => {
+    try {
+      const itemId = request.params.id;
+      if (isItemLocked(itemId)) {
+        return reply.status(409).send({
+          success: false,
+          error: 'Operation already in progress for this item',
+        });
+      }
+      const approval = await withItemLock(itemId, () => approveTestPlan(itemId));
+      return reply.send({
+        success: true,
+        data: { approval },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return reply.status(400).send({
+        success: false,
+        error: message,
+      });
+    }
+  });
+
   // Start all workers (async — returns 202 immediately)
   fastify.post<{
     Params: { id: string };
     Body: StartWorkersRequest;
-    Reply: ApiResponse<{ started: boolean }>;
+    Reply: ApiResponse<StartAsyncResponse>;
   }>('/items/:id/workers/start', async (request, reply) => {
     const itemId = request.params.id;
     const startWorkersRequest = request.body || {};
@@ -252,17 +501,21 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
       });
     }
 
+    const approval = await deriveTestPlanApproval(itemId);
+    if (approval.status !== 'approved') {
+      return reply.status(400).send({
+        success: false,
+        error: `Test plan approval is required before starting workers (current status: ${approval.status})`,
+      });
+    }
+
     // Fire-and-forget with item lock + error logging
     withItemLock(itemId, async () => {
       await startWorkers(itemId, { targetRepos, mode });
     }).catch(async (err) => {
       const message = err instanceof Error ? err.message : 'Unknown error';
       console.error(`[${itemId}] Workers failed:`, message);
-      try {
-        const errorEvent = createErrorEvent(itemId, message);
-        await appendJsonl(getItemEventsPath(itemId), errorEvent);
-        eventBus.emit('event', { itemId, event: errorEvent });
-      } catch { /* best-effort */ }
+      await recordBackgroundError(itemId, message);
     });
 
     return reply.status(202).send({

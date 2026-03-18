@@ -19,6 +19,7 @@ import { type ReviewReceiverResponse } from '../lib/claude-schemas';
 import { getRole } from '../lib/role-loader';
 import { composeRepositoryRolePrompt } from '../lib/repository-role-prompts';
 import { archiveCurrentExecutionArtifacts, finalizeGeneratedPlan } from './planner-service';
+import { synchronizeTestPlan } from './test-planner-service';
 
 /**
  * 指定されたItemのPR情報を取得する（repoName でフィルタ可能）
@@ -385,6 +386,7 @@ export async function startReviewReceive(
     allowEmptyTasks: true,
     sourcePath: repoPlanPath,
   });
+  await synchronizeTestPlan(itemId, config);
   await rm(repoPlanPath, { force: true });
 
   // Record review_receive_completed after successful agent execution

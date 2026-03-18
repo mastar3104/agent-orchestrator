@@ -17,7 +17,12 @@ vi.mock('../../lib/yaml', () => ({
 }));
 
 vi.mock('../task-state-service', () => ({
+  createPlanFingerprint: vi.fn().mockReturnValue('fingerprint'),
   readRepoTaskState: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock('../test-planner-service', () => ({
+  deriveTestPlanApproval: vi.fn().mockResolvedValue({ status: 'approved' }),
 }));
 
 vi.mock('fs', () => ({

@@ -60,6 +60,7 @@ import { getAgentsByItem, stopAgent } from './agent-service';
 import { stopAllGitSnapshots } from './git-snapshot-service';
 import { startPlanner, getPlan } from './planner-service';
 import { readRepoTaskState, type RepoTaskStateFile, type RepoTaskStateTask } from './task-state-service';
+import { deriveTestPlanApproval, getTestPlan } from './test-planner-service';
 
 export async function createItem(request: CreateItemRequest): Promise<ItemConfig> {
   const id = `ITEM-${nanoid(8)}`;
@@ -411,6 +412,7 @@ export async function getItemConfig(itemId: string): Promise<ItemConfig | null> 
 const WORKFLOW_STAGE_LABELS: Record<WorkflowStageId, string> = {
   workspace: 'Workspace',
   planning: 'Planning',
+  test_planning: 'Test Planning',
   execution: 'Execution',
   publish: 'Publish',
   review_receive: 'Review Receive',
@@ -435,6 +437,7 @@ export function buildWorkflowSummary(params: {
   config: ItemConfig;
   itemStatus: import('@agent-orch/shared').ItemStatus;
   plan: Plan | null;
+  testPlanApproval: import('@agent-orch/shared').TestPlanApprovalState;
   events: ItemEvent[];
   agents: AgentInfo[];
   repoStatuses: Map<string, RepoDerivedState>;
@@ -446,6 +449,7 @@ export function buildWorkflowSummary(params: {
     config,
     itemStatus,
     plan,
+    testPlanApproval,
     events,
     agents,
     repoStatuses,
@@ -522,6 +526,18 @@ export function buildWorkflowSummary(params: {
     plan ? 'completed'
       : plannerRunning ? 'running'
       : hasPlannerError ? 'error'
+      : 'pending';
+  const testPlannerRunning = agents.some(
+    (agent) => agent.role === 'test-planner' && (agent.status === 'starting' || agent.status === 'running')
+  );
+  const hasTestPlannerError =
+    testPlanApproval.status !== 'approved' &&
+    events.some((event) => event.type === 'error' && event.phase === 'test_planner');
+  const testPlanningStageStatus: WorkflowStageStatus =
+    !plan ? 'pending'
+      : testPlanApproval.status === 'approved' ? 'completed'
+      : testPlannerRunning ? 'running'
+      : hasTestPlannerError ? 'error'
       : 'pending';
 
   const tasksByRepo = new Map<string, PlanTask[]>();
@@ -656,6 +672,7 @@ export function buildWorkflowSummary(params: {
   const stages: ItemWorkflowStage[] = [
     { id: 'workspace', label: WORKFLOW_STAGE_LABELS.workspace, status: workspaceStageStatus },
     { id: 'planning', label: WORKFLOW_STAGE_LABELS.planning, status: planningStageStatus },
+    { id: 'test_planning', label: WORKFLOW_STAGE_LABELS.test_planning, status: testPlanningStageStatus },
     { id: 'execution', label: WORKFLOW_STAGE_LABELS.execution, status: executionStageStatus },
     { id: 'publish', label: WORKFLOW_STAGE_LABELS.publish, status: publishStageStatus },
   ];
@@ -673,7 +690,9 @@ export function buildWorkflowSummary(params: {
   }
 
   const runningPublishRepos = jobs.filter((job) => job.activeStage === 'publish' && job.status === 'running');
-  const planningActivityCount = planningStageStatus === 'running' ? 1 : 0;
+  const planningActivityCount =
+    (planningStageStatus === 'running' ? 1 : 0) +
+    (testPlanningStageStatus === 'running' ? 1 : 0);
   const totalRunningActivities =
     reviewReceiveRunningRepos.length +
     runningPublishRepos.length +
@@ -710,6 +729,11 @@ export function buildWorkflowSummary(params: {
       stage: 'planning',
       moreRunningCount: Math.max(totalRunningActivities - 1, 0) || undefined,
     };
+  } else if (testPlanningStageStatus === 'running') {
+    currentActivity = {
+      stage: 'test_planning',
+      moreRunningCount: Math.max(totalRunningActivities - 1, 0) || undefined,
+    };
   } else if (workspaceRunningRepos.length > 0) {
     currentActivity = {
       repoName: workspaceRunningRepos[0].name,
@@ -739,6 +763,8 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
 
   const status = await deriveItemStatus(itemId);
   const plan = await getPlan(itemId);
+  const testPlan = await getTestPlan(itemId);
+  const testPlanApproval = await deriveTestPlanApproval(itemId, plan, testPlan);
   const agents = await getAgentsByItem(itemId);
   const pendingApprovals = await getPendingApprovals(itemId);
 
@@ -758,6 +784,7 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
     config,
     itemStatus: status,
     plan,
+    testPlanApproval,
     events,
     agents,
     repoStatuses: repoStatusMap,
@@ -792,6 +819,8 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
     ...config,
     status,
     plan: plan || undefined,
+    testPlan: testPlan || undefined,
+    testPlanApproval,
     agents,
     pendingApprovals,
     repos,

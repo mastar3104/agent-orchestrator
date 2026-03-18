@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { readFile, mkdir, writeFile } from 'fs/promises';
+import { mkdir, writeFile } from 'fs/promises';
 import { resolve, join } from 'path';
 import type {
   Plan,
@@ -19,7 +19,8 @@ import {
   stopAllGitSnapshots,
 } from './git-snapshot-service';
 import { createDraftPrsForAllRepos } from './git-pr-service';
-import { getWorkspaceRoot, getRepoWorkspaceDir, getItemEventsPath, getItemPlanPath, getHookLogDir } from '../lib/paths';
+import { getWorkspaceRoot, getRepoWorkspaceDir, getItemEventsPath, getHookLogDir } from '../lib/paths';
+import { stringifyYaml } from '../lib/yaml';
 import { eventBus } from './event-bus';
 import { appendJsonl } from '../lib/jsonl';
 import {
@@ -47,6 +48,7 @@ import {
 } from './task-state-service';
 import { deriveRepoStatuses } from './state-service';
 import { resolveHooksMaxAttempts } from '../lib/repository-config';
+import { ensureApprovedTestPlan } from './test-planner-service';
 
 const MAX_FEEDBACK_ROUNDS = 3;
 const MAX_DIFF_LINES = 20000;
@@ -921,6 +923,7 @@ async function runTaskReviewPhase(
       phaseBase,
       currentHead,
       task,
+      plan,
       hookPhase.exhausted ? summarizeHookFailures(hookPhase.hookResults) : undefined
     );
     const reviewerPrompt = composeRepositoryRolePrompt(
@@ -1105,6 +1108,8 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
   if (!plan) {
     throw new Error(`No plan found for item ${itemId}`);
   }
+
+  await ensureApprovedTestPlan(itemId);
 
   const itemConfig = await getItemConfig(itemId);
   if (!itemConfig) {
@@ -1461,18 +1466,18 @@ async function buildReviewContext(
   phaseBase: string,
   currentHead: string,
   reviewTask: PlanTask,
+  plan: Plan,
   hookWarningSummary?: string
 ): Promise<string> {
   const taskDescriptions = `### Task: ${reviewTask.id} - ${reviewTask.title}
 ${reviewTask.description}`;
 
-  // Read plan.yaml
-  let planContent = '';
-  try {
-    planContent = await readFile(getItemPlanPath(itemId), 'utf-8');
-  } catch {
-    planContent = '<unable to read plan>';
-  }
+  // Build plan excerpt for the current review task only
+  const relevantPlan = {
+    summary: plan.summary,
+    tasks: plan.tasks.filter(t => t.id === reviewTask.id),
+  };
+  const planContent = stringifyYaml(relevantPlan);
 
   // Get changed files info
   let changedFiles: ChangedFileInfo[] = [];

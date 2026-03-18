@@ -5,6 +5,11 @@ type RepoScopedRolePromptKey = Extract<
   'engineer' | 'reviewer' | 'reviewReceiver'
 >;
 
+type WorkspaceScopedRolePromptKey = Extract<
+  EditableRolePromptKey,
+  'planner' | 'testPlanner'
+>;
+
 export function composeRepositoryRolePrompt(
   basePrompt: string,
   rolePrompts: RolePrompts | undefined,
@@ -22,19 +27,20 @@ ${repositoryPrompt}
 ${basePrompt}`;
 }
 
-export function composePlannerRepositoryPrompts(
+export function composeWorkspaceRolePrompts(
   basePrompt: string,
-  repositories: Array<{ name: string; rolePrompts?: RolePrompts }>
+  repositories: Array<{ name: string; rolePrompts?: RolePrompts }>,
+  roleKey: WorkspaceScopedRolePromptKey
 ): string {
   const sections = repositories
     .map((repository) => {
-      const plannerPrompt = repository.rolePrompts?.planner?.trim();
-      if (!plannerPrompt) {
+      const workspacePrompt = repository.rolePrompts?.[roleKey]?.trim();
+      if (!workspacePrompt) {
         return null;
       }
 
       return `### ${repository.name}
-${plannerPrompt}`;
+${workspacePrompt}`;
     })
     .filter((section): section is string => section !== null);
 
@@ -47,4 +53,11 @@ ${plannerPrompt}`;
 ${sections.join('\n\n')}
 
 ${basePrompt}`;
+}
+
+export function composePlannerRepositoryPrompts(
+  basePrompt: string,
+  repositories: Array<{ name: string; rolePrompts?: RolePrompts }>
+): string {
+  return composeWorkspaceRolePrompts(basePrompt, repositories, 'planner');
 }

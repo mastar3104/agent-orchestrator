@@ -21,7 +21,12 @@ vi.mock('../planner-service', () => ({
   getPlan: vi.fn(),
 }));
 
+vi.mock('../test-planner-service', () => ({
+  ensureApprovedTestPlan: vi.fn().mockResolvedValue({ status: 'approved' }),
+}));
+
 vi.mock('../task-state-service', () => ({
+  createPlanFingerprint: vi.fn().mockReturnValue('fingerprint'),
   ensureTaskStatesForPlan: vi.fn().mockImplementation(async (itemId: string, plan: any) => {
     for (const task of plan.tasks || []) {
       if (!taskStateStore.has(task.repository)) {

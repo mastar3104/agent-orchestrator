@@ -62,6 +62,10 @@ vi.mock('../task-state-service', () => ({
   regenerateTaskStatesForPlan: vi.fn().mockResolvedValue([]),
 }));
 
+vi.mock('../test-planner-service', () => ({
+  synchronizeTestPlan: vi.fn().mockResolvedValue(undefined),
+}));
+
 import { validatePlanFeedback, planFeedback, formatFeedbacks, finalizeGeneratedPlan, startPlanner } from '../planner-service';
 import { executeAgent } from '../agent-service';
 import { getItemConfig } from '../item-service';

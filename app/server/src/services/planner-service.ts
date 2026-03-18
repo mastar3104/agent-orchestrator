@@ -22,6 +22,7 @@ import { eventBus } from './event-bus';
 import { type PlannerResponse } from '../lib/claude-schemas';
 import { getRole } from '../lib/role-loader';
 import { composePlannerRepositoryPrompts } from '../lib/repository-role-prompts';
+import { synchronizeTestPlan } from './test-planner-service';
 
 type LegacyPlanTask = PlanTask & { agent?: string };
 type LegacyPlan = Omit<Plan, 'tasks'> & { tasks: LegacyPlanTask[] };
@@ -159,6 +160,7 @@ export async function startPlanner(itemId: string): Promise<void> {
   });
 
   await finalizeGeneratedPlan(itemId, config);
+  await synchronizeTestPlan(itemId, config);
 }
 
 function buildPlannerContext(config: ItemConfig): string {
@@ -406,4 +408,5 @@ export async function planFeedback(
   });
 
   await finalizeGeneratedPlan(itemId, config);
+  await synchronizeTestPlan(itemId, config);
 }

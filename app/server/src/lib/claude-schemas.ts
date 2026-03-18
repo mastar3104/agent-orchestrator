@@ -5,6 +5,8 @@ export interface PlannerResponse {
   summary: string;
 }
 
+export type TestPlannerResponse = PlannerResponse;
+
 export interface EngineerResponse {
   status: 'success' | 'failure';
 }
@@ -66,11 +68,13 @@ export const REVIEWER_RESPONSE_SCHEMA = {
 };
 
 export const REVIEW_RECEIVER_RESPONSE_SCHEMA = PLANNER_RESPONSE_SCHEMA;
+export const TEST_PLANNER_RESPONSE_SCHEMA = PLANNER_RESPONSE_SCHEMA;
 
 // ─── Schema Registry (for role-loader) ───
 
 export const SCHEMA_REGISTRY: Record<string, object> = {
   planner: PLANNER_RESPONSE_SCHEMA,
+  testPlanner: TEST_PLANNER_RESPONSE_SCHEMA,
   engineer: ENGINEER_RESPONSE_SCHEMA,
   reviewer: REVIEWER_RESPONSE_SCHEMA,
   reviewReceiver: REVIEW_RECEIVER_RESPONSE_SCHEMA,

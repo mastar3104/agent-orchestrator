@@ -84,8 +84,8 @@ export async function executeAgent<T>(options: {
   env?: Record<string, string>;
   timeoutMs?: number;
 }): Promise<{ agent: AgentInfo; result: ClaudeExecutionResult<T> }> {
-  // planner 以外は repoName 必須チェック
-  if (options.role !== 'planner' && !options.repoName) {
+  const workspaceScopedRoles = new Set(['planner', 'test-planner']);
+  if (!workspaceScopedRoles.has(options.role) && !options.repoName) {
     throw new Error(`repoName is required for role '${options.role}'`);
   }
 
@@ -174,6 +174,7 @@ export async function executeAgent<T>(options: {
 
     if (options.emitErrorEvent !== false) {
       const phase = options.role === 'review-receiver' ? 'review_receive' as const
+        : options.role === 'test-planner' ? 'test_planner' as const
         : (['engineer', 'review', 'planner'] as const).find(r => r === options.role);
       const errorEvent = createErrorEvent(options.itemId, errorMessage, {
         agentId,

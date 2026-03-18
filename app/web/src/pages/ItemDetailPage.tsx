@@ -37,6 +37,13 @@ const STEP_STATUS_ICONS: Record<string, string> = {
   failed: '✕',
 };
 
+const TEST_PLAN_APPROVAL_STYLES: Record<string, string> = {
+  missing: 'bg-gray-700 text-gray-300',
+  stale: 'bg-yellow-500/20 text-yellow-200',
+  pending: 'bg-blue-500/20 text-blue-200',
+  approved: 'bg-emerald-500/20 text-emerald-200',
+};
+
 function formatPhase(phase?: TaskProgressPhase): string {
   if (!phase) return '';
   return phase.charAt(0).toUpperCase() + phase.slice(1);
@@ -48,6 +55,8 @@ function formatStageLabel(stage: WorkflowStageId): string {
       return 'Preparing workspace';
     case 'planning':
       return 'Planning';
+    case 'test_planning':
+      return 'Test Planning';
     case 'execution':
       return 'Executing tasks';
     case 'publish':
@@ -71,6 +80,9 @@ function getCurrentActivityText(
   }
   if (activity.stage === 'planning') {
     return 'Planner is building the current plan';
+  }
+  if (activity.stage === 'test_planning') {
+    return 'Test planner is building the current test plan';
   }
   if (activity.stage === 'workspace') {
     return `${activity.repoName}: preparing workspace`;
@@ -103,13 +115,21 @@ export function ItemDetailPage() {
     error,
     refresh,
     startPlanner,
+    startTestPlanner,
     startWorkers,
     stopAgent,
     startReviewReceive,
     reviewReceiveError,
+    testPlannerError,
     submitPlanFeedback,
     planFeedbackSubmitting,
     planFeedbackError,
+    submitTestPlanFeedback,
+    testPlanFeedbackSubmitting,
+    testPlanFeedbackError,
+    approveCurrentTestPlan,
+    testPlanApproveSubmitting,
+    testPlanApproveError,
   } = useItem(id);
   const [recentEvents, setRecentEvents] = useState<ItemEvent[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
@@ -123,6 +143,18 @@ export function ItemDetailPage() {
   const [feedbackRows, setFeedbackRows] = useState<{ taskId: string; feedback: string }[]>([{ taskId: '', feedback: '' }]);
   const [feedbackLocalError, setFeedbackLocalError] = useState<string | null>(null);
   const [planUpdatedBanner, setPlanUpdatedBanner] = useState(false);
+  const [testPlanEditorOpen, setTestPlanEditorOpen] = useState(false);
+  const [testPlanContent, setTestPlanContent] = useState('');
+  const [testPlanOriginal, setTestPlanOriginal] = useState('');
+  const [testPlanLoaded, setTestPlanLoaded] = useState(false);
+  const [testPlanLoading, setTestPlanLoading] = useState(false);
+  const [testPlanSaving, setTestPlanSaving] = useState(false);
+  const [testPlanError, setTestPlanError] = useState<string | null>(null);
+  const [testPlanFeedbackRows, setTestPlanFeedbackRows] = useState<{ scenarioId: string; feedback: string }[]>([
+    { scenarioId: '', feedback: '' },
+  ]);
+  const [testPlanFeedbackLocalError, setTestPlanFeedbackLocalError] = useState<string | null>(null);
+  const [testPlanUpdatedBanner, setTestPlanUpdatedBanner] = useState(false);
 
   const loadPlanContent = useCallback(async () => {
     if (!id) return;
@@ -142,14 +174,39 @@ export function ItemDetailPage() {
   }, [id]);
 
   const planDirty = planContent !== planOriginal;
+  const testPlanDirty = testPlanContent !== testPlanOriginal;
 
   // Use refs so handleEvent always sees current values without re-creating
   const planEditorOpenRef = useRef(planEditorOpen);
   const planDirtyRef = useRef(planDirty);
   const loadPlanContentRef = useRef(loadPlanContent);
+  const testPlanEditorOpenRef = useRef(testPlanEditorOpen);
+  const testPlanDirtyRef = useRef(testPlanDirty);
   useEffect(() => { planEditorOpenRef.current = planEditorOpen; }, [planEditorOpen]);
   useEffect(() => { planDirtyRef.current = planDirty; }, [planDirty]);
   useEffect(() => { loadPlanContentRef.current = loadPlanContent; }, [loadPlanContent]);
+  useEffect(() => { testPlanEditorOpenRef.current = testPlanEditorOpen; }, [testPlanEditorOpen]);
+  useEffect(() => { testPlanDirtyRef.current = testPlanDirty; }, [testPlanDirty]);
+
+  const loadTestPlanContent = useCallback(async () => {
+    if (!id) return;
+    setTestPlanLoading(true);
+    setTestPlanError(null);
+    try {
+      const result = await api.getTestPlanContent(id);
+      const content = result.content ?? '';
+      setTestPlanContent(content);
+      setTestPlanOriginal(content);
+      setTestPlanLoaded(true);
+    } catch (err) {
+      setTestPlanError(err instanceof Error ? err.message : 'Failed to load test plan');
+    } finally {
+      setTestPlanLoading(false);
+    }
+  }, [id]);
+
+  const loadTestPlanContentRef = useRef(loadTestPlanContent);
+  useEffect(() => { loadTestPlanContentRef.current = loadTestPlanContent; }, [loadTestPlanContent]);
 
   const handleEvent = useCallback((event: ItemEvent) => {
     setRecentEvents((prev) => [...prev.slice(-100), event]);
@@ -167,6 +224,8 @@ export function ItemDetailPage() {
       event.type === 'approval_requested' ||
       event.type === 'approval_decision' ||
       event.type === 'plan_created' ||
+      event.type === 'test_plan_created' ||
+      event.type === 'test_plan_approved' ||
       event.type === 'hooks_executed' ||
       event.type === 'review_receive_started' ||
       event.type === 'review_receive_completed' ||
@@ -186,6 +245,13 @@ export function ItemDetailPage() {
         setPlanUpdatedBanner(true);
       }
     }
+    if (event.type === 'test_plan_created' && testPlanEditorOpenRef.current) {
+      if (!testPlanDirtyRef.current) {
+        loadTestPlanContentRef.current();
+      } else {
+        setTestPlanUpdatedBanner(true);
+      }
+    }
   }, [refresh]);
 
   const { isConnected } = useWebSocket({
@@ -199,6 +265,13 @@ export function ItemDetailPage() {
       await loadPlanContent();
     }
   }, [loadPlanContent, planLoaded]);
+
+  const handleOpenTestPlanEditor = useCallback(async () => {
+    setTestPlanEditorOpen(true);
+    if (!testPlanLoaded) {
+      await loadTestPlanContent();
+    }
+  }, [loadTestPlanContent, testPlanLoaded]);
 
   const handleSavePlan = useCallback(async () => {
     if (!id) return;
@@ -215,6 +288,22 @@ export function ItemDetailPage() {
       setPlanSaving(false);
     }
   }, [id, planContent, refresh]);
+
+  const handleSaveTestPlan = useCallback(async () => {
+    if (!id) return;
+    setTestPlanSaving(true);
+    setTestPlanError(null);
+    try {
+      const result = await api.updateTestPlan(id, { content: testPlanContent });
+      setTestPlanContent(result.content);
+      setTestPlanOriginal(result.content);
+      await refresh();
+    } catch (err) {
+      setTestPlanError(err instanceof Error ? err.message : 'Failed to save test plan');
+    } finally {
+      setTestPlanSaving(false);
+    }
+  }, [id, testPlanContent, refresh]);
 
   if (loading) {
     return (
@@ -241,8 +330,10 @@ export function ItemDetailPage() {
 
   // Workers can only be started when ready or when there was an error but plan exists
   const canStartWorkers =
-    item.status === 'ready' ||
-    (item.status === 'error' && !!item.plan);
+    item.testPlanApproval.status === 'approved' &&
+    (item.status === 'ready' ||
+      (item.status === 'error' && !!item.plan));
+  const testPlanScenarios = item.testPlan?.scenarios ?? [];
 
   // Error repos for partial re-run
   const failedRepos = item.repos?.filter(r => r.status === 'error').map(r => r.repoName) ?? [];
@@ -723,6 +814,208 @@ export function ItemDetailPage() {
                   </div>
                   {(feedbackLocalError || planFeedbackError) && (
                     <div className="text-xs text-red-400">{feedbackLocalError || planFeedbackError}</div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Test Plan Summary */}
+      {item.plan && (
+        <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <h3 className="text-sm font-medium text-gray-400">Test Plan</h3>
+                <span className={`px-2 py-0.5 rounded-full text-xs ${TEST_PLAN_APPROVAL_STYLES[item.testPlanApproval.status]}`}>
+                  {item.testPlanApproval.status}
+                </span>
+              </div>
+              <p className="text-white mb-2">
+                {item.testPlan?.summary || 'No test plan generated yet.'}
+              </p>
+              <p className="text-sm text-gray-400">
+                {item.testPlan?.scenarios.length ?? 0} scenarios
+              </p>
+              {item.testPlanApproval.status === 'stale' && (
+                <p className="text-xs text-yellow-300 mt-2">
+                  This test plan is stale for the current live plan. Regenerate or edit it before approval.
+                </p>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={startTestPlanner}
+                className="px-3 py-1.5 bg-indigo-600 text-white rounded hover:bg-indigo-500 text-sm"
+              >
+                Run Test Planner
+              </button>
+              {item.testPlanApproval.status === 'pending' && (
+                <button
+                  onClick={approveCurrentTestPlan}
+                  disabled={testPlanApproveSubmitting}
+                  className="px-3 py-1.5 bg-emerald-600 text-white rounded hover:bg-emerald-500 text-sm disabled:opacity-50"
+                >
+                  {testPlanApproveSubmitting ? 'Approving...' : 'Approve Test Plan'}
+                </button>
+              )}
+              <button
+                onClick={handleOpenTestPlanEditor}
+                className="px-3 py-1.5 bg-gray-700 text-white rounded hover:bg-gray-600 text-sm"
+              >
+                Edit test-plan.yaml
+              </button>
+            </div>
+          </div>
+          {(testPlannerError || testPlanApproveError) && (
+            <div className="text-xs text-red-400 mt-3">{testPlannerError || testPlanApproveError}</div>
+          )}
+          {testPlanEditorOpen && (
+            <div className="mt-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-medium text-gray-300">test-plan.yaml</h4>
+                <div className="flex gap-2">
+                  <button
+                    onClick={loadTestPlanContent}
+                    disabled={testPlanLoading}
+                    className="px-2.5 py-1 bg-gray-700 text-gray-200 rounded hover:bg-gray-600 text-xs disabled:opacity-50"
+                  >
+                    Reload
+                  </button>
+                  <button
+                    onClick={() => {
+                      setTestPlanContent(testPlanOriginal);
+                      setTestPlanError(null);
+                    }}
+                    disabled={!testPlanDirty || testPlanSaving}
+                    className="px-2.5 py-1 bg-gray-700 text-gray-200 rounded hover:bg-gray-600 text-xs disabled:opacity-50"
+                  >
+                    Revert
+                  </button>
+                  <button
+                    onClick={handleSaveTestPlan}
+                    disabled={!testPlanDirty || testPlanSaving}
+                    className="px-2.5 py-1 bg-green-600 text-white rounded hover:bg-green-500 text-xs disabled:opacity-50"
+                  >
+                    {testPlanSaving ? 'Saving...' : 'Save'}
+                  </button>
+                </div>
+              </div>
+              {testPlanLoading ? (
+                <div className="text-xs text-gray-400">Loading test plan...</div>
+              ) : (
+                <textarea
+                  value={testPlanContent}
+                  onChange={(event) => setTestPlanContent(event.target.value)}
+                  className="w-full min-h-[220px] bg-gray-900 text-gray-100 border border-gray-700 rounded p-3 font-mono text-xs"
+                  spellCheck={false}
+                />
+              )}
+              {testPlanError && (
+                <div className="text-xs text-red-400">{testPlanError}</div>
+              )}
+              {testPlanUpdatedBanner && (
+                <div className="flex items-center gap-3 bg-blue-900/50 border border-blue-500/50 rounded px-3 py-2 text-sm text-blue-300">
+                  <span>Test plan has been updated. Reload?</span>
+                  <button
+                    onClick={() => {
+                      loadTestPlanContent();
+                      setTestPlanUpdatedBanner(false);
+                    }}
+                    className="px-2 py-0.5 bg-blue-600 text-white rounded text-xs hover:bg-blue-500"
+                  >
+                    Reload
+                  </button>
+                  <button
+                    onClick={() => setTestPlanUpdatedBanner(false)}
+                    className="px-2 py-0.5 bg-gray-700 text-gray-300 rounded text-xs hover:bg-gray-600"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+              {item.testPlan && item.testPlanApproval.status !== 'stale' && testPlanScenarios.length > 0 && (
+                <div className="border border-gray-700 rounded p-3 space-y-2">
+                  <h5 className="text-xs font-medium text-gray-400">Test Plan Feedback</h5>
+                  {testPlanFeedbackRows.map((row, idx) => (
+                    <div key={idx} className="flex gap-2 items-start">
+                      <select
+                        value={row.scenarioId}
+                        onChange={(e) => {
+                          const updated = [...testPlanFeedbackRows];
+                          updated[idx] = { ...updated[idx], scenarioId: e.target.value };
+                          setTestPlanFeedbackRows(updated);
+                        }}
+                        className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 min-w-[160px]"
+                      >
+                        <option value="">Select scenario...</option>
+                        {testPlanScenarios.map((scenario) => (
+                          <option key={scenario.id} value={scenario.id}>{scenario.id}</option>
+                        ))}
+                      </select>
+                      <textarea
+                        value={row.feedback}
+                        onChange={(e) => {
+                          const updated = [...testPlanFeedbackRows];
+                          updated[idx] = { ...updated[idx], feedback: e.target.value };
+                          setTestPlanFeedbackRows(updated);
+                        }}
+                        placeholder="Feedback..."
+                        className="flex-1 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 min-h-[32px]"
+                        rows={1}
+                      />
+                      <button
+                        onClick={() => {
+                          const updated = testPlanFeedbackRows.filter((_, i) => i !== idx);
+                          setTestPlanFeedbackRows(
+                            updated.length === 0 ? [{ scenarioId: '', feedback: '' }] : updated
+                          );
+                        }}
+                        className="text-gray-500 hover:text-red-400 text-xs px-1"
+                      >
+                        x
+                      </button>
+                    </div>
+                  ))}
+                  <div className="flex gap-2 items-center">
+                    <button
+                      onClick={() =>
+                        setTestPlanFeedbackRows([...testPlanFeedbackRows, { scenarioId: '', feedback: '' }])
+                      }
+                      className="px-2 py-0.5 bg-gray-700 text-gray-300 rounded text-xs hover:bg-gray-600"
+                    >
+                      + Add Row
+                    </button>
+                    <button
+                      onClick={async () => {
+                        setTestPlanFeedbackLocalError(null);
+                        const valid = testPlanFeedbackRows.filter(
+                          (row) => row.scenarioId && row.feedback.trim()
+                        );
+                        if (valid.length === 0) {
+                          setTestPlanFeedbackLocalError('No valid feedback provided');
+                          return;
+                        }
+                        const ok = await submitTestPlanFeedback(valid);
+                        if (ok) {
+                          setTestPlanFeedbackRows([{ scenarioId: '', feedback: '' }]);
+                        }
+                      }}
+                      disabled={
+                        testPlanFeedbackSubmitting ||
+                        testPlanFeedbackRows.every((row) => !row.scenarioId || !row.feedback.trim())
+                      }
+                      className="px-2 py-0.5 bg-indigo-600 text-white rounded text-xs hover:bg-indigo-500 disabled:opacity-50"
+                    >
+                      {testPlanFeedbackSubmitting ? 'Submitting...' : 'Submit Feedback'}
+                    </button>
+                  </div>
+                  {(testPlanFeedbackLocalError || testPlanFeedbackError) && (
+                    <div className="text-xs text-red-400">
+                      {testPlanFeedbackLocalError || testPlanFeedbackError}
+                    </div>
                   )}
                 </div>
               )}

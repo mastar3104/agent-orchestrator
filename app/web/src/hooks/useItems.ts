@@ -52,6 +52,11 @@ export function useItem(id: string | undefined) {
   const [reviewReceiveError, setReviewReceiveError] = useState<string | null>(null);
   const [planFeedbackSubmitting, setPlanFeedbackSubmitting] = useState(false);
   const [planFeedbackError, setPlanFeedbackError] = useState<string | null>(null);
+  const [testPlannerError, setTestPlannerError] = useState<string | null>(null);
+  const [testPlanFeedbackSubmitting, setTestPlanFeedbackSubmitting] = useState(false);
+  const [testPlanFeedbackError, setTestPlanFeedbackError] = useState<string | null>(null);
+  const [testPlanApproveSubmitting, setTestPlanApproveSubmitting] = useState(false);
+  const [testPlanApproveError, setTestPlanApproveError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!id) return;
@@ -76,6 +81,17 @@ export function useItem(id: string | undefined) {
     if (!id) return;
     await api.startPlanner(id);
     await refresh();
+  };
+
+  const startTestPlanner = async () => {
+    if (!id) return;
+    setTestPlannerError(null);
+    try {
+      await api.startTestPlanner(id);
+      await refresh();
+    } catch (err) {
+      setTestPlannerError(err instanceof Error ? err.message : 'Failed to start test planner');
+    }
   };
 
   const startWorkers = async (request?: StartWorkersRequest) => {
@@ -108,6 +124,44 @@ export function useItem(id: string | undefined) {
     }
   };
 
+  const submitTestPlanFeedback = async (
+    feedbacks: { scenarioId: string; feedback: string }[]
+  ): Promise<boolean> => {
+    if (!id) return false;
+    setTestPlanFeedbackSubmitting(true);
+    setTestPlanFeedbackError(null);
+    try {
+      await api.submitTestPlanFeedback(id, feedbacks);
+      await refresh();
+      return true;
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to submit test plan feedback';
+      setTestPlanFeedbackError(message);
+      return false;
+    } finally {
+      setTestPlanFeedbackSubmitting(false);
+    }
+  };
+
+  const approveCurrentTestPlan = async (): Promise<boolean> => {
+    if (!id) return false;
+    setTestPlanApproveSubmitting(true);
+    setTestPlanApproveError(null);
+    try {
+      await api.approveTestPlan(id);
+      await refresh();
+      return true;
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to approve test plan';
+      setTestPlanApproveError(message);
+      return false;
+    } finally {
+      setTestPlanApproveSubmitting(false);
+    }
+  };
+
   const startReviewReceive = async (repoName?: string) => {
     if (!id) return;
     setReviewReceiveError(null);
@@ -127,12 +181,20 @@ export function useItem(id: string | undefined) {
     error,
     refresh,
     startPlanner,
+    startTestPlanner,
     startWorkers,
     stopAgent,
     startReviewReceive,
     reviewReceiveError,
+    testPlannerError,
     submitPlanFeedback,
     planFeedbackSubmitting,
     planFeedbackError,
+    submitTestPlanFeedback,
+    testPlanFeedbackSubmitting,
+    testPlanFeedbackError,
+    approveCurrentTestPlan,
+    testPlanApproveSubmitting,
+    testPlanApproveError,
   };
 }
