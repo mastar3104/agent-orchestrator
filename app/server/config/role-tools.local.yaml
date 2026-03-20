@@ -1,5 +1,0 @@
-planner:
-  - mcp__notionApi__API-retrieve-a-page
-  - mcp__notionApi__API-get-block-children
-  - mcp__notionApi__API-query-data-source
-  - mcp__notionApi__API-post-search
