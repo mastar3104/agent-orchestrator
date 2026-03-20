@@ -104,9 +104,12 @@ export function RepositoriesPage() {
     setForm(prev => ({ ...prev, [key]: value }));
   };
 
-  const parseAllowedTools = (raw: string): string[] | undefined => {
+  const parseAllowedTools = (raw: string, preserveEmptyArray: boolean = false): string[] | undefined => {
     const tools = raw.split(',').map(t => t.trim()).filter(t => t.length > 0);
-    return tools.length > 0 ? tools : undefined;
+    if (tools.length > 0) {
+      return tools;
+    }
+    return preserveEmptyArray ? [] : undefined;
   };
 
   const parseRolePrompts = (raw: Record<EditableRolePromptKey, string>, preserveEmptyObject: boolean = false): RolePrompts | undefined => {
@@ -121,9 +124,12 @@ export function RepositoriesPage() {
     return Object.fromEntries(entries) as RolePrompts;
   };
 
-  const parseHooks = (raw: string): string[] | undefined => {
+  const parseHooks = (raw: string, preserveEmptyArray: boolean = false): string[] | undefined => {
     const hooks = raw.split('\n').map(h => h.trim()).filter(h => h.length > 0);
-    return hooks.length > 0 ? hooks : undefined;
+    if (hooks.length > 0) {
+      return hooks;
+    }
+    return preserveEmptyArray ? [] : undefined;
   };
 
   const parseSetup = (raw: string, preserveEmptyArray: boolean = false): string[] | undefined => {
@@ -173,10 +179,10 @@ export function RepositoriesPage() {
         submodules: form.submodules,
         linkMode: form.linkMode,
         directoryName: form.directoryName || undefined,
-        allowedTools: parseAllowedTools(form.allowedTools),
+        allowedTools: parseAllowedTools(form.allowedTools, true),
         rolePrompts: parseRolePrompts(form.rolePrompts, true),
         setup: form.type === 'remote' ? parseSetup(form.setup, true) : undefined,
-        hooks: parseHooks(form.hooks),
+        hooks: parseHooks(form.hooks, true),
       };
       await update(editingId, data);
       setEditingId(null);

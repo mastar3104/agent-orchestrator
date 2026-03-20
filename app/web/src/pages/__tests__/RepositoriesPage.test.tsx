@@ -11,6 +11,16 @@ vi.mock('../../hooks/useRepositories', () => ({
 import { useRepositoryList } from '../../hooks/useRepositories';
 
 const mockUseRepositoryList = vi.mocked(useRepositoryList);
+const EXISTING_REPOSITORY = {
+  id: 'REPO-1',
+  name: 'repo-a',
+  type: 'local' as const,
+  localPath: '/tmp/repo-a',
+  allowedTools: ['Bash(git status)', 'Edit'],
+  hooks: ['npm run lint', 'npm test'],
+  createdAt: '2026-01-01T00:00:00Z',
+  updatedAt: '2026-01-01T00:00:00Z',
+};
 
 describe('RepositoriesPage', () => {
   const refresh = vi.fn();
@@ -64,6 +74,47 @@ describe('RepositoriesPage', () => {
         planner: 'Repo-specific planner prompt',
         engineer: 'Repo-specific engineer prompt',
       },
+    }));
+  });
+
+  it('sends empty arrays when clearing allowedTools and hooks during edit', async () => {
+    const user = userEvent.setup();
+    update.mockResolvedValue({
+      ...EXISTING_REPOSITORY,
+      allowedTools: [],
+      hooks: [],
+    });
+    mockUseRepositoryList.mockReturnValue({
+      repositories: [EXISTING_REPOSITORY],
+      loading: false,
+      error: null,
+      refresh,
+      create,
+      update,
+      remove,
+    });
+
+    const view = render(
+      <MemoryRouter>
+        <RepositoriesPage />
+      </MemoryRouter>
+    );
+
+    await user.click(view.getByRole('button', { name: 'Edit' }));
+
+    const allowedToolsInput = view.getByPlaceholderText('Bash(git status), Bash(npm run test)');
+    await user.clear(allowedToolsInput);
+    await user.type(allowedToolsInput, ',   ,');
+
+    const hooksInput = view.getByPlaceholderText('npm run lint\nnpm test');
+    await user.clear(hooksInput);
+    await user.type(hooksInput, '  \n   ');
+
+    await user.click(view.getByRole('button', { name: 'Update' }));
+
+    expect(update).toHaveBeenCalledWith('REPO-1', expect.objectContaining({
+      allowedTools: [],
+      hooks: [],
     }));
   });
 });

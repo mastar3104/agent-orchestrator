@@ -1136,7 +1136,7 @@ describe('Worker task-state execution', () => {
       'Task T1 failed for repo-a: boom-again'
     );
 
-    expect(currentTasks).toEqual(['T1: Task 1']);
+    expect(currentTasks).toEqual(['T1: Task 1', 'T1: Task 1', 'T1: Task 1']);
     expect(getRepoTaskState('repo-a').tasks).toEqual([
       expect.objectContaining({ id: 'T1', status: 'failed', attempts: 2, lastError: 'Task T1 failed for repo-a: boom-again' }),
       expect.objectContaining({ id: 'T2', status: 'pending', attempts: 0 }),

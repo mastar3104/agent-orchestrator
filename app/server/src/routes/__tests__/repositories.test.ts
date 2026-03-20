@@ -106,6 +106,46 @@ describe('repository routes validation', () => {
     expect(res.json().error).toContain('allowedTools[1] must be a string');
   });
 
+  it('clears allowedTools and hooks when patch receives empty arrays', async () => {
+    mockReadYamlSafe.mockResolvedValue([
+      {
+        id: 'REPO-1',
+        name: 'repo-a',
+        type: 'local',
+        localPath: '/tmp/repo-a',
+        allowedTools: ['Edit'],
+        hooks: ['npm test'],
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+      },
+    ]);
+
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/api/repositories/REPO-1',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        allowedTools: [],
+        hooks: [],
+      }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data.repository.allowedTools).toEqual([]);
+    expect(res.json().data.repository.hooks).toEqual([]);
+    expect(mockWriteYaml).toHaveBeenCalledWith(
+      '/repositories.yaml',
+      [
+        expect.objectContaining({
+          id: 'REPO-1',
+          allowedTools: [],
+          hooks: [],
+        }),
+      ]
+    );
+  });
+
   it('accepts remote setup commands and trims blank lines', async () => {
     mockReadYamlSafe.mockResolvedValue([]);
 
