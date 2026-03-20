@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -13,13 +13,14 @@ import {
   RolePromptsFormatError,
   RoleToolOverridesFormatError,
 } from '../role-loader';
+import { getRolesConfigPath } from '../paths';
 
 describe('role-loader', () => {
   beforeEach(() => {
     loadRoles(join(tmpdir(), `missing-role-tools-${Date.now()}.yaml`));
   });
 
-  it('loads built-in roles and resolves jsonSchema', () => {
+  it('loads configured roles and resolves jsonSchema', () => {
     const roles = loadRoles(join(tmpdir(), `missing-role-tools-${Date.now()}.yaml`));
 
     expect(Object.keys(roles)).toEqual([
@@ -35,6 +36,38 @@ describe('role-loader', () => {
     expect(resolved.systemPrompt).toContain('You are a development planner agent.');
     expect(resolved.allowedTools).toEqual(['Read', 'Write', 'Skill']);
     expect(resolved.jsonSchema).toHaveProperty('type', 'object');
+  });
+
+  it('loads role prompts and tools from roles.yaml', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'roles-config-'));
+    const overridePath = join(dir, 'missing-role-tools.local.yaml');
+    const rolesPath = join(dir, 'roles.yaml');
+
+    try {
+      const currentConfig = readFileSync(getRolesConfigPath(), 'utf-8');
+      writeFileSync(
+        rolesPath,
+        currentConfig.replace(
+          'You are a development planner agent. Your task is to analyze the design document and repository structure, then create a detailed implementation plan.',
+          'Planner prompt loaded from YAML.'
+        ).replace(
+          '      - Skill',
+          ['      - Skill', '      - "Bash(git diff:*)"'].join('\n')
+        )
+      );
+
+      loadRoles(overridePath, rolesPath);
+
+      expect(getRole('planner').systemPrompt).toContain('Planner prompt loaded from YAML.');
+      expect(getRole('planner').allowedTools).toEqual([
+        'Read',
+        'Write',
+        'Skill',
+        'Bash(git diff:*)',
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('merges additive global role tool overrides from a local file', () => {
@@ -90,7 +123,7 @@ describe('role-loader', () => {
     }
   });
 
-  it('falls back to built-in tools when the local override file is missing', () => {
+  it('falls back to roles.yaml tools when the local override file is missing', () => {
     expect(
       loadGlobalRoleToolOverrides(join(tmpdir(), `missing-role-tools-${Date.now()}.yaml`))
     ).toEqual({});

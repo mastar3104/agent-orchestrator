@@ -31,6 +31,7 @@ AI エージェントによるマルチリポジトリ開発を自動化する�
 │    ├── events.jsonl       # イベントログ (append-only)│
 │    ├── workspace/                               │
 │    │   ├── plan.yaml      # 実行計画            │
+│    │   ├── test-plan.yaml # テスト観点の計画      │
 │    │   ├── {repoName}/    # リポジトリ作業ディレクトリ│
 │    │   └── ...                                  │
 │    └── agents/{agentId}/  # エージェント別データ  │
@@ -43,19 +44,23 @@ AI エージェントによるマルチリポジトリ開発を自動化する�
 Item 作成 → リポジトリ clone/link → Planner Agent → plan.yaml 生成
                                                          │
                                               ユーザーが Plan を確認・編集
-                                              (Plan Feedback で再生成も可)
+                                              (Plan Feedback / YAML 編集)
+                                                         │
+                                              Test Planner → test-plan.yaml 生成
+                                                         │
+                                       ユーザーがテスト観点を確認・編集・承認
+                                    (Test Plan Feedback / Approve Test Plan)
                                                          │
                                                     Worker 起動
                                                          │
-                                          ┌──────────────┼──────────────┐
-                                          ▼              ▼              ▼
-                                     front agent    back agent    infra agent
-                                      (並列実行)     (並列実行)     (並列実行)
-                                          │              │              │
-                                          └──────────────┼──────────────┘
+                                   次の actionable task を 1 件選択
+                          (repository をまたいで依存関係順に直列実行)
+                                                         │
+                                         Engineer → hooks → Reviewer
+                                      (必要なら同じ task を review-fix)
                                                          │
                                                    Review Agent
-                                                  (コードレビュー)
+                                                (コードレビュー)
                                                          │
                                                  ┌───────┴───────┐
                                                  │ request_changes│
@@ -69,6 +74,8 @@ Item 作成 → リポジトリ clone/link → Planner Agent → plan.yaml 生�
                                                          │
                                               Review Receive (任意)
                                               PR レビューコメント反映
+                                                         │
+                                  必要に応じて plan.yaml / test-plan.yaml を再生成
 ```
 
 ## 実行モデル
@@ -88,13 +95,15 @@ claude -p \
 | ロール             | AllowedTools                                                                                                | レスポンススキーマ                   |
 |-----------------|-------------------------------------------------------------------------------------------------------------|-----------------------------|
 | Planner         | `Read`, `Write`                                                                                             | `{status, summary}`         |
+| Test Planner    | `Read`, `Write`                                                                                             | `{status, summary}`         |
 | Engineer (dev)  | `Read`, `Write`, `Edit`, `Bash(git add:*)`, `Bash(git rm:*)`, `Bash(git commit -m:*)`, `Bash(git status:*)` | `{status}`                  |
 | Reviewer        | `Read`, `Glob`, `Grep`                                                                                      | `{review_status, comments}` |
 | Review-Receiver | `Read`, `Write`                                                                                             | `{status, summary}`         |
+| Completed Reviewer | `Read`, `Glob`, `Grep`                                                                                   | `{review_status, summary, findings}` |
 
 ### 非同期実行
 
-Planner と Worker の起動は HTTP `202 Accepted` で即時返答し、バックグラウンドで実行される。Item レベルの排他ロック (`withItemLock`) で重複実行を防止する。進捗は既存の WebSocket + JSONL イベントで通知される。
+Planner / Test Planner / Worker / Completed Review の起動は HTTP `202 Accepted` で即時返答し、バックグラウンドで実行される。Item レベルの排他ロック (`withItemLock`) で重複実行を防止する。進捗は WebSocket + JSONL イベントで通知される。
 
 ## 前提条件
 
@@ -123,15 +132,17 @@ agent-orch/
 │       ├── index.ts       # エントリーポイント
 │       ├── routes/        # REST API エンドポイント
 │       │   ├── items.ts       # Item CRUD, Review Receive
-│       │   ├── agents.ts      # Agent 制御 (planner/worker/plan-feedback 起動, 202 Accepted)
-│       │   ├── settings.ts    # ロール設定 (roles.local.yaml 読み書き)
+│       │   ├── agents.ts      # Agent 制御 (planner/test-planner/worker/completed-review 起動, test-plan API)
+│       │   ├── role-tools.ts  # role-tools.local.yaml 読み書き
 │       │   ├── repositories.ts# 保存済みリポジトリ管理
 │       │   └── ws.ts          # WebSocket (リアルタイムイベント)
 │       ├── services/      # ビジネスロジック
 │       │   ├── item-service.ts      # Item 作成・ワークスペースセットアップ
 │       │   ├── agent-service.ts     # executeAgent() — Claude -p 実行 + イベント記録
 │       │   ├── planner-service.ts   # Planner Agent オーケストレーション
+│       │   ├── test-planner-service.ts # Test Planner / test-plan approval 管理
 │       │   ├── worker-service.ts    # Worker Agent オーケストレーション (3 フェーズ)
+│       │   ├── completed-review-service.ts # approved test-plan に対する完了レビュー
 │       │   ├── git-pr-service.ts    # Draft PR 作成, PR コメント取得 (gh CLI)
 │       │   ├── git-snapshot-service.ts # 定期的 git status 追跡
 │       │   ├── review-receive-service.ts # PR レビューコメント処理
@@ -167,9 +178,11 @@ Claude CLI の `-p` モード (非対話) で実行されるエンティティ�
 | 役割 | 説明 | ツール制限 |
 |------|------|-----------|
 | `planner` | 設計ドキュメントからタスク計画を生成 | Read, Write のみ |
+| `test-planner` | 現在の `plan.yaml` から振る舞いベースの `test-plan.yaml` を生成 | Read, Write のみ |
 | `engineer` | Plan の task を 1 件ずつ実装 | Read, Write, Edit, git add, git commit -m, git status |
 | `review` | Worker の変更をレビュー | Read, Glob, Grep のみ (読み取り専用) |
 | `review-receiver` | PR レビューコメントを受けて修正計画を作成 | Read, Write のみ (Bash アクセスなし) |
+| `completed-reviewer` | 承認済み `test-plan.yaml` に対する実装充足度を確認 | Read, Glob, Grep のみ (読み取り専用) |
 
 ### Agent ステータス
 
@@ -184,6 +197,8 @@ created → cloning → planning → ready → running → completed | error
                                                      ↓
                                               review_receiving
 ```
+
+`ready` は、現在の `plan.yaml` に対応する `test-plan.yaml` が存在し、承認状態が `approved` になっていることを意味する。
 
 ### Plan
 
@@ -204,9 +219,41 @@ tasks:
 
 `plan.yaml` は implementation task のみを表し、review task は含めない。
 
+### Test Plan / TestApprove
+
+`test-plan.yaml` は、現在の `plan.yaml` に対する振る舞いベースの検証観点を表す。`TestPlanner` はコードを変更せず、このファイルだけを生成・更新する。
+
+```yaml
+version: "1.0"
+itemId: "ITEM-xxxxx"
+planFingerprint: "<current plan fingerprint>"
+summary: "テスト計画の概要"
+scenarios:
+  - id: "scenario-1"
+    kind: "bdd"
+    title: "ユーザーが設定を保存できる"
+    repositories: ["frontend", "backend"]
+    given: "ユーザーが設定画面を開いている"
+    when: "必須項目を入力して保存する"
+    then: "設定が永続化され、再表示時にも内容が保持される"
+```
+
+- 各 scenario は `kind: bdd` または `kind: regression` のどちらかを使う
+- `repositories` には、その scenario に関係する repository 名を 1 つ以上入れる
+- Planner 完了後、Plan Feedback 後、手動 `plan.yaml` 更新後、Review Receive による plan 再生成後に、現在の plan と同期する `test-plan.yaml` が再生成される
+- `POST /items/:id/test-planner/start` でも手動再生成できる
+- `POST /items/:id/test-plan/approve` が `Approve Test Plan` に相当し、現在の `plan.yaml` と `test-plan.yaml` の組み合わせに対して承認イベントを記録する
+- 承認状態は `missing` / `pending` / `stale` / `approved`
+- `plan.yaml` が更新されると既存の `test-plan.yaml` は `stale` になり、再生成または編集後に再承認が必要
+- `plan.yaml` に task が 1 件もない場合は、空の `scenarios` を持つ `test-plan.yaml` を生成し、自動承認 (`approvedBy: auto`) する
+
 ### Worker 実行
 
 Worker の起動時、以下の流れで処理される:
+
+`POST /items/:id/workers/start` は、現在の test plan approval が `approved` の場合にのみ実行できる。`missing` / `pending` / `stale` のときは開始できない。
+
+リポジトリごとの worker を常駐させて並列実行するのではなく、オーケストレーターが毎回 1 つの actionable task を選び、repository をまたぎながら順番に処理する。
 
 1. **Task Execution** — `plan.yaml` の task を依存関係を見ながら 1 件ずつ直列実行。Engineer が task を実装しコミット
 2. **Task Review Loop** — 各 task の直後に hooks と reviewer を実行し、`approve` されるまで同じ task を修正し続ける。hooks は通常の engineer 後も review-fix 後も走り、失敗して retry を使い切っても task failure にはせず `hooks exhausted` warning として reviewer へ進む。`request_changes` は最大 3 回まで feedback fix を試し、最後の review-fix が終わった時点で再度 reviewer は起動せず、その直後に hooks を 1 回だけ流して task を完了させる。そこで hooks が失敗しても `review exhausted` / `hooks exhausted` warning 付きの completed として次へ進む
@@ -222,20 +269,20 @@ Worker の起動時、以下の流れで処理される:
 
 PR コメントは外部ユーザーからの入力であるため、Review-Receiver は Bash アクセスを持たない。オーケストレーターが `gh api` で PR コメントを取得し、プロンプトにコンテキストとして注入する。
 
-### ロール設定のカスタマイズ (roles.local.yaml)
+### ロール設定のカスタマイズ
 
-`app/server/config/roles.yaml` にはデフォルトのロール定義（promptTemplate, allowedTools, schemaRef）が含まれる。このファイルを直接編集する代わりに、**`roles.local.yaml`** でローカルオーバーライドできる。
+`app/server/config/roles.yaml` がロール定義の正本で、各 role の `promptTemplate` / `allowedTools` / `schemaRef` を保持する。
 
-- `roles.local.yaml` が存在する場合、`roles.yaml` の代わりにそちらが読み込まれる
-- Web UI の **Settings > Roles** 画面から編集・保存が可能（`PUT /api/settings/roles`）
-- 保存時にバリデーション → アトミック書き込み → ホットリロードが行われ、不正な設定はロールバックされる
-- `DELETE /api/settings/roles/local` でローカルオーバーライドを削除しデフォルトに戻せる
-- `.gitignore` に `roles.local.yaml` が登録されておりリポジトリにはコミットされない
+- サーバ起動時と `getRole()` 初回呼び出し時に `roles.yaml` が読み込まれる
+- Web UI の **Settings > Roles** 画面で編集できるのは、`config/role-tools.local.yaml` に保存される追加 `allowedTools` のみ
+- `role-tools.local.yaml` の内容は `roles.yaml` の `allowedTools` に加算マージされる
+- repository 単位の追加 prompt は repositories 設定の `rolePrompts` で管理される
+- `.gitignore` に登録されるローカル設定ファイルは `role-tools.local.yaml`
 
 ```
 config/
-├── roles.yaml          # デフォルト設定 (git 管理)
-└── roles.local.yaml    # ローカルオーバーライド (git 管理外)
+├── roles.yaml               # ロール定義の正本 (git 管理)
+└── role-tools.local.yaml    # allowedTools のローカル加算設定 (git 管理外)
 ```
 
 ### Plan Feedback
@@ -248,9 +295,22 @@ Planner が生成した `plan.yaml` に対して、タスク単位でフィー�
   1. 現在の `plan.yaml` を `plan_<timestamp>_<random>.yaml` にアーカイブ
   2. フィードバック内容を含むプロンプトで Planner Agent を再実行
   3. 生成された `plan.yaml` をバリデーション後、`plan_created` イベントを発行
+  4. 同期のため Test Planner も再実行し、`test-plan.yaml` を現行 plan に合わせて更新する
 - **UI**: Plan エディタ内にフィードバックフォームが表示される。タスクを選択しフィードバックを入力して送信
 - フィードバックに含まれないタスクは保持するよう Planner に指示される
 - `plan_created` イベント受信時、エディタが未編集なら自動リロード、編集中ならリロード確認バナーを表示
+
+### Test Plan Feedback / TestApprove
+
+生成済みの `test-plan.yaml` に対して、scenario 単位のフィードバックと承認を行える。
+
+- **再生成**: `POST /items/:id/test-plan/feedback`（202 Accepted、非同期実行）
+- **リクエスト**: `{ feedbacks: [{ scenarioId: "scenario-1", feedback: "修正内容" }, ...] }`
+- **バリデーション**: `scenarioId` の重複は禁止。現在の `test-plan.yaml` に存在しない scenario は指定できない
+- **挙動**: フィードバック対象以外の scenario は保持しつつ `test-plan.yaml` を再生成する。再生成後の承認状態は `pending` に戻る
+- **手動編集**: `PUT /items/:id/test-plan` で YAML を直接更新できる。保存後は承認を取り直す
+- **承認**: `POST /items/:id/test-plan/approve` で現在の `planFingerprint` と `testPlanFingerprint` の組に対して承認を記録する
+- **前提条件**: `stale` 状態の test plan は承認できない
 
 ### Repository Setup Commands
 
@@ -320,6 +380,7 @@ repositories:
 | `agent_started` / `agent_exited` | エージェントのライフサイクル |
 | `claude_execution` | Claude -p 実行結果 (exitCode, durationMs, attempt, success) |
 | `plan_created` | plan.yaml 生成完了 |
+| `test_plan_created` / `test_plan_approved` | test-plan.yaml の生成・承認 |
 | `repo_setup_started` / `repo_setup_completed` | clone 後 setup 実行 |
 | `review_findings_extracted` | レビュー結果 (findings, overallAssessment) |
 | `hooks_executed` | Hooks 実行結果 (allPassed, attempt) |

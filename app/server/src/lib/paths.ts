@@ -82,6 +82,10 @@ export function getRepositoriesPath(): string {
   return join(DATA_DIR, 'repositories.yaml');
 }
 
+export function getRolesConfigPath(): string {
+  return join(SERVER_ROOT_DIR, 'config', 'roles.yaml');
+}
+
 export function getRoleToolsLocalPath(): string {
   return join(SERVER_ROOT_DIR, 'config', 'role-tools.local.yaml');
 }

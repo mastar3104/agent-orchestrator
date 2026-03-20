@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import Fastify from 'fastify';
+import { join } from 'path';
 
 vi.mock('../../lib/yaml', () => ({
   readYamlSafe: vi.fn(),
@@ -8,6 +9,7 @@ vi.mock('../../lib/yaml', () => ({
 
 vi.mock('../../lib/paths', () => ({
   getRoleToolsLocalPath: vi.fn().mockReturnValue('/role-tools.local.yaml'),
+  getRolesConfigPath: vi.fn().mockReturnValue(join(process.cwd(), 'config', 'roles.yaml')),
 }));
 
 import { readYamlSafe, writeYaml } from '../../lib/yaml';
