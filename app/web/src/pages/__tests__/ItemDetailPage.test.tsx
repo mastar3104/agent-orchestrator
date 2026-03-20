@@ -19,6 +19,7 @@ const mockUseItem = vi.mocked(useItem);
 const mockUseWebSocket = vi.mocked(useWebSocket);
 const startPlanner = vi.fn();
 const startTestPlanner = vi.fn();
+const startCompletedReview = vi.fn();
 const startWorkers = vi.fn();
 const submitPlanFeedback = vi.fn();
 const submitTestPlanFeedback = vi.fn();
@@ -59,6 +60,10 @@ function makeItem(overrides: Partial<ItemDetail> = {}): ItemDetail {
     testPlanApproval: {
       status: 'missing',
     },
+    completedReview: {
+      status: 'not_started',
+      findings: [],
+    },
     repos: [
       {
         repoName: 'repo-a',
@@ -74,7 +79,9 @@ function makeItem(overrides: Partial<ItemDetail> = {}): ItemDetail {
       stages: [
         { id: 'workspace' as const, label: 'Workspace', status: 'completed' as const },
         { id: 'planning' as const, label: 'Planning', status: 'completed' as const },
+        { id: 'test_planning' as const, label: 'Test Planning', status: 'completed' as const },
         { id: 'execution' as const, label: 'Execution', status: 'running' as const },
+        { id: 'completed_review' as const, label: 'Completed Review', status: 'pending' as const },
         { id: 'publish' as const, label: 'Publish', status: 'pending' as const },
         { id: 'review_receive' as const, label: 'Review Receive', status: 'pending' as const, optional: true },
       ],
@@ -133,11 +140,13 @@ function makeUseItemResult(overrides: Partial<UseItemResult> = {}): UseItemResul
     refresh,
     startPlanner,
     startTestPlanner,
+    startCompletedReview,
     startWorkers,
     stopAgent: vi.fn(),
     startReviewReceive: vi.fn(),
     reviewReceiveError: null,
     testPlannerError: null,
+    completedReviewError: null,
     submitPlanFeedback,
     planFeedbackSubmitting: false,
     planFeedbackError: null,
@@ -166,6 +175,7 @@ describe('ItemDetailPage workflow UI', () => {
     vi.clearAllMocks();
     startPlanner.mockReset();
     startTestPlanner.mockReset();
+    startCompletedReview.mockReset();
     startWorkers.mockReset();
     submitPlanFeedback.mockReset();
     submitTestPlanFeedback.mockReset();
@@ -187,6 +197,7 @@ describe('ItemDetailPage workflow UI', () => {
     expect(view.getByText('Jobs')).toBeInTheDocument();
     expect(view.getByText('Workspace')).toBeInTheDocument();
     expect(view.getByText('Execution')).toBeInTheDocument();
+    expect(view.getByText('Completed Review')).toBeInTheDocument();
     expect(view.getByText('repo-a: T1: Implement workflow (Hooks)')).toBeInTheDocument();
     expect(view.getByText('0 / 1 steps')).toBeInTheDocument();
     expect(view.getAllByText('Hooks').length).toBeGreaterThan(0);
@@ -213,7 +224,7 @@ describe('ItemDetailPage workflow UI', () => {
     expect(refresh).toHaveBeenCalled();
   });
 
-  it('sends retry_failed mode when Retry Failed is clicked', () => {
+  it('sends retry_failed mode when Retry Workflow is clicked', () => {
     mockUseItem.mockReturnValue(makeUseItemResult({
       item: makeItem({
         status: 'error',
@@ -230,9 +241,9 @@ describe('ItemDetailPage workflow UI', () => {
     }));
 
     const view = renderPage();
-    view.getByRole('button', { name: 'Retry Failed (repo-a)' }).click();
+    view.getByRole('button', { name: 'Retry Workflow' }).click();
 
-    expect(startWorkers).toHaveBeenCalledWith({ repos: ['repo-a'], mode: 'retry_failed' });
+    expect(startWorkers).toHaveBeenCalledWith({ mode: 'retry_failed' });
   });
 
   it('starts workers without retry mode for ready items', () => {

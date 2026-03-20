@@ -12,6 +12,7 @@ import type {
   GetPlanContentResponse,
   GetTestPlanResponse,
   GetTestPlanContentResponse,
+  GetCompletedReviewResponse,
   UpdatePlanRequest,
   UpdatePlanResponse,
   UpdateTestPlanRequest,
@@ -26,7 +27,12 @@ import {
 } from '../services/agent-service';
 import { startPlanner, getPlan, getPlanContent, updatePlanContent, planFeedback, validatePlanFeedback } from '../services/planner-service';
 import { parseYaml } from '../lib/yaml';
-import { startWorkers, getWorkerStatus } from '../services/worker-service';
+import {
+  startWorkers,
+  getWorkerStatus,
+  validateWorkerStartPreconditions,
+  WorkerStartValidationError,
+} from '../services/worker-service';
 import { getWorkspaceRoot, getAgentOutputPath, getItemPlanPath, getItemEventsPath } from '../lib/paths';
 import { withItemLock, isItemLocked } from '../lib/locks';
 import { createErrorEvent } from '../lib/events';
@@ -43,6 +49,10 @@ import {
   updateTestPlanContent,
   validateTestPlanFeedback,
 } from '../services/test-planner-service';
+import {
+  getLatestCompletedReview,
+  startCompletedReview,
+} from '../services/completed-review-service';
 
 async function recordBackgroundError(
   itemId: string,
@@ -295,6 +305,50 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
     });
   });
 
+  fastify.post<{
+    Params: { id: string };
+    Reply: ApiResponse<StartAsyncResponse>;
+  }>('/items/:id/completed-review/start', async (request, reply) => {
+    const itemId = request.params.id;
+
+    if (isItemLocked(itemId)) {
+      return reply.status(409).send({
+        success: false,
+        error: 'Operation already in progress for this item',
+      });
+    }
+
+    withItemLock(itemId, () => startCompletedReview(itemId)).catch(async (err) => {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      console.error(`[${itemId}] Completed review failed:`, message);
+      await recordBackgroundError(itemId, message, 'completed_review');
+    });
+
+    return reply.status(202).send({
+      success: true,
+      data: { started: true },
+    });
+  });
+
+  fastify.get<{
+    Params: { id: string };
+    Reply: ApiResponse<GetCompletedReviewResponse>;
+  }>('/items/:id/completed-review', async (request, reply) => {
+    try {
+      const completedReview = await getLatestCompletedReview(request.params.id);
+      return reply.send({
+        success: true,
+        data: { completedReview },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return reply.status(500).send({
+        success: false,
+        error: message,
+      });
+    }
+  });
+
   fastify.get<{
     Params: { id: string };
     Reply: ApiResponse<GetTestPlanResponse>;
@@ -507,6 +561,18 @@ export const agentRoutes: FastifyPluginAsync = async (fastify) => {
         success: false,
         error: `Test plan approval is required before starting workers (current status: ${approval.status})`,
       });
+    }
+
+    try {
+      await validateWorkerStartPreconditions(itemId, { targetRepos, mode });
+    } catch (error) {
+      if (error instanceof WorkerStartValidationError) {
+        return reply.status(400).send({
+          success: false,
+          error: error.message,
+        });
+      }
+      throw error;
     }
 
     // Fire-and-forget with item lock + error logging

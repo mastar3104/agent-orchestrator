@@ -8,6 +8,7 @@ import { useRoleTools } from '../hooks/useRoleTools';
 const ROLE_LABELS: Record<GlobalRoleToolKey, string> = {
   planner: 'Planner',
   testPlanner: 'Test Planner',
+  completedReviewer: 'Completed Reviewer',
   engineer: 'Engineer',
   reviewer: 'Reviewer',
   reviewReceiver: 'Review Receiver',

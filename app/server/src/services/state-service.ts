@@ -23,7 +23,13 @@ import { readJsonl } from '../lib/jsonl';
 import { getItemEventsPath, getAgentEventsPath, getItemPlanPath, getWorkspaceRoot } from '../lib/paths';
 import { readYamlSafe } from '../lib/yaml';
 import type { Plan } from '@agent-orch/shared';
-import { readRepoTaskState, type RepoTaskStateFile } from './task-state-service';
+import {
+  AGENT_STOPPED_BEFORE_COMPLETION_ERROR,
+  hasStaleExecutionStop,
+  readRepoTaskState,
+  reconcileStoppedRepoTaskState,
+  type RepoTaskStateFile,
+} from './task-state-service';
 import { deriveTestPlanApproval } from './test-planner-service';
 
 /**
@@ -103,6 +109,9 @@ export async function deriveRepoStatuses(itemId: string): Promise<Map<string, Re
   // Track review_receive state for restore logic
   const reviewReceivePreStates = new Map<string, RepoDerivedState>();
   const reviewReceivingRepos = new Set<string>();
+  const hasCompletedReviewPassInCurrentCycle = events.some(
+    (event, index) => index > lastPlanCreatedIdx && event.type === 'completed_review_passed'
+  );
 
   // Process events in order
   for (let i = 0; i < events.length; i++) {
@@ -344,7 +353,7 @@ export async function deriveRepoStatuses(itemId: string): Promise<Map<string, Re
         if (state.status !== 'running' && state.status !== 'review_receiving') break;
         if (role === 'engineer' || role === 'developer' || role === 'review' || role === 'review-receiver') {
           state.status = 'error';
-          state.lastErrorMessage = 'Agent stopped before completion';
+          state.lastErrorMessage = AGENT_STOPPED_BEFORE_COMPLETION_ERROR;
           // review_receiving 中に停止した場合もセットから除去して error にする
           reviewReceivingRepos.delete(repoName);
         }
@@ -353,34 +362,73 @@ export async function deriveRepoStatuses(itemId: string): Promise<Map<string, Re
     }
   }
 
-  await overlayExecutionStateFromTaskState(itemId, repoStates, currentPlanRepos);
+  await overlayExecutionStateFromTaskState(
+    itemId,
+    events,
+    repoStates,
+    currentPlanRepos,
+    hasCompletedReviewPassInCurrentCycle
+  );
 
   return repoStates;
 }
 
 async function overlayExecutionStateFromTaskState(
   itemId: string,
+  events: ItemEvent[],
   repoStates: Map<string, RepoDerivedState>,
-  currentPlanRepos: Set<string> | null
+  currentPlanRepos: Set<string> | null,
+  hasCompletedReviewPass: boolean
 ): Promise<void> {
   if (!currentPlanRepos || currentPlanRepos.size === 0) {
     return;
   }
 
+  const taskStatesByRepo = new Map<string, RepoTaskStateFile>();
   for (const repoName of currentPlanRepos) {
     ensureRepo(repoStates, repoName, currentPlanRepos);
     const persistedState = await readRepoTaskState(itemId, repoName);
+    if (persistedState) {
+      taskStatesByRepo.set(
+        repoName,
+        hasStaleExecutionStop(events, repoName)
+          ? reconcileStoppedRepoTaskState(persistedState).state
+          : persistedState
+      );
+    }
+  }
+
+  const allExecutionCompleted = [...currentPlanRepos].every((repoName) => {
+    const taskState = taskStatesByRepo.get(repoName);
+    return Boolean(
+      taskState &&
+      taskState.tasks.length > 0 &&
+      taskState.tasks.every((task) => task.status === 'completed')
+    );
+  });
+
+  for (const repoName of currentPlanRepos) {
+    const persistedState = taskStatesByRepo.get(repoName);
     const repoState = repoStates.get(repoName);
     if (!persistedState || !repoState) {
       continue;
     }
-    applyExecutionStateFromTaskState(repoState, persistedState);
+    applyExecutionStateFromTaskState(
+      repoState,
+      persistedState,
+      hasStaleExecutionStop(events, repoName),
+      hasCompletedReviewPass,
+      allExecutionCompleted
+    );
   }
 }
 
 function applyExecutionStateFromTaskState(
   repoState: RepoDerivedState,
-  taskState: RepoTaskStateFile
+  taskState: RepoTaskStateFile,
+  interruptedExecutionStopped: boolean,
+  hasCompletedReviewPass: boolean,
+  allExecutionCompleted: boolean
 ): void {
   if (repoState.status === 'review_receiving' || repoState.activePhase === 'review_receive') {
     return;
@@ -398,6 +446,16 @@ function applyExecutionStateFromTaskState(
     repoState.activePhase = failedTask.currentPhase || 'engineer';
     repoState.lastErrorMessage = failedTask.lastError;
     return;
+  }
+
+  if (interruptedExecutionStopped) {
+    const interruptedReviewTask = taskState.tasks.find((task) => task.status === 'in_review');
+    if (interruptedReviewTask) {
+      repoState.status = 'ready';
+      repoState.activePhase = undefined;
+      repoState.lastErrorMessage = undefined;
+      return;
+    }
   }
 
   const runningTask = taskState.tasks.find(
@@ -422,8 +480,13 @@ function applyExecutionStateFromTaskState(
     return;
   }
 
-  repoState.status = 'running';
-  repoState.activePhase = 'pr';
+  if (allExecutionCompleted) {
+    repoState.status = 'running';
+    repoState.activePhase = hasCompletedReviewPass ? 'pr' : 'completed_review';
+  } else {
+    repoState.status = 'completed';
+    repoState.activePhase = undefined;
+  }
   repoState.lastErrorMessage = undefined;
 }
 

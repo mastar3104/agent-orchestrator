@@ -25,6 +25,7 @@ vi.mock('../test-planner-service', () => ({
 }));
 
 vi.mock('../task-state-service', () => ({
+  AGENT_STOPPED_BEFORE_COMPLETION_ERROR: 'Agent stopped before completion',
   createPlanFingerprint: vi.fn().mockReturnValue('fingerprint'),
   ensureTaskStatesForPlan: vi.fn().mockImplementation(async (itemId: string, plan: any) => {
     for (const task of plan.tasks || []) {
@@ -54,6 +55,55 @@ vi.mock('../task-state-service', () => ({
     const state = taskStateStore.get(repoName);
     return state ? JSON.parse(JSON.stringify(state)) : null;
   }),
+  reconcileStoppedRepoTaskState: vi.fn().mockImplementation((state: any) => {
+    const next = JSON.parse(JSON.stringify(state));
+    const interruptedInProgressTaskIds: string[] = [];
+    const interruptedInReviewTaskIds: string[] = [];
+    for (const task of next.tasks || []) {
+      if (task.status === 'in_progress') {
+        task.status = 'failed';
+        task.currentPhase = task.currentPhase || 'engineer';
+        task.lastError = task.lastError || 'Interrupted before completion';
+        interruptedInProgressTaskIds.push(task.id);
+      } else if (task.status === 'in_review') {
+        interruptedInReviewTaskIds.push(task.id);
+      }
+    }
+    return {
+      state: next,
+      mutated: interruptedInProgressTaskIds.length > 0,
+      interruptedInProgressTaskIds,
+      interruptedInReviewTaskIds,
+    };
+  }),
+  reconcileStoppedRepoTaskStateForItem: vi.fn().mockImplementation(async (_itemId: string, repoName: string) => {
+    const state = taskStateStore.get(repoName);
+    if (!state) {
+      return null;
+    }
+    const next = JSON.parse(JSON.stringify(state));
+    const interruptedInProgressTaskIds: string[] = [];
+    const interruptedInReviewTaskIds: string[] = [];
+    for (const task of next.tasks || []) {
+      if (task.status === 'in_progress') {
+        task.status = 'failed';
+        task.currentPhase = task.currentPhase || 'engineer';
+        task.lastError = task.lastError || 'Interrupted before completion';
+        interruptedInProgressTaskIds.push(task.id);
+      } else if (task.status === 'in_review') {
+        interruptedInReviewTaskIds.push(task.id);
+      }
+    }
+    if (interruptedInProgressTaskIds.length > 0) {
+      taskStateStore.set(repoName, JSON.parse(JSON.stringify(next)));
+    }
+    return {
+      state: next,
+      mutated: interruptedInProgressTaskIds.length > 0,
+      interruptedInProgressTaskIds,
+      interruptedInReviewTaskIds,
+    };
+  }),
   writeRepoTaskState: vi.fn().mockImplementation(async (_itemId: string, state: any) => {
     taskStateStore.set(state.repository, JSON.parse(JSON.stringify(state)));
   }),
@@ -75,6 +125,10 @@ vi.mock('../git-snapshot-service', () => ({
 
 vi.mock('../git-pr-service', () => ({
   createDraftPrsForAllRepos: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../completed-review-service', () => ({
+  maybeStartCompletedReviewAfterTasks: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../lib/paths', () => ({
@@ -192,13 +246,19 @@ vi.mock('child_process', () => {
 
 import { executeAgent } from '../agent-service';
 import { createDraftPrsForAllRepos } from '../git-pr-service';
+import { maybeStartCompletedReviewAfterTasks } from '../completed-review-service';
 import { getItemConfig } from '../item-service';
 import { getPlan } from '../planner-service';
 import { eventBus } from '../event-bus';
-import { startWorkers } from '../worker-service';
+import {
+  startWorkers,
+  validateWorkerStartPreconditions,
+  WorkerStartValidationError,
+} from '../worker-service';
 
 const mockExecuteAgent = vi.mocked(executeAgent);
 const mockCreateDraftPrsForAllRepos = vi.mocked(createDraftPrsForAllRepos);
+const mockMaybeStartCompletedReviewAfterTasks = vi.mocked(maybeStartCompletedReviewAfterTasks);
 const mockGetItemConfig = vi.mocked(getItemConfig);
 const mockGetPlan = vi.mocked(getPlan);
 const mockEventBus = vi.mocked(eventBus);
@@ -352,6 +412,7 @@ describe('Worker task-state execution', () => {
     gitMockState.committedPaths = ['file.ts'];
     gitMockState.statusPorcelain = '';
     gitMockState.diffRanges = {};
+    mockMaybeStartCompletedReviewAfterTasks.mockResolvedValue(undefined);
     mockGetPlan.mockResolvedValue(
       makePlan([{ id: 'T1', title: 'Task 1', repository: 'repo-a' }]) as any
     );
@@ -837,7 +898,7 @@ describe('Worker task-state execution', () => {
     expect(currentTasks).toEqual(['T3: Task 3']);
   });
 
-  it('retry_failed reruns only failed tasks and leaves unrelated pending tasks untouched', async () => {
+  it('retry_failed reruns failed tasks and continues remaining tasks in the workflow', async () => {
     mockGetPlan.mockResolvedValue(
       makePlan([
         { id: 'T1', title: 'Task 1', repository: 'repo-a' },
@@ -870,10 +931,281 @@ describe('Worker task-state execution', () => {
 
     expect(getRepoTaskState('repo-a').tasks).toEqual([
       expect.objectContaining({ id: 'T1', status: 'completed', attempts: 2 }),
-      expect.objectContaining({ id: 'T2', status: 'pending', attempts: 0 }),
-      expect.objectContaining({ id: 'T3', status: 'pending', attempts: 0 }),
+      expect.objectContaining({ id: 'T2', status: 'completed', attempts: 1 }),
+      expect.objectContaining({ id: 'T3', status: 'completed', attempts: 1 }),
     ]);
+    expect(currentTasks).toEqual(['T1: Task 1', 'T2: Task 2', 'T3: Task 3']);
+    expect(mockMaybeStartCompletedReviewAfterTasks).toHaveBeenCalledWith(ITEM_ID);
+  });
+
+  it('retry_failed continues into other repos when downstream work remains in the current plan', async () => {
+    mockGetPlan.mockResolvedValue(
+      makePlan([
+        { id: 'T1', title: 'Task 1', repository: 'repo-a' },
+        { id: 'T2', title: 'Task 2', repository: 'repo-b', dependencies: ['T1'] },
+      ]) as any
+    );
+    mockGetItemConfig.mockResolvedValue(makeItemConfig(['repo-a', 'repo-b']) as any);
+
+    taskStateStore.set('repo-a', {
+      version: '1',
+      itemId: ITEM_ID,
+      repository: 'repo-a',
+      planFingerprint: 'fingerprint',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+      tasks: [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          dependencies: [],
+          status: 'failed',
+          attempts: 1,
+          currentPhase: 'engineer',
+          lastError: 'boom',
+        },
+      ],
+    });
+    taskStateStore.set('repo-b', {
+      version: '1',
+      itemId: ITEM_ID,
+      repository: 'repo-b',
+      planFingerprint: 'fingerprint',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+      tasks: [
+        {
+          id: 'T2',
+          title: 'Task 2',
+          dependencies: ['T1'],
+          status: 'pending',
+          attempts: 0,
+        },
+      ],
+    });
+
+    const currentTasks: string[] = [];
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        currentTasks.push(params.currentTask);
+        return engineerSuccess();
+      }
+      if (params.role === 'review') {
+        return reviewApprove();
+      }
+      throw new Error(`Unexpected role: ${params.role}`);
+    });
+
+    await expect(startWorkers(ITEM_ID, { mode: 'retry_failed' })).resolves.toBeUndefined();
+
+    expect(currentTasks).toEqual(['T1: Task 1', 'T2: Task 2']);
+    expect(getRepoTaskState('repo-a').tasks).toEqual([
+      expect.objectContaining({ id: 'T1', status: 'completed', attempts: 2 }),
+    ]);
+    expect(getRepoTaskState('repo-b').tasks).toEqual([
+      expect.objectContaining({ id: 'T2', status: 'completed', attempts: 1 }),
+    ]);
+  });
+
+  it('retry_failed continues remaining tasks only within the explicit target scope', async () => {
+    mockGetPlan.mockResolvedValue(
+      makePlan([
+        { id: 'T1', title: 'Task 1', repository: 'repo-a' },
+        { id: 'T2', title: 'Task 2', repository: 'repo-b', dependencies: ['T1'] },
+        { id: 'T3', title: 'Task 3', repository: 'repo-b', dependencies: ['T2'] },
+      ]) as any
+    );
+    mockGetItemConfig.mockResolvedValue(makeItemConfig(['repo-a', 'repo-b']) as any);
+
+    taskStateStore.set('repo-a', {
+      version: '1',
+      itemId: ITEM_ID,
+      repository: 'repo-a',
+      planFingerprint: 'fingerprint',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+      tasks: [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          dependencies: [],
+          status: 'completed',
+          attempts: 1,
+          completedAt: '2026-01-01T00:00:00Z',
+        },
+      ],
+    });
+    taskStateStore.set('repo-b', {
+      version: '1',
+      itemId: ITEM_ID,
+      repository: 'repo-b',
+      planFingerprint: 'fingerprint',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+      tasks: [
+        {
+          id: 'T2',
+          title: 'Task 2',
+          dependencies: ['T1'],
+          status: 'failed',
+          attempts: 1,
+          currentPhase: 'engineer',
+          lastError: 'boom',
+        },
+        {
+          id: 'T3',
+          title: 'Task 3',
+          dependencies: ['T2'],
+          status: 'pending',
+          attempts: 0,
+        },
+      ],
+    });
+
+    const currentTasks: string[] = [];
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        currentTasks.push(params.currentTask);
+        return engineerSuccess();
+      }
+      if (params.role === 'review') {
+        return reviewApprove();
+      }
+      throw new Error(`Unexpected role: ${params.role}`);
+    });
+
+    await expect(
+      startWorkers(ITEM_ID, { mode: 'retry_failed', targetRepos: ['repo-b'] })
+    ).resolves.toBeUndefined();
+
+    expect(currentTasks).toEqual(['T2: Task 2', 'T3: Task 3']);
+    expect(getRepoTaskState('repo-a').tasks).toEqual([
+      expect.objectContaining({ id: 'T1', status: 'completed', attempts: 1 }),
+    ]);
+    expect(getRepoTaskState('repo-b').tasks).toEqual([
+      expect.objectContaining({ id: 'T2', status: 'completed', attempts: 2 }),
+      expect.objectContaining({ id: 'T3', status: 'completed', attempts: 1 }),
+    ]);
+  });
+
+  it('retry_failed stops without starting downstream tasks when the retried task fails again', async () => {
+    mockGetPlan.mockResolvedValue(
+      makePlan([
+        { id: 'T1', title: 'Task 1', repository: 'repo-a' },
+        { id: 'T2', title: 'Task 2', repository: 'repo-a', dependencies: ['T1'] },
+      ]) as any
+    );
+
+    taskStateStore.set('repo-a', {
+      version: '1',
+      itemId: ITEM_ID,
+      repository: 'repo-a',
+      planFingerprint: 'fingerprint',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+      tasks: [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          dependencies: [],
+          status: 'failed',
+          attempts: 1,
+          currentPhase: 'engineer',
+          lastError: 'boom',
+        },
+        {
+          id: 'T2',
+          title: 'Task 2',
+          dependencies: ['T1'],
+          status: 'pending',
+          attempts: 0,
+        },
+      ],
+    });
+
+    const currentTasks: string[] = [];
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer') {
+        currentTasks.push(params.currentTask);
+        throw new Error('boom-again');
+      }
+      throw new Error(`Unexpected role: ${params.role}`);
+    });
+
+    await expect(startWorkers(ITEM_ID, { mode: 'retry_failed' })).rejects.toThrow(
+      'Task T1 failed for repo-a: boom-again'
+    );
+
     expect(currentTasks).toEqual(['T1: Task 1']);
+    expect(getRepoTaskState('repo-a').tasks).toEqual([
+      expect.objectContaining({ id: 'T1', status: 'failed', attempts: 2, lastError: 'Task T1 failed for repo-a: boom-again' }),
+      expect.objectContaining({ id: 'T2', status: 'pending', attempts: 0 }),
+    ]);
+  });
+
+  it('validateWorkerStartPreconditions rejects missing same-target dependencies', async () => {
+    mockGetPlan.mockResolvedValue(
+      makePlan([
+        { id: 'T1', title: 'Task 1', repository: 'repo-a' },
+        { id: 'T2', title: 'Task 2', repository: 'repo-a', dependencies: ['T1'] },
+      ]) as any
+    );
+
+    taskStateStore.set('repo-a', {
+      version: '1',
+      itemId: ITEM_ID,
+      repository: 'repo-a',
+      planFingerprint: 'fingerprint',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+      tasks: [
+        {
+          id: 'T2',
+          title: 'Task 2',
+          dependencies: ['T1'],
+          status: 'failed',
+          attempts: 1,
+          currentPhase: 'engineer',
+          lastError: 'boom',
+        },
+      ],
+    });
+
+    await expect(
+      validateWorkerStartPreconditions(ITEM_ID, { mode: 'retry_failed', targetRepos: ['repo-a'] })
+    ).rejects.toThrow(WorkerStartValidationError);
+  });
+
+  it('validateWorkerStartPreconditions rejects dependencies missing from the plan', async () => {
+    mockGetPlan.mockResolvedValue(
+      makePlan([
+        { id: 'T2', title: 'Task 2', repository: 'repo-a', dependencies: ['missing-task'] },
+      ]) as any
+    );
+
+    taskStateStore.set('repo-a', {
+      version: '1',
+      itemId: ITEM_ID,
+      repository: 'repo-a',
+      planFingerprint: 'fingerprint',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+      tasks: [
+        {
+          id: 'T2',
+          title: 'Task 2',
+          dependencies: ['missing-task'],
+          status: 'failed',
+          attempts: 1,
+          currentPhase: 'engineer',
+          lastError: 'boom',
+        },
+      ],
+    });
+
+    await expect(
+      validateWorkerStartPreconditions(ITEM_ID, { mode: 'retry_failed', targetRepos: ['repo-a'] })
+    ).rejects.toThrow(WorkerStartValidationError);
   });
 
   it('normalizes stale in-progress tasks to failed and skips them', async () => {
@@ -1046,7 +1378,8 @@ describe('Worker task-state execution', () => {
       id: 'T2',
       status: 'completed',
     });
-    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(ITEM_ID, new Set(['repo-a']));
+    expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
+    expect(mockMaybeStartCompletedReviewAfterTasks).toHaveBeenCalledWith(ITEM_ID);
   });
 
   it('resumes an in-review task from hooks and reviewer without rerunning engineer', async () => {

@@ -14,6 +14,7 @@ const EDITABLE_ROLE_PROMPT_KEYS: EditableRolePromptKey[] = [
   'reviewer',
   'reviewReceiver',
   'testPlanner',
+  'completedReviewer',
 ];
 
 function normalizeRolePrompts(value: unknown): RolePrompts | undefined {

@@ -4,6 +4,7 @@ export const EDITABLE_ROLE_PROMPT_KEYS = [
   'reviewer',
   'reviewReceiver',
   'testPlanner',
+  'completedReviewer',
 ] as const;
 
 export type EditableRolePromptKey = typeof EDITABLE_ROLE_PROMPT_KEYS[number];

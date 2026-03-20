@@ -18,7 +18,6 @@ import {
   startGitSnapshot,
   stopAllGitSnapshots,
 } from './git-snapshot-service';
-import { createDraftPrsForAllRepos } from './git-pr-service';
 import { getWorkspaceRoot, getRepoWorkspaceDir, getItemEventsPath, getHookLogDir } from '../lib/paths';
 import { stringifyYaml } from '../lib/yaml';
 import { eventBus } from './event-bus';
@@ -42,13 +41,15 @@ import { COMMAND_TIMEOUT_MS, runShellCommands } from '../lib/command-runner';
 import {
   ensureTaskStatesForPlan,
   readRepoTaskState,
+  reconcileStoppedRepoTaskState,
+  reconcileStoppedRepoTaskStateForItem,
   writeRepoTaskState,
   type RepoTaskStateFile,
   type RepoTaskStateTask,
 } from './task-state-service';
-import { deriveRepoStatuses } from './state-service';
 import { resolveHooksMaxAttempts } from '../lib/repository-config';
 import { ensureApprovedTestPlan } from './test-planner-service';
+import { maybeStartCompletedReviewAfterTasks } from './completed-review-service';
 
 const MAX_FEEDBACK_ROUNDS = 3;
 const MAX_DIFF_LINES = 20000;
@@ -56,6 +57,13 @@ const REVIEW_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const ENGINEER_TIMEOUT_MS = 50 * 60 * 1000; // 50 minutes
 const AGENT_MAX_RETRIES = 2;
 const HOOK_TIMEOUT_MS = COMMAND_TIMEOUT_MS;
+
+export class WorkerStartValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WorkerStartValidationError';
+  }
+}
 
 function getRoleDescription(role: string): string {
   const descriptions: Record<string, string> = {
@@ -430,22 +438,6 @@ async function mutateVisibleTaskState(
   return next;
 }
 
-async function normalizeStaleInProgressTasks(itemId: string, repoName: string): Promise<RepoTaskStateFile> {
-  return mutateRepoTaskState(itemId, repoName, (state) => {
-    for (const task of state.tasks) {
-      if (task.status === 'in_progress') {
-        task.status = 'failed';
-        task.currentPhase = task.currentPhase || 'engineer';
-        task.lastError = task.lastError || 'Interrupted before completion';
-      }
-    }
-  });
-}
-
-function areRepoTasksCompleted(state: RepoTaskStateFile): boolean {
-  return state.tasks.every((task) => task.status === 'completed');
-}
-
 function buildTaskStateIndex(statesByRepo: Map<string, RepoTaskStateFile>): Map<string, RepoTaskStateTask> {
   const index = new Map<string, RepoTaskStateTask>();
   for (const state of statesByRepo.values()) {
@@ -460,12 +452,37 @@ function buildPlanTaskIndex(plan: Plan): Map<string, PlanTask> {
   return new Map(plan.tasks.map((task) => [task.id, task]));
 }
 
+function buildTargetRepoSet(plan: Plan, targetRepos?: string[]): Set<string> {
+  return new Set(targetRepos || plan.tasks.map((task) => task.repository));
+}
+
+function findTaskStateEntry(
+  statesByRepo: Map<string, RepoTaskStateFile>,
+  task: PlanTask
+): RepoTaskStateTask | undefined {
+  return statesByRepo.get(task.repository)?.tasks.find((entry) => entry.id === task.id);
+}
+
 function areDependenciesCompleted(
   task: PlanTask,
-  taskStateIndex: Map<string, RepoTaskStateTask>
+  taskStateIndex: Map<string, RepoTaskStateTask>,
+  planTaskIndex: Map<string, PlanTask>,
+  targetRepoSet: Set<string>
 ): boolean {
   const dependencies = task.dependencies || [];
-  return dependencies.every((dependencyId) => taskStateIndex.get(dependencyId)?.status === 'completed');
+  return dependencies.every((dependencyId) => {
+    const dependencyState = taskStateIndex.get(dependencyId);
+    if (dependencyState) {
+      return dependencyState.status === 'completed';
+    }
+
+    const dependencyTask = planTaskIndex.get(dependencyId);
+    if (!dependencyTask) {
+      return false;
+    }
+
+    return !targetRepoSet.has(dependencyTask.repository);
+  });
 }
 
 function selectInReviewTask(
@@ -478,12 +495,7 @@ function selectInReviewTask(
       continue;
     }
 
-    const repoState = statesByRepo.get(task.repository);
-    if (!repoState) {
-      continue;
-    }
-
-    const taskState = repoState.tasks.find((entry) => entry.id === task.id);
+    const taskState = findTaskStateEntry(statesByRepo, task);
     if (taskState?.status === 'in_review') {
       return task;
     }
@@ -498,17 +510,14 @@ function selectNextRunnableTask(
   targetRepos?: string[]
 ): PlanTask | null {
   const taskStateIndex = buildTaskStateIndex(statesByRepo);
+  const planTaskIndex = buildPlanTaskIndex(plan);
+  const targetRepoSet = buildTargetRepoSet(plan, targetRepos);
   for (const task of plan.tasks) {
     if (targetRepos && !targetRepos.includes(task.repository)) {
       continue;
     }
 
-    const repoState = statesByRepo.get(task.repository);
-    if (!repoState) {
-      continue;
-    }
-
-    const taskState = repoState.tasks.find((entry) => entry.id === task.id);
+    const taskState = findTaskStateEntry(statesByRepo, task);
     if (!taskState) {
       continue;
     }
@@ -522,7 +531,7 @@ function selectNextRunnableTask(
       continue;
     }
 
-    if (!areDependenciesCompleted(task, taskStateIndex)) {
+    if (!areDependenciesCompleted(task, taskStateIndex, planTaskIndex, targetRepoSet)) {
       continue;
     }
 
@@ -538,22 +547,19 @@ function selectNextFailedTask(
   targetRepos?: string[]
 ): PlanTask | null {
   const taskStateIndex = buildTaskStateIndex(statesByRepo);
+  const planTaskIndex = buildPlanTaskIndex(plan);
+  const targetRepoSet = buildTargetRepoSet(plan, targetRepos);
   for (const task of plan.tasks) {
     if (targetRepos && !targetRepos.includes(task.repository)) {
       continue;
     }
 
-    const repoState = statesByRepo.get(task.repository);
-    if (!repoState) {
-      continue;
-    }
-
-    const taskState = repoState.tasks.find((entry) => entry.id === task.id);
+    const taskState = findTaskStateEntry(statesByRepo, task);
     if (taskState?.status !== 'failed') {
       continue;
     }
 
-    if (!areDependenciesCompleted(task, taskStateIndex)) {
+    if (!areDependenciesCompleted(task, taskStateIndex, planTaskIndex, targetRepoSet)) {
       continue;
     }
 
@@ -561,6 +567,81 @@ function selectNextFailedTask(
   }
 
   return null;
+}
+
+interface SelectedTask {
+  task: PlanTask;
+  kind: 'review' | 'execute';
+}
+
+function selectNormalActionableTask(
+  plan: Plan,
+  statesByRepo: Map<string, RepoTaskStateFile>,
+  targetRepos?: string[]
+): SelectedTask | null {
+  const reviewTask = selectInReviewTask(plan, statesByRepo, targetRepos);
+  if (reviewTask) {
+    return { task: reviewTask, kind: 'review' };
+  }
+
+  const runnableTask = selectNextRunnableTask(plan, statesByRepo, targetRepos);
+  return runnableTask ? { task: runnableTask, kind: 'execute' } : null;
+}
+
+function selectActionableTask(
+  plan: Plan,
+  statesByRepo: Map<string, RepoTaskStateFile>,
+  mode: StartWorkersMode,
+  targetRepos?: string[]
+): SelectedTask | null {
+  if (mode === 'all') {
+    return selectNormalActionableTask(plan, statesByRepo, targetRepos);
+  }
+
+  const failedTask = selectNextFailedTask(plan, statesByRepo, targetRepos);
+  if (failedTask) {
+    return { task: failedTask, kind: 'execute' };
+  }
+
+  return selectNormalActionableTask(plan, statesByRepo, targetRepos);
+}
+
+function buildNoActionableWorkersMessage(
+  itemId: string,
+  plan: Plan,
+  statesByRepo: Map<string, RepoTaskStateFile>,
+  mode: StartWorkersMode,
+  targetRepos?: string[]
+): string {
+  if (mode === 'retry_failed') {
+    const remainingFailedTasks = plan.tasks.filter((task) => {
+      if (targetRepos && !targetRepos.includes(task.repository)) {
+        return false;
+      }
+      return findTaskStateEntry(statesByRepo, task)?.status === 'failed';
+    });
+
+    if (remainingFailedTasks.length > 0) {
+      return `No retryable failed tasks remain for item ${itemId}: ${remainingFailedTasks.map((task) => task.id).join(', ')}`;
+    }
+
+    return `No retryable failed tasks remain for item ${itemId}`;
+  }
+
+  const remainingTasks = plan.tasks.filter((task) => {
+    if (targetRepos && !targetRepos.includes(task.repository)) {
+      return false;
+    }
+
+    const taskState = findTaskStateEntry(statesByRepo, task);
+    return taskState ? taskState.status !== 'completed' : true;
+  });
+
+  if (remainingTasks.length > 0) {
+    return `No runnable tasks remain for item ${itemId}: ${remainingTasks.map((task) => task.id).join(', ')}`;
+  }
+
+  return `No runnable tasks remain for item ${itemId}`;
 }
 
 async function markTaskInProgress(
@@ -714,10 +795,6 @@ Please fix all issues, commit your intentional changes, and return status.
 Before returning, stage your intentional fixes with \`git add -A -- <paths>\`, create a commit with \`git commit -m "<message>"\`, and ensure \`git status --porcelain\` is empty.
 Return {"status": "success"} when done.
 If you encounter an error, return {"status": "failure"}.`;
-}
-
-async function finalizeCompletedRepo(itemId: string, repoName: string): Promise<void> {
-  await createDraftPrsForAllRepos(itemId, new Set([repoName]));
 }
 
 async function failTaskWithError(
@@ -1103,6 +1180,60 @@ interface StartWorkersOptions {
   mode?: StartWorkersMode;
 }
 
+export async function validateWorkerStartPreconditions(
+  itemId: string,
+  options: StartWorkersOptions = {}
+): Promise<void> {
+  const plan = await getPlan(itemId);
+  if (!plan) {
+    throw new WorkerStartValidationError(`No plan found for item ${itemId}`);
+  }
+
+  const itemConfig = await getItemConfig(itemId);
+  if (!itemConfig) {
+    throw new WorkerStartValidationError(`Item config not found for ${itemId}`);
+  }
+
+  const targetRepos = options.targetRepos;
+  const mode = options.mode || 'all';
+  const configuredRepos = new Set(itemConfig.repositories.map((repo) => repo.name));
+  const unknownRepos = (targetRepos || []).filter((repoName) => !configuredRepos.has(repoName));
+  if (unknownRepos.length > 0) {
+    throw new WorkerStartValidationError(
+      `Repository config not found for ${unknownRepos.join(', ')}`
+    );
+  }
+
+  await ensureTaskStatesForPlan(itemId, plan);
+
+  const tasksByRepo = new Set(plan.tasks.map((task) => task.repository));
+  const statesByRepo = new Map<string, RepoTaskStateFile>();
+  for (const repo of itemConfig.repositories) {
+    if (targetRepos && !targetRepos.includes(repo.name)) {
+      continue;
+    }
+    if (!tasksByRepo.has(repo.name)) {
+      continue;
+    }
+
+    const state = await readRepoTaskState(itemId, repo.name);
+    if (!state) {
+      continue;
+    }
+    statesByRepo.set(repo.name, reconcileStoppedRepoTaskState(state).state);
+  }
+
+  const initialActionableTask = mode === 'retry_failed'
+    ? selectNextFailedTask(plan, statesByRepo, targetRepos)
+    : selectActionableTask(plan, statesByRepo, mode, targetRepos);
+
+  if (!initialActionableTask) {
+    throw new WorkerStartValidationError(
+      buildNoActionableWorkersMessage(itemId, plan, statesByRepo, mode, targetRepos)
+    );
+  }
+}
+
 export async function startWorkers(itemId: string, options: StartWorkersOptions = {}): Promise<void> {
   const plan = await getPlan(itemId);
   if (!plan) {
@@ -1139,48 +1270,21 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
     if (!tasksByRepo.has(repo.name)) {
       continue;
     }
-    const normalizedState = await normalizeStaleInProgressTasks(itemId, repo.name);
-    statesByRepo.set(repo.name, normalizedState);
-  }
-
-  const repoStatuses = await deriveRepoStatuses(itemId);
-  const finalizedRepos = new Set(
-    [...repoStatuses.entries()]
-      .filter(([, state]) => state.inCurrentPlan && state.status === 'completed')
-      .map(([repoName]) => repoName)
-  );
-
-  const tryFinalizeCompletedRepos = async (): Promise<void> => {
-    for (const repo of itemConfig.repositories) {
-      if (targetRepos && !targetRepos.includes(repo.name)) {
-        continue;
-      }
-      if (finalizedRepos.has(repo.name)) {
-        continue;
-      }
-      const repoTasks = tasksByRepo.get(repo.name);
-      const repoState = statesByRepo.get(repo.name);
-      if (!repoTasks || !repoState || !areRepoTasksCompleted(repoState)) {
-        continue;
-      }
-      await finalizeCompletedRepo(itemId, repo.name);
-      finalizedRepos.add(repo.name);
+    const reconciledState = await reconcileStoppedRepoTaskStateForItem(itemId, repo.name);
+    if (!reconciledState) {
+      continue;
     }
-  };
-
-  await tryFinalizeCompletedRepos();
+    statesByRepo.set(repo.name, reconciledState.state);
+  }
 
   let failedTaskMessage: string | null = null;
   while (true) {
-    const reviewTask = mode === 'all' ? selectInReviewTask(plan, statesByRepo, targetRepos) : null;
-    const nextTask = reviewTask || (
-      mode === 'retry_failed'
-        ? selectNextFailedTask(plan, statesByRepo, targetRepos)
-        : selectNextRunnableTask(plan, statesByRepo, targetRepos)
-    );
-    if (!nextTask) {
+    const selectedTask = selectActionableTask(plan, statesByRepo, mode, targetRepos);
+    if (!selectedTask) {
       break;
     }
+    const nextTask = selectedTask.task;
+    const isReviewTask = selectedTask.kind === 'review';
 
     const repo = itemConfig.repositories.find((candidate) => candidate.name === nextTask.repository);
     if (!repo) {
@@ -1196,7 +1300,7 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
     const engineerRole = getRole('engineer');
     const effectiveTools = mergeAllowedTools(engineerRole.allowedTools, repo.allowedTools);
     let skipReview = false;
-    if (!reviewTask) {
+    if (!isReviewTask) {
       console.log(
         `[${itemId}/${repo.name}] Starting task ${taskIndex + 1}/${repoTasks.length}: ${nextTask.id} - ${nextTask.title}`
       );
@@ -1290,26 +1394,18 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
       }
     }
 
-    const repoState = statesByRepo.get(repo.name);
-    if (repoState && areRepoTasksCompleted(repoState) && !finalizedRepos.has(repo.name)) {
-      await finalizeCompletedRepo(itemId, repo.name);
-      finalizedRepos.add(repo.name);
-    }
   }
 
   if (failedTaskMessage) {
     throw new Error(failedTaskMessage);
   }
 
-  await tryFinalizeCompletedRepos();
-
   if (mode === 'retry_failed') {
     const remainingFailedTasks = plan.tasks.filter((task) => {
       if (targetRepos && !targetRepos.includes(task.repository)) {
         return false;
       }
-      const repoState = statesByRepo.get(task.repository);
-      return repoState ? getRepoTaskEntry(repoState, task.id).status === 'failed' : false;
+      return findTaskStateEntry(statesByRepo, task)?.status === 'failed';
     });
 
     if (remainingFailedTasks.length > 0) {
@@ -1317,16 +1413,14 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
         `No retryable failed tasks remain for item ${itemId}: ${remainingFailedTasks.map((task) => task.id).join(', ')}`
       );
     }
-
-    return;
   }
 
   const remainingTasks = plan.tasks.filter((task) => {
     if (targetRepos && !targetRepos.includes(task.repository)) {
       return false;
     }
-    const repoState = statesByRepo.get(task.repository);
-    return repoState ? getRepoTaskEntry(repoState, task.id).status !== 'completed' : false;
+    const taskState = findTaskStateEntry(statesByRepo, task);
+    return taskState ? taskState.status !== 'completed' : true;
   });
 
   if (remainingTasks.length > 0) {
@@ -1334,6 +1428,8 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
       `No runnable tasks remain for item ${itemId}: ${remainingTasks.map((task) => task.id).join(', ')}`
     );
   }
+
+  await maybeStartCompletedReviewAfterTasks(itemId);
 }
 
 function buildWorkerContext(

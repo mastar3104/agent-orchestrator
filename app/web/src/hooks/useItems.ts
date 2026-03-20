@@ -57,6 +57,7 @@ export function useItem(id: string | undefined) {
   const [testPlanFeedbackError, setTestPlanFeedbackError] = useState<string | null>(null);
   const [testPlanApproveSubmitting, setTestPlanApproveSubmitting] = useState(false);
   const [testPlanApproveError, setTestPlanApproveError] = useState<string | null>(null);
+  const [completedReviewError, setCompletedReviewError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!id) return;
@@ -98,6 +99,17 @@ export function useItem(id: string | undefined) {
     if (!id) return;
     await api.startWorkers(id, request);
     await refresh();
+  };
+
+  const startCompletedReview = async () => {
+    if (!id) return;
+    setCompletedReviewError(null);
+    try {
+      await api.startCompletedReview(id);
+      await refresh();
+    } catch (err) {
+      setCompletedReviewError(err instanceof Error ? err.message : 'Failed to start completed review');
+    }
   };
 
   const stopAgent = async (agentId: string) => {
@@ -183,10 +195,12 @@ export function useItem(id: string | undefined) {
     startPlanner,
     startTestPlanner,
     startWorkers,
+    startCompletedReview,
     stopAgent,
     startReviewReceive,
     reviewReceiveError,
     testPlannerError,
+    completedReviewError,
     submitPlanFeedback,
     planFeedbackSubmitting,
     planFeedbackError,

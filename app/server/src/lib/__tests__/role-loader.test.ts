@@ -25,6 +25,7 @@ describe('role-loader', () => {
     expect(Object.keys(roles)).toEqual([
       'planner',
       'testPlanner',
+      'completedReviewer',
       'engineer',
       'reviewer',
       'reviewReceiver',
@@ -44,6 +45,8 @@ describe('role-loader', () => {
       writeFileSync(configPath, [
         'planner:',
         '  - "Bash(git status:*)"',
+        'completedReviewer:',
+        '  - "Bash(git diff:*)"',
         'engineer:',
         '  - "Read"',
         '  - "Bash(npm test:*)"',
@@ -74,6 +77,13 @@ describe('role-loader', () => {
         'Read',
         'Glob',
         'Grep',
+      ]);
+      expect(getRole('completedReviewer').allowedTools).toEqual([
+        'Read',
+        'Glob',
+        'Grep',
+        'Skill',
+        'Bash(git diff:*)',
       ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });

@@ -46,6 +46,43 @@ export interface TestPlanApprovalState {
   approvedBy?: 'user' | 'auto';
 }
 
+export type CompletedReviewFindingSeverity = 'critical' | 'major' | 'minor';
+
+export interface CompletedReviewFinding {
+  id: string;
+  scenarioId: string;
+  targetRepository: string;
+  relatedRepositories: string[];
+  severity: CompletedReviewFindingSeverity;
+  summary: string;
+  details: string;
+  suggestedFix: string;
+}
+
+export interface CompletedReviewResult {
+  status: 'needs_fixes' | 'passed';
+  summary: string;
+  findings: CompletedReviewFinding[];
+  round: number;
+  reviewedAt: string;
+}
+
+export type CompletedReviewStatus =
+  | 'not_started'
+  | 'running'
+  | 'needs_fixes'
+  | 'passed'
+  | 'error';
+
+export interface CompletedReviewState {
+  status: CompletedReviewStatus;
+  summary?: string;
+  findings: CompletedReviewFinding[];
+  round?: number;
+  updatedAt?: string;
+  errorMessage?: string;
+}
+
 export interface PlannerPromptContext {
   itemConfig: import('./item').ItemConfig;
   designDoc: string;

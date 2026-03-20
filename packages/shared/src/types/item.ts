@@ -61,10 +61,11 @@ export type WorkflowStageId =
   | 'planning'
   | 'test_planning'
   | 'execution'
+  | 'completed_review'
   | 'publish'
   | 'review_receive';
 
-export type WorkflowJobStage = 'execution' | 'publish' | 'review_receive';
+export type WorkflowJobStage = 'execution' | 'completed_review' | 'publish' | 'review_receive';
 
 export type WorkflowStageStatus = 'pending' | 'running' | 'completed' | 'error';
 
@@ -76,7 +77,16 @@ export type RepoStatus =
   | 'completed'
   | 'error';
 
-export type RepoPhase = 'clone' | 'workspace_setup' | 'setup' | 'engineer' | 'hooks' | 'review' | 'pr' | 'review_receive';
+export type RepoPhase =
+  | 'clone'
+  | 'workspace_setup'
+  | 'setup'
+  | 'engineer'
+  | 'hooks'
+  | 'review'
+  | 'completed_review'
+  | 'pr'
+  | 'review_receive';
 
 export interface RepoSummary {
   repoName: string;
@@ -143,6 +153,7 @@ export interface ItemDetail extends ItemConfig {
   plan?: import('./plan').Plan;
   testPlan?: import('./plan').TestPlan;
   testPlanApproval: import('./plan').TestPlanApprovalState;
+  completedReview: import('./plan').CompletedReviewState;
   agents: import('./agent').AgentInfo[];
   pendingApprovals: import('./events').ApprovalRequestEvent[];
   repos: RepoSummary[];  // 変更: prUrl/prNumber を置換

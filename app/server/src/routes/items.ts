@@ -15,6 +15,7 @@ import {
   deleteItem,
 } from '../services/item-service';
 import { createDraftPrsForAllRepos } from '../services/git-pr-service';
+import { ensureCompletedReviewPassed } from '../services/completed-review-service';
 import {
   startReviewReceive,
   validateReviewReceivePreConditions,
@@ -187,6 +188,7 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
     Reply: ApiResponse<{ results: Array<{ repoName: string; prUrl?: string; prNumber?: number; noChanges: boolean }> }>;
   }>('/items/:id/create-pr', async (request, reply) => {
     try {
+      await ensureCompletedReviewPassed(request.params.id);
       const result = await createDraftPrsForAllRepos(request.params.id);
 
       return reply.send({
@@ -195,6 +197,12 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
+      if (message.includes('Completed review must pass before publish')) {
+        return reply.status(400).send({
+          success: false,
+          error: message,
+        });
+      }
       fastify.log.error({ itemId: request.params.id, error }, 'PR creation failed');
       return reply.status(500).send({
         success: false,

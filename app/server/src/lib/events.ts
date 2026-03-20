@@ -7,6 +7,8 @@ import type {
   PlanCreatedEvent,
   TestPlanCreatedEvent,
   TestPlanApprovedEvent,
+  CompletedReviewFindingsExtractedEvent,
+  CompletedReviewPassedEvent,
   ApprovalRequestEvent,
   ApprovalDecisionEvent,
   ApprovalFlags,
@@ -28,6 +30,7 @@ import type {
   RepoNoChangesEvent,
   AgentRole,
   ReviewFinding,
+  CompletedReviewFinding,
   ReviewFindingsExtractedEvent,
   ReviewReceiveStartedEvent,
   ReviewReceiveCompletedEvent,
@@ -232,6 +235,49 @@ export function createTestPlanApprovedEvent(
     planFingerprint,
     testPlanFingerprint,
     approvedBy,
+  };
+}
+
+export function createCompletedReviewFindingsExtractedEvent(
+  itemId: string,
+  agentId: string,
+  findings: CompletedReviewFinding[],
+  summary: string,
+  round: number
+): CompletedReviewFindingsExtractedEvent {
+  const criticalCount = findings.filter((finding) => finding.severity === 'critical').length;
+  const majorCount = findings.filter((finding) => finding.severity === 'major').length;
+  const minorCount = findings.filter((finding) => finding.severity === 'minor').length;
+
+  return {
+    id: createEventId(),
+    type: 'completed_review_findings_extracted',
+    timestamp: timestamp(),
+    itemId,
+    agentId,
+    findings,
+    summary,
+    round,
+    criticalCount,
+    majorCount,
+    minorCount,
+  };
+}
+
+export function createCompletedReviewPassedEvent(
+  itemId: string,
+  agentId: string,
+  summary: string,
+  round: number
+): CompletedReviewPassedEvent {
+  return {
+    id: createEventId(),
+    type: 'completed_review_passed',
+    timestamp: timestamp(),
+    itemId,
+    agentId,
+    summary,
+    round,
   };
 }
 

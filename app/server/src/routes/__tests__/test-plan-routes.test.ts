@@ -34,6 +34,8 @@ vi.mock('../../services/test-planner-service', () => ({
 vi.mock('../../services/worker-service', () => ({
   startWorkers: vi.fn().mockResolvedValue(undefined),
   getWorkerStatus: vi.fn().mockResolvedValue([]),
+  validateWorkerStartPreconditions: vi.fn().mockResolvedValue(undefined),
+  WorkerStartValidationError: class WorkerStartValidationError extends Error {},
 }));
 
 vi.mock('../../services/git-snapshot-service', () => ({
@@ -85,7 +87,11 @@ vi.mock('../../lib/yaml', () => ({
   }),
 }));
 
-import { startWorkers } from '../../services/worker-service';
+import {
+  startWorkers,
+  validateWorkerStartPreconditions,
+  WorkerStartValidationError,
+} from '../../services/worker-service';
 import {
   approveTestPlan,
   deriveTestPlanApproval,
@@ -104,6 +110,7 @@ const mockTestPlanFeedback = vi.mocked(testPlanFeedback);
 const mockApproveTestPlan = vi.mocked(approveTestPlan);
 const mockDeriveTestPlanApproval = vi.mocked(deriveTestPlanApproval);
 const mockUpdatePlanContent = vi.mocked(updatePlanContent);
+const mockValidateWorkerStartPreconditions = vi.mocked(validateWorkerStartPreconditions);
 
 function buildApp() {
   const app = Fastify();
@@ -240,6 +247,46 @@ describe('test plan routes', () => {
 
     expect(res.statusCode).toBe(400);
     expect(res.json().error).toContain('Test plan approval is required');
+    expect(mockValidateWorkerStartPreconditions).not.toHaveBeenCalled();
+    expect(mockStartWorkers).not.toHaveBeenCalled();
+  });
+
+  it('starts workers asynchronously when worker preconditions pass', async () => {
+    const app = buildApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/items/item-1/workers/start',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({ repos: ['repo-b'], mode: 'retry_failed' }),
+    });
+
+    expect(res.statusCode).toBe(202);
+    expect(mockValidateWorkerStartPreconditions).toHaveBeenCalledWith('item-1', {
+      targetRepos: ['repo-b'],
+      mode: 'retry_failed',
+    });
+    expect(mockStartWorkers).toHaveBeenCalledWith('item-1', {
+      targetRepos: ['repo-b'],
+      mode: 'retry_failed',
+    });
+  });
+
+  it('rejects worker start when no actionable worker tasks remain', async () => {
+    mockValidateWorkerStartPreconditions.mockRejectedValueOnce(
+      new WorkerStartValidationError('No retryable failed tasks remain for item item-1: task-3')
+    );
+    const app = buildApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/items/item-1/workers/start',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({ repos: ['repo-b'], mode: 'retry_failed' }),
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toContain('No retryable failed tasks remain');
     expect(mockStartWorkers).not.toHaveBeenCalled();
   });
 });

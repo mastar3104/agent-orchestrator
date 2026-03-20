@@ -17,8 +17,75 @@ vi.mock('../../lib/yaml', () => ({
 }));
 
 vi.mock('../task-state-service', () => ({
+  AGENT_STOPPED_BEFORE_COMPLETION_ERROR: 'Agent stopped before completion',
   createPlanFingerprint: vi.fn().mockReturnValue('fingerprint'),
+  hasStaleExecutionStop: vi.fn().mockImplementation((events: ItemEvent[], repoName: string) => {
+    const agentRepoById = new Map<string, string>();
+    const agentRoleById = new Map<string, string>();
+    let staleStop = false;
+
+    for (const event of events) {
+      if (event.type === 'plan_created') {
+        staleStop = false;
+        continue;
+      }
+      if (event.type === 'agent_started' && event.agentId) {
+        const started = event as any;
+        if (started.repoName) {
+          agentRepoById.set(started.agentId, started.repoName);
+        }
+        agentRoleById.set(started.agentId, started.role);
+        if (started.repoName === repoName && ['engineer', 'developer', 'review'].includes(started.role)) {
+          staleStop = false;
+        }
+        continue;
+      }
+      if (event.type === 'status_changed' && event.agentId) {
+        const changed = event as any;
+        const agentRepo = agentRepoById.get(event.agentId);
+        const role = agentRoleById.get(event.agentId);
+        if (
+          agentRepo === repoName &&
+          ['engineer', 'developer', 'review'].includes(role || '') &&
+          changed.previousStatus === 'running' &&
+          changed.newStatus === 'stopped'
+        ) {
+          staleStop = true;
+        }
+      }
+    }
+
+    return staleStop;
+  }),
   readRepoTaskState: vi.fn().mockResolvedValue(null),
+  reconcileStoppedRepoTaskState: vi.fn().mockImplementation((state: any) => {
+    const next = {
+      ...state,
+      tasks: (state.tasks || []).map((task: any) => ({
+        ...task,
+        dependencies: [...(task.dependencies || [])],
+        filesModified: task.filesModified ? [...task.filesModified] : undefined,
+      })),
+    };
+    const interruptedInProgressTaskIds: string[] = [];
+    const interruptedInReviewTaskIds: string[] = [];
+    for (const task of next.tasks) {
+      if (task.status === 'in_progress') {
+        task.status = 'failed';
+        task.currentPhase = task.currentPhase || 'engineer';
+        task.lastError = task.lastError || 'Interrupted before completion';
+        interruptedInProgressTaskIds.push(task.id);
+      } else if (task.status === 'in_review') {
+        interruptedInReviewTaskIds.push(task.id);
+      }
+    }
+    return {
+      state: next,
+      mutated: interruptedInProgressTaskIds.length > 0,
+      interruptedInProgressTaskIds,
+      interruptedInReviewTaskIds,
+    };
+  }),
 }));
 
 vi.mock('../test-planner-service', () => ({
@@ -255,7 +322,92 @@ describe('deriveRepoStatuses', () => {
 
     const statuses = await deriveRepoStatuses('item-1');
     expect(statuses.get('repoA')?.status).toBe('running');
-    expect(statuses.get('repoA')?.activePhase).toBe('pr');
+    expect(statuses.get('repoA')?.activePhase).toBe('completed_review');
+  });
+
+  it('multi-repo: repoA all tasks completed but repoB failed → repoA=completed, item=error', async () => {
+    setPlanRepos(['repoA', 'repoB']);
+    mockReadRepoTaskState.mockImplementation(async (_itemId, repoName) => {
+      if (repoName === 'repoA') {
+        return makeTaskState('repoA', [
+          {
+            id: 'T1',
+            title: 'Task 1',
+            dependencies: [],
+            status: 'completed',
+            attempts: 1,
+          },
+        ]);
+      }
+      if (repoName === 'repoB') {
+        return makeTaskState('repoB', [
+          {
+            id: 'T2',
+            title: 'Task 2',
+            dependencies: [],
+            status: 'failed',
+            currentPhase: 'engineer',
+            attempts: 1,
+            lastError: 'Build failed',
+          },
+        ]);
+      }
+      return null;
+    });
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'A', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('agent_exited', { agentId: 'A', exitCode: 0 }),
+      makeEvent('agent_started', { agentId: 'B', role: 'engineer', repoName: 'repoB' }),
+      makeEvent('error', { repoName: 'repoB', phase: 'engineer', message: 'Build failed' }),
+      makeEvent('agent_exited', { agentId: 'B', exitCode: 1 }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')?.status).toBe('completed');
+    expect(statuses.get('repoA')?.activePhase).toBeUndefined();
+    expect(statuses.get('repoB')?.status).toBe('error');
+    expect(await deriveItemStatus('item-1')).toBe('error');
+  });
+
+  it('multi-repo: all repos completed execution → completed_review starts for each repo', async () => {
+    setPlanRepos(['repoA', 'repoB']);
+    mockReadRepoTaskState.mockImplementation(async (_itemId, repoName) => {
+      if (repoName === 'repoA') {
+        return makeTaskState('repoA', [
+          {
+            id: 'T1',
+            title: 'Task 1',
+            dependencies: [],
+            status: 'completed',
+            attempts: 1,
+          },
+        ]);
+      }
+      if (repoName === 'repoB') {
+        return makeTaskState('repoB', [
+          {
+            id: 'T2',
+            title: 'Task 2',
+            dependencies: [],
+            status: 'completed',
+            attempts: 1,
+          },
+        ]);
+      }
+      return null;
+    });
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'A', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('agent_exited', { agentId: 'A', exitCode: 0 }),
+      makeEvent('agent_started', { agentId: 'B', role: 'engineer', repoName: 'repoB' }),
+      makeEvent('agent_exited', { agentId: 'B', exitCode: 0 }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')).toMatchObject({ status: 'running', activePhase: 'completed_review' });
+    expect(statuses.get('repoB')).toMatchObject({ status: 'running', activePhase: 'completed_review' });
   });
 
   it('retry success with pending tasks remaining → repo/item ready', async () => {
@@ -659,6 +811,66 @@ describe('deriveRepoStatuses - status_changed(stopped) recovery', () => {
     expect(await deriveItemStatus('item-1')).toBe('error');
   });
 
+  it('stale in-progress task after stop stays error instead of returning to running', async () => {
+    setPlanRepos(['repoA']);
+    mockReadRepoTaskState.mockResolvedValue(
+      makeTaskState('repoA', [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          dependencies: [],
+          status: 'in_progress',
+          attempts: 1,
+          currentPhase: 'engineer',
+        },
+      ])
+    );
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'eng1', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('status_changed', { agentId: 'eng1', previousStatus: 'running', newStatus: 'stopped' }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')).toMatchObject({
+      status: 'error',
+      activePhase: 'engineer',
+      lastErrorMessage: 'Interrupted before completion',
+    });
+    expect(await deriveItemStatus('item-1')).toBe('error');
+  });
+
+  it('stale in-review task after stop becomes ready for resume', async () => {
+    setPlanRepos(['repoA']);
+    mockReadRepoTaskState.mockResolvedValue(
+      makeTaskState('repoA', [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          dependencies: [],
+          status: 'in_review',
+          attempts: 1,
+          currentPhase: 'hooks',
+        },
+      ])
+    );
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'eng1', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('agent_exited', { agentId: 'eng1', exitCode: 0 }),
+      makeEvent('agent_started', { agentId: 'review1', role: 'review', repoName: 'repoA' }),
+      makeEvent('status_changed', { agentId: 'review1', previousStatus: 'running', newStatus: 'stopped' }),
+    ]);
+
+    const statuses = await deriveRepoStatuses('item-1');
+    expect(statuses.get('repoA')).toMatchObject({
+      status: 'ready',
+      activePhase: undefined,
+      lastErrorMessage: undefined,
+    });
+    expect(await deriveItemStatus('item-1')).toBe('ready');
+  });
+
   it('review stopped (running→stopped) → repo error', async () => {
     setPlanRepos(['repoA']);
     mockReadJsonl.mockResolvedValue([
@@ -676,6 +888,18 @@ describe('deriveRepoStatuses - status_changed(stopped) recovery', () => {
 
   it('stopped then new agent starts → repo running again (recovery)', async () => {
     setPlanRepos(['repoA']);
+    mockReadRepoTaskState.mockResolvedValue(
+      makeTaskState('repoA', [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          dependencies: [],
+          status: 'in_review',
+          attempts: 1,
+          currentPhase: 'review',
+        },
+      ])
+    );
     mockReadJsonl.mockResolvedValue([
       makeEvent('plan_created', { planPath: '/plan.yaml' }),
       makeEvent('agent_started', { agentId: 'eng1', role: 'engineer', repoName: 'repoA' }),

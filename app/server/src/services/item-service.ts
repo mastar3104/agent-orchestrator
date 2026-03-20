@@ -59,8 +59,15 @@ import { deriveItemStatus, deriveRepoStatuses, getPendingApprovals, type RepoDer
 import { getAgentsByItem, stopAgent } from './agent-service';
 import { stopAllGitSnapshots } from './git-snapshot-service';
 import { startPlanner, getPlan } from './planner-service';
-import { readRepoTaskState, type RepoTaskStateFile, type RepoTaskStateTask } from './task-state-service';
+import {
+  hasStaleExecutionStop,
+  readRepoTaskState,
+  reconcileStoppedRepoTaskState,
+  type RepoTaskStateFile,
+  type RepoTaskStateTask,
+} from './task-state-service';
 import { deriveTestPlanApproval, getTestPlan } from './test-planner-service';
+import { getLatestCompletedReview } from './completed-review-service';
 
 export async function createItem(request: CreateItemRequest): Promise<ItemConfig> {
   const id = `ITEM-${nanoid(8)}`;
@@ -414,6 +421,7 @@ const WORKFLOW_STAGE_LABELS: Record<WorkflowStageId, string> = {
   planning: 'Planning',
   test_planning: 'Test Planning',
   execution: 'Execution',
+  completed_review: 'Completed Review',
   publish: 'Publish',
   review_receive: 'Review Receive',
 };
@@ -428,6 +436,7 @@ function mapTaskPhaseToRepoPhase(phase?: TaskProgressPhase): RepoPhase | undefin
 }
 
 function mapJobStageToRepoPhase(stage?: WorkflowJobStage): RepoPhase | undefined {
+  if (stage === 'completed_review') return 'completed_review';
   if (stage === 'publish') return 'pr';
   if (stage === 'review_receive') return 'review_receive';
   return undefined;
@@ -461,6 +470,44 @@ export function buildWorkflowSummary(params: {
   const prEventByRepo = new Map<string, PrCreatedEvent>();
   for (const event of prEvents) {
     prEventByRepo.set(event.repoName, event);
+  }
+  let lastPlanCreatedIndex = -1;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index].type === 'plan_created') {
+      lastPlanCreatedIndex = index;
+      break;
+    }
+  }
+  const currentCycleEvents = lastPlanCreatedIndex >= 0 ? events.slice(lastPlanCreatedIndex + 1) : events;
+  const latestCompletedReviewPass = [...currentCycleEvents]
+    .reverse()
+    .find((event): event is Extract<ItemEvent, { type: 'completed_review_passed' }> =>
+      event.type === 'completed_review_passed'
+    );
+  const completedReviewPassed = Boolean(latestCompletedReviewPass);
+  const completedReviewRunningAgents = agents.filter(
+    (agent) =>
+      (agent.role === 'completed-reviewer' ||
+        (agent.role === 'engineer' && agent.currentTask?.startsWith('completed-review-fix'))) &&
+      (agent.status === 'starting' || agent.status === 'running')
+  );
+  const completedReviewFixAgentByRepo = new Map(
+    completedReviewRunningAgents
+      .filter((agent) => agent.role === 'engineer' && agent.repoName)
+      .map((agent) => [agent.repoName!, agent])
+  );
+  const hasCompletedReviewError = currentCycleEvents.some(
+    (event) => event.type === 'error' && event.phase === 'completed_review'
+  );
+  const staleExecutionStoppedRepos = new Set<string>();
+  const effectiveTaskStates = new Map<string, RepoTaskStateFile>();
+  for (const [repoName, taskState] of taskStates) {
+    if (hasStaleExecutionStop(events, repoName)) {
+      staleExecutionStoppedRepos.add(repoName);
+      effectiveTaskStates.set(repoName, reconcileStoppedRepoTaskState(taskState).state);
+      continue;
+    }
+    effectiveTaskStates.set(repoName, taskState);
   }
 
   const noChangesByRepo = new Set(noChangesEvents.map((event) => event.repoName));
@@ -547,11 +594,25 @@ export function buildWorkflowSummary(params: {
     tasksByRepo.set(task.repository, repoTasks);
   }
 
+  const allJobsExecutionCompleted =
+    tasksByRepo.size > 0 &&
+    [...tasksByRepo.entries()].every(([repoName, repoTasks]) => {
+      const persistedState = effectiveTaskStates.get(repoName);
+      if (!persistedState || repoTasks.length === 0) {
+        return false;
+      }
+      const taskStateById = new Map<string, RepoTaskStateTask>();
+      for (const taskState of persistedState.tasks) {
+        taskStateById.set(taskState.id, taskState);
+      }
+      return repoTasks.every((task) => taskStateById.get(task.id)?.status === 'completed');
+    });
+
   const jobs: ItemWorkflowJob[] = [];
   for (const [repoName, repoTasks] of tasksByRepo) {
     const repoState = repoStatuses.get(repoName);
     const taskStateById = new Map<string, RepoTaskStateTask>();
-    const persistedState = taskStates.get(repoName);
+    const persistedState = effectiveTaskStates.get(repoName);
     for (const taskState of persistedState?.tasks || []) {
       taskStateById.set(taskState.id, taskState);
     }
@@ -574,14 +635,19 @@ export function buildWorkflowSummary(params: {
     const totalSteps = steps.length;
     const completedSteps = steps.filter((step) => step.status === 'completed').length;
     const failedSteps = steps.filter((step) => step.status === 'failed').length;
-    const runningStep = steps.find((step) => isTaskRunning(step.status));
+    const interruptedReviewStep = staleExecutionStoppedRepos.has(repoName)
+      ? steps.find((step) => step.status === 'in_review')
+      : undefined;
+    const runningStep = interruptedReviewStep
+      ? steps.find((step) => step.status === 'in_progress')
+      : steps.find((step) => isTaskRunning(step.status));
     const failedStep = steps.find((step) => step.status === 'failed');
     const hasTerminalPublish = prEventByRepo.has(repoName) || noChangesByRepo.has(repoName);
 
     let status: WorkflowStageStatus = 'pending';
     let activeStage: WorkflowJobStage | undefined;
-    let currentTaskId = runningStep?.taskId ?? failedStep?.taskId;
-    let currentPhase = runningStep?.currentPhase ?? failedStep?.currentPhase;
+    let currentTaskId = runningStep?.taskId ?? failedStep?.taskId ?? interruptedReviewStep?.taskId;
+    let currentPhase = runningStep?.currentPhase ?? failedStep?.currentPhase ?? interruptedReviewStep?.currentPhase;
 
     if (repoState?.status === 'review_receiving') {
       status = 'running';
@@ -598,6 +664,9 @@ export function buildWorkflowSummary(params: {
       activeStage = 'publish';
       currentTaskId = undefined;
       currentPhase = undefined;
+    } else if (interruptedReviewStep) {
+      status = 'pending';
+      activeStage = undefined;
     } else if (runningStep) {
       status = 'running';
       activeStage = 'execution';
@@ -610,9 +679,23 @@ export function buildWorkflowSummary(params: {
     } else if (totalSteps > 0 && completedSteps === totalSteps) {
       if (hasTerminalPublish) {
         status = 'completed';
-      } else {
+      } else if (!allJobsExecutionCompleted) {
+        status = 'completed';
+        currentTaskId = undefined;
+        currentPhase = undefined;
+      } else if (completedReviewPassed) {
         status = 'running';
         activeStage = 'publish';
+      } else {
+        const completedReviewFixAgent = completedReviewFixAgentByRepo.get(repoName);
+        status = hasCompletedReviewError ? 'error' : 'running';
+        activeStage = 'completed_review';
+        currentTaskId = completedReviewFixAgent?.currentTask;
+        currentPhase = repoState?.activePhase === 'hooks'
+          ? 'hooks'
+          : completedReviewFixAgent
+          ? 'engineer'
+          : undefined;
       }
     }
 
@@ -633,14 +716,12 @@ export function buildWorkflowSummary(params: {
   const completedSteps = jobs.reduce((sum, job) => sum + job.completedSteps, 0);
   const failedSteps = jobs.reduce((sum, job) => sum + job.failedSteps, 0);
   const jobsByRepo = new Map<string, ItemWorkflowJob>(jobs.map((job) => [job.repoName, job]));
-  const runningExecutionActivities = (plan?.tasks || []).flatMap((task) => {
-      const job = jobsByRepo.get(task.repository);
-      const step = job?.steps.find((candidate) => candidate.taskId === task.id);
-      if (!job || !step || !isTaskRunning(step.status)) {
-        return [];
-      }
-      return [{ repoName: task.repository, taskId: task.id, phase: step.currentPhase }];
-    });
+  const runningExecutionActivities = jobs.flatMap((job) => {
+    if (job.activeStage !== 'execution' || job.status !== 'running' || !job.currentTaskId) {
+      return [];
+    }
+    return [{ repoName: job.repoName, taskId: job.currentTaskId, phase: job.currentPhase }];
+  });
 
   const executionStageStatus: WorkflowStageStatus =
     !plan || totalSteps === 0 ? 'pending'
@@ -648,10 +729,17 @@ export function buildWorkflowSummary(params: {
       : runningExecutionActivities.length > 0 ? 'running'
       : completedSteps === totalSteps ? 'completed'
       : 'pending';
+  const completedReviewStageStatus: WorkflowStageStatus =
+    !plan || totalSteps === 0 ? 'pending'
+      : completedSteps < totalSteps ? 'pending'
+      : jobs.some((job) => job.activeStage === 'completed_review' && job.status === 'error') || hasCompletedReviewError ? 'error'
+      : completedReviewPassed ? 'completed'
+      : completedReviewRunningAgents.length > 0 || jobs.some((job) => job.activeStage === 'completed_review' && job.status === 'running') ? 'running'
+      : 'pending';
 
   const publishTargetRepos = jobs.map((job) => job.repoName);
   const publishStageStatus: WorkflowStageStatus =
-    publishTargetRepos.length === 0 ? 'pending'
+    publishTargetRepos.length === 0 || !completedReviewPassed ? 'pending'
       : jobs.some((job) => job.activeStage === 'publish' && job.status === 'error') ? 'error'
       : publishTargetRepos.every((repoName) => prEventByRepo.has(repoName) || noChangesByRepo.has(repoName)) ? 'completed'
       : jobs.some((job) => job.activeStage === 'publish' && job.status === 'running') ? 'running'
@@ -674,6 +762,7 @@ export function buildWorkflowSummary(params: {
     { id: 'planning', label: WORKFLOW_STAGE_LABELS.planning, status: planningStageStatus },
     { id: 'test_planning', label: WORKFLOW_STAGE_LABELS.test_planning, status: testPlanningStageStatus },
     { id: 'execution', label: WORKFLOW_STAGE_LABELS.execution, status: executionStageStatus },
+    { id: 'completed_review', label: WORKFLOW_STAGE_LABELS.completed_review, status: completedReviewStageStatus },
     { id: 'publish', label: WORKFLOW_STAGE_LABELS.publish, status: publishStageStatus },
   ];
 
@@ -690,12 +779,14 @@ export function buildWorkflowSummary(params: {
   }
 
   const runningPublishRepos = jobs.filter((job) => job.activeStage === 'publish' && job.status === 'running');
+  const runningCompletedReviewRepos = jobs.filter((job) => job.activeStage === 'completed_review' && job.status === 'running');
   const planningActivityCount =
     (planningStageStatus === 'running' ? 1 : 0) +
     (testPlanningStageStatus === 'running' ? 1 : 0);
   const totalRunningActivities =
     reviewReceiveRunningRepos.length +
     runningPublishRepos.length +
+    Math.max(completedReviewRunningAgents.length, runningCompletedReviewRepos.length) +
     runningExecutionActivities.length +
     planningActivityCount +
     workspaceRunningRepos.length;
@@ -706,6 +797,20 @@ export function buildWorkflowSummary(params: {
     currentActivity = {
       repoName: primaryActivity.repoName,
       stage: 'review_receive',
+      moreRunningCount: Math.max(totalRunningActivities - 1, 0) || undefined,
+    };
+  } else if (completedReviewRunningAgents.some((agent) => agent.role === 'completed-reviewer')) {
+    currentActivity = {
+      stage: 'completed_review',
+      moreRunningCount: Math.max(totalRunningActivities - 1, 0) || undefined,
+    };
+  } else if (runningCompletedReviewRepos.length > 0) {
+    const primaryActivity = runningCompletedReviewRepos[0];
+    currentActivity = {
+      repoName: primaryActivity.repoName,
+      stage: 'completed_review',
+      taskId: primaryActivity.currentTaskId,
+      phase: primaryActivity.currentPhase,
       moreRunningCount: Math.max(totalRunningActivities - 1, 0) || undefined,
     };
   } else if (runningPublishRepos.length > 0) {
@@ -765,6 +870,7 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
   const plan = await getPlan(itemId);
   const testPlan = await getTestPlan(itemId);
   const testPlanApproval = await deriveTestPlanApproval(itemId, plan, testPlan);
+  const completedReview = await getLatestCompletedReview(itemId);
   const agents = await getAgentsByItem(itemId);
   const pendingApprovals = await getPendingApprovals(itemId);
 
@@ -821,6 +927,7 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
     plan: plan || undefined,
     testPlan: testPlan || undefined,
     testPlanApproval,
+    completedReview,
     agents,
     pendingApprovals,
     repos,

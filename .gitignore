@@ -21,6 +21,7 @@ data/
 # Local settings
 *.local.json
 roles.local.yaml
+role-tools.local.yaml
 
 # Logs
 *.log

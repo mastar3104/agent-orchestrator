@@ -44,6 +44,14 @@ const TEST_PLAN_APPROVAL_STYLES: Record<string, string> = {
   approved: 'bg-emerald-500/20 text-emerald-200',
 };
 
+const COMPLETED_REVIEW_STATUS_STYLES: Record<string, string> = {
+  not_started: 'bg-gray-700 text-gray-300',
+  running: 'bg-amber-500/20 text-amber-200',
+  needs_fixes: 'bg-red-500/20 text-red-200',
+  passed: 'bg-emerald-500/20 text-emerald-200',
+  error: 'bg-red-500/20 text-red-200',
+};
+
 function formatPhase(phase?: TaskProgressPhase): string {
   if (!phase) return '';
   return phase.charAt(0).toUpperCase() + phase.slice(1);
@@ -59,6 +67,8 @@ function formatStageLabel(stage: WorkflowStageId): string {
       return 'Test Planning';
     case 'execution':
       return 'Executing tasks';
+    case 'completed_review':
+      return 'Completed Review';
     case 'publish':
       return 'Creating PR';
     case 'review_receive':
@@ -84,6 +94,12 @@ function getCurrentActivityText(
   if (activity.stage === 'test_planning') {
     return 'Test planner is building the current test plan';
   }
+  if (activity.stage === 'completed_review') {
+    if (activity.repoName) {
+      return `${activity.repoName}: ${activity.taskId || 'completed review fix'}${activity.phase ? ` (${formatPhase(activity.phase)})` : ''}`;
+    }
+    return 'Completed reviewer is validating the implementation against the approved test plan';
+  }
   if (activity.stage === 'workspace') {
     return `${activity.repoName}: preparing workspace`;
   }
@@ -94,6 +110,11 @@ function getCurrentActivityText(
 }
 
 function getJobSummary(job: ItemWorkflowJob): string {
+  if (job.activeStage === 'completed_review') {
+    return job.currentTaskId
+      ? `${job.currentTaskId}${job.currentPhase ? ` (${formatPhase(job.currentPhase)})` : ''}`
+      : 'Awaiting final completed review';
+  }
   if (job.activeStage === 'publish') {
     return 'Creating PR';
   }
@@ -117,10 +138,12 @@ export function ItemDetailPage() {
     startPlanner,
     startTestPlanner,
     startWorkers,
+    startCompletedReview,
     stopAgent,
     startReviewReceive,
     reviewReceiveError,
     testPlannerError,
+    completedReviewError,
     submitPlanFeedback,
     planFeedbackSubmitting,
     planFeedbackError,
@@ -226,6 +249,8 @@ export function ItemDetailPage() {
       event.type === 'plan_created' ||
       event.type === 'test_plan_created' ||
       event.type === 'test_plan_approved' ||
+      event.type === 'completed_review_findings_extracted' ||
+      event.type === 'completed_review_passed' ||
       event.type === 'hooks_executed' ||
       event.type === 'review_receive_started' ||
       event.type === 'review_receive_completed' ||
@@ -342,6 +367,13 @@ export function ItemDetailPage() {
   const canStartReviewReceive = item.repos?.some(
     repo => repo.prUrl && (repo.status === 'completed' || repo.status === 'error')
   ) ?? false;
+  const allWorkflowStepsCompleted =
+    item.workflow.overall.totalSteps > 0 &&
+    item.workflow.overall.completedSteps === item.workflow.overall.totalSteps;
+  const canStartCompletedReview =
+    allWorkflowStepsCompleted &&
+    item.completedReview.status !== 'running' &&
+    item.completedReview.status !== 'passed';
 
   // "Review Receive (All)" only shown for single-PR items
   const prRepos = item.repos?.filter(r => r.prUrl) ?? [];
@@ -428,7 +460,7 @@ export function ItemDetailPage() {
             <button
               onClick={() => {
                 if (item.status === 'error' && failedRepos.length > 0) {
-                  startWorkers({ repos: failedRepos, mode: 'retry_failed' });
+                  startWorkers({ mode: 'retry_failed' });
                 } else {
                   startWorkers();
                 }
@@ -436,7 +468,7 @@ export function ItemDetailPage() {
               className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-500"
             >
               {item.status === 'error' && failedRepos.length > 0
-                ? `Retry Failed (${failedRepos.join(', ')})`
+                ? 'Retry Workflow'
                 : 'Start Workers'}
             </button>
           )}
@@ -1019,6 +1051,71 @@ export function ItemDetailPage() {
                   )}
                 </div>
               )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Completed Review Summary */}
+      {item.plan && (
+        <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <h3 className="text-sm font-medium text-gray-400">Completed Review</h3>
+                <span className={`px-2 py-0.5 rounded-full text-xs ${COMPLETED_REVIEW_STATUS_STYLES[item.completedReview.status]}`}>
+                  {item.completedReview.status}
+                </span>
+              </div>
+              <p className="text-white mb-2">
+                {item.completedReview.summary || 'Final completed review has not run yet.'}
+              </p>
+              <p className="text-sm text-gray-400">
+                Round {item.completedReview.round || 0} · {item.completedReview.findings.length} findings
+              </p>
+              {item.completedReview.errorMessage && (
+                <p className="text-xs text-red-300 mt-2">{item.completedReview.errorMessage}</p>
+              )}
+            </div>
+            {canStartCompletedReview && (
+              <button
+                onClick={startCompletedReview}
+                className="px-3 py-1.5 bg-fuchsia-600 text-white rounded hover:bg-fuchsia-500 text-sm"
+              >
+                Run Completed Review
+              </button>
+            )}
+          </div>
+          {completedReviewError && (
+            <div className="text-xs text-red-400 mt-3">{completedReviewError}</div>
+          )}
+          {item.completedReview.findings.length > 0 && (
+            <div className="mt-4 space-y-2">
+              {item.completedReview.findings.map((finding) => (
+                <div
+                  key={finding.id}
+                  className="bg-gray-900 rounded p-3 border border-gray-700"
+                >
+                  <div className="flex items-center justify-between gap-3 mb-2">
+                    <div className="flex items-center gap-2">
+                      <span className={`text-xs font-semibold px-2 py-0.5 rounded ${
+                        finding.severity === 'critical'
+                          ? 'bg-red-500/20 text-red-400'
+                          : finding.severity === 'major'
+                          ? 'bg-orange-500/20 text-orange-300'
+                          : 'bg-yellow-500/20 text-yellow-200'
+                      }`}>
+                        {finding.severity.toUpperCase()}
+                      </span>
+                      <span className="text-sm text-white">{finding.summary}</span>
+                    </div>
+                    <span className="text-xs text-gray-500">{finding.targetRepository}</span>
+                  </div>
+                  <p className="text-xs text-gray-400 mb-2">Scenario: {finding.scenarioId}</p>
+                  <p className="text-sm text-gray-300 mb-2">{finding.details}</p>
+                  <p className="text-xs text-gray-500">Fix: {finding.suggestedFix}</p>
+                </div>
+              ))}
             </div>
           )}
         </div>

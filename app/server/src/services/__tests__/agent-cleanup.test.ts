@@ -18,13 +18,19 @@ vi.mock('../event-bus', () => ({
   },
 }));
 
+vi.mock('../task-state-service', () => ({
+  reconcileStoppedRepoTaskStateForItem: vi.fn().mockResolvedValue(null),
+}));
+
 import { cleanupOrphanedAgentsForItem } from '../agent-service';
 import { readJsonl, appendJsonl } from '../../lib/jsonl';
 import { eventBus } from '../event-bus';
+import { reconcileStoppedRepoTaskStateForItem } from '../task-state-service';
 
 const mockReadJsonl = vi.mocked(readJsonl);
 const mockAppendJsonl = vi.mocked(appendJsonl);
 const mockEventBusEmit = vi.mocked(eventBus.emit);
+const mockReconcileStoppedRepoTaskStateForItem = vi.mocked(reconcileStoppedRepoTaskStateForItem);
 
 function makeEvent(type: string, extra: Record<string, unknown> = {}): ItemEvent {
   return {
@@ -128,6 +134,17 @@ describe('cleanupOrphanedAgentsForItem - stuck review_receiving detection', () =
 
     // Should not write additional error event since error already exists
     expect(cleanedCount).toBe(0);
+  });
+
+  it('reconciles repo task state when cleaning up an orphaned execution agent', async () => {
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'eng1', role: 'engineer', repoName: 'repoA' }),
+    ]);
+
+    await cleanupOrphanedAgentsForItem('item-1');
+
+    expect(mockReconcileStoppedRepoTaskStateForItem).toHaveBeenCalledWith('item-1', 'repoA');
   });
 
   it('handles multiple review_receives in same item correctly', async () => {

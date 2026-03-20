@@ -26,6 +26,7 @@ vi.mock('../test-planner-service', () => ({
 }));
 
 vi.mock('../task-state-service', () => ({
+  AGENT_STOPPED_BEFORE_COMPLETION_ERROR: 'Agent stopped before completion',
   createPlanFingerprint: vi.fn().mockReturnValue('fingerprint'),
   ensureTaskStatesForPlan: vi.fn().mockImplementation(async (itemId: string, plan: any) => {
     for (const task of plan.tasks || []) {
@@ -55,6 +56,55 @@ vi.mock('../task-state-service', () => ({
     const state = taskStateStore.get(repoName);
     return state ? JSON.parse(JSON.stringify(state)) : null;
   }),
+  reconcileStoppedRepoTaskState: vi.fn().mockImplementation((state: any) => {
+    const next = JSON.parse(JSON.stringify(state));
+    const interruptedInProgressTaskIds: string[] = [];
+    const interruptedInReviewTaskIds: string[] = [];
+    for (const task of next.tasks || []) {
+      if (task.status === 'in_progress') {
+        task.status = 'failed';
+        task.currentPhase = task.currentPhase || 'engineer';
+        task.lastError = task.lastError || 'Interrupted before completion';
+        interruptedInProgressTaskIds.push(task.id);
+      } else if (task.status === 'in_review') {
+        interruptedInReviewTaskIds.push(task.id);
+      }
+    }
+    return {
+      state: next,
+      mutated: interruptedInProgressTaskIds.length > 0,
+      interruptedInProgressTaskIds,
+      interruptedInReviewTaskIds,
+    };
+  }),
+  reconcileStoppedRepoTaskStateForItem: vi.fn().mockImplementation(async (_itemId: string, repoName: string) => {
+    const state = taskStateStore.get(repoName);
+    if (!state) {
+      return null;
+    }
+    const next = JSON.parse(JSON.stringify(state));
+    const interruptedInProgressTaskIds: string[] = [];
+    const interruptedInReviewTaskIds: string[] = [];
+    for (const task of next.tasks || []) {
+      if (task.status === 'in_progress') {
+        task.status = 'failed';
+        task.currentPhase = task.currentPhase || 'engineer';
+        task.lastError = task.lastError || 'Interrupted before completion';
+        interruptedInProgressTaskIds.push(task.id);
+      } else if (task.status === 'in_review') {
+        interruptedInReviewTaskIds.push(task.id);
+      }
+    }
+    if (interruptedInProgressTaskIds.length > 0) {
+      taskStateStore.set(repoName, JSON.parse(JSON.stringify(next)));
+    }
+    return {
+      state: next,
+      mutated: interruptedInProgressTaskIds.length > 0,
+      interruptedInProgressTaskIds,
+      interruptedInReviewTaskIds,
+    };
+  }),
   writeRepoTaskState: vi.fn().mockImplementation(async (_itemId: string, state: any) => {
     taskStateStore.set(state.repository, JSON.parse(JSON.stringify(state)));
   }),
@@ -76,6 +126,10 @@ vi.mock('../git-snapshot-service', () => ({
 
 vi.mock('../git-pr-service', () => ({
   createDraftPrsForAllRepos: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../completed-review-service', () => ({
+  maybeStartCompletedReviewAfterTasks: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../lib/paths', () => ({
@@ -171,6 +225,7 @@ import { executeAgent } from '../agent-service';
 import { getPlan } from '../planner-service';
 import { getItemConfig } from '../item-service';
 import { createDraftPrsForAllRepos } from '../git-pr-service';
+import { maybeStartCompletedReviewAfterTasks } from '../completed-review-service';
 import { startWorkers } from '../worker-service';
 import { appendJsonl } from '../../lib/jsonl';
 import { createHooksExecutedEvent, createErrorEvent } from '../../lib/events';
@@ -181,6 +236,7 @@ const mockExecuteAgent = vi.mocked(executeAgent);
 const mockGetPlan = vi.mocked(getPlan);
 const mockGetItemConfig = vi.mocked(getItemConfig);
 const mockCreateDraftPrsForAllRepos = vi.mocked(createDraftPrsForAllRepos);
+const mockMaybeStartCompletedReviewAfterTasks = vi.mocked(maybeStartCompletedReviewAfterTasks);
 const mockAppendJsonl = vi.mocked(appendJsonl);
 const mockCreateHooksExecutedEvent = vi.mocked(createHooksExecutedEvent);
 const mockCreateErrorEvent = vi.mocked(createErrorEvent);
@@ -360,6 +416,7 @@ describe('Worker hooks', () => {
     gitMockState.committedPaths = ['file.ts'];
     gitMockState.statusPorcelain = '';
     gitMockState.diffRanges = {};
+    mockMaybeStartCompletedReviewAfterTasks.mockResolvedValue(undefined);
   });
 
   it('should proceed to review when no hooks are configured', async () => {
@@ -583,7 +640,8 @@ describe('Worker hooks', () => {
       reviewRounds: 0,
       hooksExhausted: true,
     });
-    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(ITEM_ID, new Set(['repo-a']));
+    expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
+    expect(mockMaybeStartCompletedReviewAfterTasks).toHaveBeenCalledWith(ITEM_ID);
   });
 
   it('should respect hooksMaxAttempts=1', async () => {
@@ -762,14 +820,8 @@ describe('Worker hooks', () => {
 
     await expect(startWorkers(ITEM_ID)).resolves.toBeUndefined();
 
-    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(
-      ITEM_ID,
-      new Set(['repo-a'])
-    );
-    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(
-      ITEM_ID,
-      new Set(['repo-b'])
-    );
+    expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
+    expect(mockMaybeStartCompletedReviewAfterTasks).toHaveBeenCalledWith(ITEM_ID);
     const engineerTaskCalls = mockExecuteAgent.mock.calls
       .filter((call) => call[0].role === 'engineer')
       .map((call) => call[0].currentTask);
@@ -1148,7 +1200,8 @@ describe('Worker hooks', () => {
       expect.stringContaining('Review feedback rounds exhausted'),
       { repoName: 'repo-a', phase: 'review' }
     );
-    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(ITEM_ID, new Set(['repo-a']));
+    expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
+    expect(mockMaybeStartCompletedReviewAfterTasks).toHaveBeenCalledWith(ITEM_ID);
     expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
       id: 'T1',
       status: 'completed',
@@ -1228,7 +1281,8 @@ describe('Worker hooks', () => {
     await expect(startWorkers(ITEM_ID)).resolves.toBeUndefined();
 
     expect(mockCreateErrorEvent).not.toHaveBeenCalled();
-    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(ITEM_ID, new Set(['repo-a']));
+    expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
+    expect(mockMaybeStartCompletedReviewAfterTasks).toHaveBeenCalledWith(ITEM_ID);
     expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
       id: 'T1',
       status: 'completed',
@@ -1285,10 +1339,8 @@ describe('Worker hooks', () => {
         currentTask: 'T1: review',
       })
     );
-    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith(
-      ITEM_ID,
-      new Set(['repo-a'])
-    );
+    expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
+    expect(mockMaybeStartCompletedReviewAfterTasks).toHaveBeenCalledWith(ITEM_ID);
   });
 
   it('should use isolated log dir per review round', async () => {

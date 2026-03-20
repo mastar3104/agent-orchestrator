@@ -33,6 +33,7 @@ const EDITABLE_ROLE_PROMPT_KEYS: EditableRolePromptKey[] = [
   'reviewer',
   'reviewReceiver',
   'testPlanner',
+  'completedReviewer',
 ];
 
 const ROLE_PROMPT_LABELS: Record<EditableRolePromptKey, string> = {
@@ -41,6 +42,7 @@ const ROLE_PROMPT_LABELS: Record<EditableRolePromptKey, string> = {
   reviewer: 'Reviewer',
   reviewReceiver: 'Review Receiver',
   testPlanner: 'Test Planner',
+  completedReviewer: 'Completed Reviewer',
 };
 
 function createEmptyRolePrompts(): Record<EditableRolePromptKey, string> {
@@ -50,6 +52,7 @@ function createEmptyRolePrompts(): Record<EditableRolePromptKey, string> {
     reviewer: '',
     reviewReceiver: '',
     testPlanner: '',
+    completedReviewer: '',
   };
 }
 

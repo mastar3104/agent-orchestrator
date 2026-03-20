@@ -31,12 +31,34 @@ import {
   createErrorEvent,
 } from '../lib/events';
 import { eventBus } from './event-bus';
+import { reconcileStoppedRepoTaskStateForItem } from './task-state-service';
 
 // In-memory state for running agents
 const agentState = new Map<string, AgentInfo>();
 
 // Track running processes for stopAgent
 const runningProcesses = new Map<string, { abort: AbortController }>();
+const TASK_STATE_TRACKED_STOP_ROLES = new Set(['engineer', 'developer', 'review']);
+
+async function reconcileStoppedTaskStateForAgent(agent: {
+  itemId: string;
+  role: AgentRole;
+  repoName?: string;
+  id?: string;
+}): Promise<void> {
+  if (!agent.repoName || !TASK_STATE_TRACKED_STOP_ROLES.has(agent.role)) {
+    return;
+  }
+
+  try {
+    await reconcileStoppedRepoTaskStateForItem(agent.itemId, agent.repoName);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(
+      `[${agent.itemId}] Failed to reconcile task state after stopping agent ${agent.id || '<unknown>'}: ${detail}`
+    );
+  }
+}
 
 /**
  * Generate a unique agent ID
@@ -84,7 +106,7 @@ export async function executeAgent<T>(options: {
   env?: Record<string, string>;
   timeoutMs?: number;
 }): Promise<{ agent: AgentInfo; result: ClaudeExecutionResult<T> }> {
-  const workspaceScopedRoles = new Set(['planner', 'test-planner']);
+  const workspaceScopedRoles = new Set(['planner', 'test-planner', 'completed-reviewer']);
   if (!workspaceScopedRoles.has(options.role) && !options.repoName) {
     throw new Error(`repoName is required for role '${options.role}'`);
   }
@@ -175,6 +197,7 @@ export async function executeAgent<T>(options: {
     if (options.emitErrorEvent !== false) {
       const phase = options.role === 'review-receiver' ? 'review_receive' as const
         : options.role === 'test-planner' ? 'test_planner' as const
+        : options.role === 'completed-reviewer' ? 'completed_review' as const
         : (['engineer', 'review', 'planner'] as const).find(r => r === options.role);
       const errorEvent = createErrorEvent(options.itemId, errorMessage, {
         agentId,
@@ -245,6 +268,7 @@ export async function stopAgent(agentId: string): Promise<boolean> {
     agentId
   );
   await logEvent(agent.itemId, agentId, statusEvent);
+  await reconcileStoppedTaskStateForAgent(agent);
 
   return true;
 }
@@ -315,7 +339,7 @@ export async function reconstructAgentState(itemId: string): Promise<void> {
 export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<number> {
   const events = await readJsonl<ItemEvent>(getItemEventsPath(itemId));
 
-  const agents = new Map<string, { status: AgentStatus; agentId: string; role?: AgentRole }>();
+  const agents = new Map<string, { status: AgentStatus; agentId: string; role?: AgentRole; repoName?: string }>();
 
   for (const event of events) {
     if (event.type === 'agent_started' && event.agentId) {
@@ -325,10 +349,12 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
           status: 'running',
           agentId: event.agentId,
           role: e.role,
+          repoName: e.repoName,
         });
       } else {
         const existing = agents.get(event.agentId)!;
         existing.role = e.role;
+        existing.repoName = e.repoName;
       }
     } else if (event.type === 'agent_exited' && event.agentId) {
       const e = event as import('@agent-orch/shared').AgentExitedEvent;
@@ -342,6 +368,7 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
         agents.set(event.agentId, {
           status: newStatus,
           agentId: event.agentId,
+          repoName: undefined,
         });
       }
     } else if (event.type === 'status_changed' && event.agentId) {
@@ -398,6 +425,13 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
           console.error(`[${itemId}] Failed to log status_changed for orphaned agent ${agentId}:`, error);
           continue;
         }
+
+        await reconcileStoppedTaskStateForAgent({
+          id: agentId,
+          itemId,
+          role,
+          repoName: agent.repoName,
+        });
 
         agentState.set(agentId, {
           id: agentId,
@@ -467,6 +501,7 @@ function tryExtractRoleFromAgentId(agentId: string): AgentRole | null {
 
   if (agentId.includes('-planner-')) return 'planner';
   if (agentId.includes('-review-receiver-')) return 'review-receiver';
+  if (agentId.includes('-completed-reviewer-')) return 'completed-reviewer';
   if (agentId.includes('-review-')) return 'review';
 
   const match = agentId.match(/^agent-([^-]+)-/);

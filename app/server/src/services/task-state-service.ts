@@ -2,7 +2,15 @@ import { createHash, randomBytes } from 'crypto';
 import { existsSync } from 'fs';
 import { mkdir, readdir, rename } from 'fs/promises';
 import { join } from 'path';
-import type { Plan, PlanTask, TaskExecutionStatus, TaskProgressPhase } from '@agent-orch/shared';
+import type {
+  AgentStartedEvent,
+  ItemEvent,
+  Plan,
+  PlanTask,
+  StatusChangedEvent,
+  TaskExecutionStatus,
+  TaskProgressPhase,
+} from '@agent-orch/shared';
 import {
   getRepoTaskStatePath,
   getTaskStateArchiveDir,
@@ -36,6 +44,97 @@ export interface RepoTaskStateFile {
   createdAt: string;
   updatedAt: string;
   tasks: RepoTaskStateTask[];
+}
+
+export const INTERRUPTED_TASK_ERROR = 'Interrupted before completion';
+export const AGENT_STOPPED_BEFORE_COMPLETION_ERROR = 'Agent stopped before completion';
+
+const INTERRUPTIBLE_AGENT_ROLES = new Set(['engineer', 'developer', 'review']);
+
+export interface ReconciledRepoTaskState {
+  state: RepoTaskStateFile;
+  mutated: boolean;
+  interruptedInProgressTaskIds: string[];
+  interruptedInReviewTaskIds: string[];
+}
+
+function cloneRepoTaskState(state: RepoTaskStateFile): RepoTaskStateFile {
+  return {
+    ...state,
+    tasks: state.tasks.map((task) => ({
+      ...task,
+      dependencies: [...task.dependencies],
+      filesModified: task.filesModified ? [...task.filesModified] : undefined,
+    })),
+  };
+}
+
+export function hasStaleExecutionStop(events: ItemEvent[], repoName: string): boolean {
+  const agentRepoById = new Map<string, string>();
+  const agentRoleById = new Map<string, string>();
+  let staleStop = false;
+
+  for (const event of events) {
+    if (event.type === 'plan_created') {
+      staleStop = false;
+      continue;
+    }
+
+    if (event.type === 'agent_started' && event.agentId) {
+      const started = event as AgentStartedEvent;
+      if (started.repoName) {
+        agentRepoById.set(started.agentId, started.repoName);
+      }
+      agentRoleById.set(started.agentId, started.role);
+      if (started.repoName === repoName && INTERRUPTIBLE_AGENT_ROLES.has(started.role)) {
+        staleStop = false;
+      }
+      continue;
+    }
+
+    if (event.type !== 'status_changed' || !event.agentId) {
+      continue;
+    }
+
+    const statusChanged = event as StatusChangedEvent;
+    const agentRepo = agentRepoById.get(event.agentId);
+    const role = agentRoleById.get(event.agentId);
+    if (agentRepo !== repoName || !role || !INTERRUPTIBLE_AGENT_ROLES.has(role)) {
+      continue;
+    }
+    if (statusChanged.previousStatus === 'running' && statusChanged.newStatus === 'stopped') {
+      staleStop = true;
+    }
+  }
+
+  return staleStop;
+}
+
+export function reconcileStoppedRepoTaskState(state: RepoTaskStateFile): ReconciledRepoTaskState {
+  const next = cloneRepoTaskState(state);
+  const interruptedInProgressTaskIds: string[] = [];
+  const interruptedInReviewTaskIds: string[] = [];
+
+  for (const task of next.tasks) {
+    if (task.status === 'in_progress') {
+      task.status = 'failed';
+      task.currentPhase = task.currentPhase || 'engineer';
+      task.lastError = task.lastError || INTERRUPTED_TASK_ERROR;
+      interruptedInProgressTaskIds.push(task.id);
+      continue;
+    }
+
+    if (task.status === 'in_review') {
+      interruptedInReviewTaskIds.push(task.id);
+    }
+  }
+
+  return {
+    state: next,
+    mutated: interruptedInProgressTaskIds.length > 0,
+    interruptedInProgressTaskIds,
+    interruptedInReviewTaskIds,
+  };
 }
 
 export function createArchiveTag(now: Date = new Date()): string {
@@ -92,6 +191,23 @@ export async function writeRepoTaskState(
   state: RepoTaskStateFile
 ): Promise<void> {
   await writeYaml(getRepoTaskStatePath(itemId, state.repository), state);
+}
+
+export async function reconcileStoppedRepoTaskStateForItem(
+  itemId: string,
+  repoName: string
+): Promise<ReconciledRepoTaskState | null> {
+  const state = await readRepoTaskState(itemId, repoName);
+  if (!state) {
+    return null;
+  }
+
+  const reconciled = reconcileStoppedRepoTaskState(state);
+  if (reconciled.mutated) {
+    await writeRepoTaskState(itemId, reconciled.state);
+  }
+
+  return reconciled;
 }
 
 export async function regenerateTaskStatesForPlan(

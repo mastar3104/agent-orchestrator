@@ -7,7 +7,7 @@ type RepoScopedRolePromptKey = Extract<
 
 type WorkspaceScopedRolePromptKey = Extract<
   EditableRolePromptKey,
-  'planner' | 'testPlanner'
+  'planner' | 'testPlanner' | 'completedReviewer'
 >;
 
 export function composeRepositoryRolePrompt(

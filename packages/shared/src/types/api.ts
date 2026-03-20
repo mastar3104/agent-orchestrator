@@ -3,6 +3,7 @@ import type {
   Plan,
   TestPlan,
   TestPlanApprovalState,
+  CompletedReviewState,
 } from './plan';
 import type { AgentInfo } from './agent';
 import type { ItemEvent } from './events';
@@ -12,6 +13,7 @@ import type { RolePrompts } from './repository';
 export const GLOBAL_ROLE_TOOL_KEYS = [
   'planner',
   'testPlanner',
+  'completedReviewer',
   'engineer',
   'reviewer',
   'reviewReceiver',
@@ -156,6 +158,10 @@ export interface UpdateTestPlanResponse {
 
 export interface TestPlanApprovalResponse {
   approval: TestPlanApprovalState;
+}
+
+export interface GetCompletedReviewResponse {
+  completedReview: CompletedReviewState;
 }
 
 export interface StartAsyncResponse {

@@ -1,4 +1,5 @@
 import type { TaskExecutionStatus, TaskProgressPhase } from './item';
+import type { CompletedReviewFinding } from './plan';
 
 export type EventType =
   | 'agent_started'
@@ -9,6 +10,8 @@ export type EventType =
   | 'plan_created'
   | 'test_plan_created'
   | 'test_plan_approved'
+  | 'completed_review_findings_extracted'
+  | 'completed_review_passed'
   | 'approval_requested'
   | 'approval_decision'
   | 'git_snapshot'
@@ -84,6 +87,24 @@ export interface TestPlanApprovedEvent extends BaseEvent {
   planFingerprint: string;
   testPlanFingerprint: string;
   approvedBy: 'user' | 'auto';
+}
+
+export interface CompletedReviewFindingsExtractedEvent extends BaseEvent {
+  type: 'completed_review_findings_extracted';
+  agentId: string;
+  findings: CompletedReviewFinding[];
+  summary: string;
+  round: number;
+  criticalCount: number;
+  majorCount: number;
+  minorCount: number;
+}
+
+export interface CompletedReviewPassedEvent extends BaseEvent {
+  type: 'completed_review_passed';
+  agentId: string;
+  summary: string;
+  round: number;
 }
 
 export type ApprovalTool = 'bash' | 'read' | 'write' | 'edit' | 'unknown';
@@ -190,6 +211,7 @@ export interface RepoSetupCompletedEvent extends BaseEvent {
 export type ErrorPhase =
   | 'planner'
   | 'test_planner'
+  | 'completed_review'
   | 'clone'
   | 'workspace_setup'
   | 'engineer'
@@ -322,6 +344,8 @@ export type ItemEvent =
   | PlanCreatedEvent
   | TestPlanCreatedEvent
   | TestPlanApprovedEvent
+  | CompletedReviewFindingsExtractedEvent
+  | CompletedReviewPassedEvent
   | StatusChangedEvent
   | ErrorEvent
   | PrCreatedEvent

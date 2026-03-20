@@ -117,7 +117,9 @@ vi.mock('../planner-service', () => ({
 }));
 
 vi.mock('../task-state-service', () => ({
+  hasStaleExecutionStop: vi.fn().mockReturnValue(false),
   readRepoTaskState: vi.fn(),
+  reconcileStoppedRepoTaskState: vi.fn().mockImplementation((state: any) => ({ state, mutated: false, interruptedInProgressTaskIds: [], interruptedInReviewTaskIds: [] })),
 }));
 
 import { existsSync } from 'fs';

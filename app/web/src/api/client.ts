@@ -17,6 +17,7 @@ import type {
   UpdateTestPlanRequest,
   UpdateTestPlanResponse,
   TestPlanApprovalResponse,
+  GetCompletedReviewResponse,
   StartAsyncResponse,
   TestPlanFeedbackItem,
 } from '@agent-orch/shared';
@@ -220,6 +221,21 @@ export async function approveTestPlan(
     method: 'POST',
     body: JSON.stringify({}),
   });
+}
+
+export async function startCompletedReview(
+  itemId: string
+): Promise<StartAsyncResponse> {
+  return request<StartAsyncResponse>(`/items/${itemId}/completed-review/start`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function getCompletedReview(
+  itemId: string
+): Promise<GetCompletedReviewResponse> {
+  return request<GetCompletedReviewResponse>(`/items/${itemId}/completed-review`);
 }
 
 // Review Receive

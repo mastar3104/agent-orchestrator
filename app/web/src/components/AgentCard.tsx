@@ -28,6 +28,7 @@ const STATUS_LABELS: Record<AgentStatus, string> = {
 const KNOWN_ROLE_LABELS: Record<string, string> = {
   planner: 'Planner',
   'test-planner': 'Test Planner',
+  'completed-reviewer': 'Completed Reviewer',
   engineer: 'Engineer',
   review: 'Review',
   'review-receiver': 'Review Receiver',
@@ -36,6 +37,7 @@ const KNOWN_ROLE_LABELS: Record<string, string> = {
 const KNOWN_ROLE_COLORS: Record<string, string> = {
   planner: 'text-purple-400',
   'test-planner': 'text-indigo-400',
+  'completed-reviewer': 'text-fuchsia-400',
   engineer: 'text-blue-400',
   review: 'text-yellow-400',
   'review-receiver': 'text-cyan-400',

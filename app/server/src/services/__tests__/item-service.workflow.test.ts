@@ -132,6 +132,7 @@ describe('buildWorkflowSummary', () => {
     expect(getStageStatus(summary, 'workspace')).toBe('completed');
     expect(getStageStatus(summary, 'planning')).toBe('running');
     expect(getStageStatus(summary, 'execution')).toBe('pending');
+    expect(getStageStatus(summary, 'completed_review')).toBe('pending');
     expect(summary.jobs).toEqual([]);
   });
 
@@ -173,6 +174,74 @@ describe('buildWorkflowSummary', () => {
     );
   });
 
+  it('does not count stale in-review work as running execution', () => {
+    const summary = buildSummary({
+      itemStatus: 'ready',
+      plan: makePlan([{ id: 'T1', repository: 'repo-a', title: 'Task 1' }]),
+      events: [
+        {
+          id: 'plan-1',
+          type: 'plan_created',
+          timestamp: '2026-01-01T00:00:00Z',
+          itemId: 'ITEM-1',
+          planPath: '/plan.yaml',
+        },
+        {
+          id: 'eng-1',
+          type: 'agent_started',
+          timestamp: '2026-01-01T00:01:00Z',
+          itemId: 'ITEM-1',
+          agentId: 'eng1',
+          role: 'engineer',
+          repoName: 'repo-a',
+          pid: 0,
+        },
+        {
+          id: 'eng-2',
+          type: 'agent_exited',
+          timestamp: '2026-01-01T00:02:00Z',
+          itemId: 'ITEM-1',
+          agentId: 'eng1',
+          exitCode: 0,
+        },
+        {
+          id: 'rev-1',
+          type: 'agent_started',
+          timestamp: '2026-01-01T00:03:00Z',
+          itemId: 'ITEM-1',
+          agentId: 'review1',
+          role: 'review',
+          repoName: 'repo-a',
+          pid: 0,
+        },
+        {
+          id: 'rev-2',
+          type: 'status_changed',
+          timestamp: '2026-01-01T00:04:00Z',
+          itemId: 'ITEM-1',
+          agentId: 'review1',
+          previousStatus: 'running',
+          newStatus: 'stopped',
+        },
+      ],
+      repoStatuses: new Map([['repo-a', makeRepoState({ status: 'ready', inCurrentPlan: true })]]),
+      taskStates: new Map([
+        ['repo-a', makeTaskState('repo-a', [{ id: 'T1', title: 'Task 1', status: 'in_review', currentPhase: 'hooks', attempts: 1 }])],
+      ]),
+    });
+
+    expect(getStageStatus(summary, 'execution')).toBe('pending');
+    expect(summary.jobs[0]).toEqual(
+      expect.objectContaining({
+        status: 'pending',
+        activeStage: undefined,
+        currentTaskId: 'T1',
+        currentPhase: 'hooks',
+      })
+    );
+    expect(summary.currentActivity).toBeUndefined();
+  });
+
   it('surfaces execution errors from failed task state', () => {
     const summary = buildSummary({
       itemStatus: 'error',
@@ -193,7 +262,7 @@ describe('buildWorkflowSummary', () => {
     );
   });
 
-  it('marks publish as running after all steps complete but before PR creation', () => {
+  it('marks completed review as running after all steps complete but before PR creation', () => {
     const summary = buildSummary({
       itemStatus: 'running',
       plan: makePlan([{ id: 'T1', repository: 'repo-a', title: 'Task 1' }]),
@@ -204,13 +273,53 @@ describe('buildWorkflowSummary', () => {
     });
 
     expect(getStageStatus(summary, 'execution')).toBe('completed');
-    expect(getStageStatus(summary, 'publish')).toBe('running');
+    expect(getStageStatus(summary, 'completed_review')).toBe('running');
+    expect(getStageStatus(summary, 'publish')).toBe('pending');
     expect(summary.jobs[0]).toEqual(
       expect.objectContaining({
         status: 'running',
-        activeStage: 'publish',
+        activeStage: 'completed_review',
       })
     );
+  });
+
+  it('keeps completed repos finished when another repo is still failing', () => {
+    const plan = makePlan([
+      { id: 'T1', repository: 'repo-a', title: 'Task 1' },
+      { id: 'T2', repository: 'repo-b', title: 'Task 2' },
+    ]);
+
+    const summary = buildSummary({
+      itemStatus: 'error',
+      plan,
+      config: makeConfig([{ name: 'repo-a' }, { name: 'repo-b' }]),
+      repoStatuses: new Map([
+        ['repo-a', makeRepoState({ status: 'completed', inCurrentPlan: true })],
+        ['repo-b', makeRepoState({ status: 'error', activePhase: 'review', inCurrentPlan: true })],
+      ]),
+      taskStates: new Map([
+        ['repo-a', makeTaskState('repo-a', [{ id: 'T1', title: 'Task 1', status: 'completed', attempts: 1 }])],
+        ['repo-b', makeTaskState('repo-b', [{ id: 'T2', title: 'Task 2', status: 'failed', currentPhase: 'review', attempts: 1, lastError: 'review failed' }])],
+      ]),
+    });
+
+    expect(getStageStatus(summary, 'execution')).toBe('error');
+    expect(getStageStatus(summary, 'completed_review')).toBe('pending');
+    expect(summary.jobs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          repoName: 'repo-a',
+          status: 'completed',
+          activeStage: undefined,
+        }),
+        expect.objectContaining({
+          repoName: 'repo-b',
+          status: 'error',
+          activeStage: 'execution',
+        }),
+      ])
+    );
+    expect(summary.currentActivity?.stage).not.toBe('completed_review');
   });
 
   it('keeps review-exhausted completed tasks in publish flow without increasing failed steps', () => {
@@ -233,7 +342,7 @@ describe('buildWorkflowSummary', () => {
     expect(summary.jobs[0]).toEqual(
       expect.objectContaining({
         status: 'running',
-        activeStage: 'publish',
+        activeStage: 'completed_review',
         completedSteps: 1,
         failedSteps: 0,
       })
@@ -265,7 +374,7 @@ describe('buildWorkflowSummary', () => {
     expect(summary.jobs[0]).toEqual(
       expect.objectContaining({
         status: 'running',
-        activeStage: 'publish',
+        activeStage: 'completed_review',
         completedSteps: 1,
         failedSteps: 0,
       })
