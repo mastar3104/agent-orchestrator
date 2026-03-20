@@ -137,16 +137,6 @@ export async function startGitSnapshot(
   snapshotTimers.set(key, timer);
 }
 
-// 単一のsnapshotを停止
-export function stopGitSnapshot(itemId: string, cwd: string, agentId?: string): void {
-  const key = getTimerKey(itemId, cwd, agentId);
-  const timer = snapshotTimers.get(key);
-  if (timer) {
-    clearInterval(timer);
-    snapshotTimers.delete(key);
-  }
-}
-
 // itemId配下のすべてのsnapshotを一括停止
 export function stopAllGitSnapshots(itemId: string): void {
   const prefix = `${itemId}:`;
@@ -156,12 +146,4 @@ export function stopAllGitSnapshots(itemId: string): void {
       snapshotTimers.delete(key);
     }
   }
-}
-
-// テスト用: すべてのスナップショットを停止
-export function stopAllSnapshots(): void {
-  for (const timer of snapshotTimers.values()) {
-    clearInterval(timer);
-  }
-  snapshotTimers.clear();
 }

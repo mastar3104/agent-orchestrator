@@ -1,5 +1,4 @@
 import { spawn } from 'child_process';
-import { mkdir, writeFile } from 'fs/promises';
 import { resolve, join } from 'path';
 import type {
   Plan,
@@ -7,16 +6,14 @@ import type {
   AgentRole,
   ItemRepositoryConfig,
   StartWorkersMode,
-  TaskExecutionStatus,
   TaskProgressPhase,
 } from '@agent-orch/shared';
 
-import { executeAgent, getAgentsByItem, stopAgent } from './agent-service';
+import { executeAgent, getAgentsByItem } from './agent-service';
 import { getPlan } from './planner-service';
 import { getItemConfig } from './item-service';
 import {
   startGitSnapshot,
-  stopAllGitSnapshots,
 } from './git-snapshot-service';
 import { getWorkspaceRoot, getRepoWorkspaceDir, getItemEventsPath, getHookLogDir } from '../lib/paths';
 import { stringifyYaml } from '../lib/yaml';
@@ -24,7 +21,6 @@ import { eventBus } from './event-bus';
 import { appendJsonl } from '../lib/jsonl';
 import {
   createReviewFindingsExtractedEvent,
-  createStatusChangedEvent,
   createHooksExecutedEvent,
   createErrorEvent,
   createTaskStateChangedEvent,
@@ -93,10 +89,6 @@ async function execGit(args: string[], cwd: string): Promise<string> {
 
 async function getGitHead(cwd: string): Promise<string> {
   return execGit(['rev-parse', 'HEAD'], cwd);
-}
-
-async function getGitMergeBase(cwd: string, baseBranch: string): Promise<string> {
-  return execGit(['merge-base', `origin/${baseBranch}`, 'HEAD'], cwd);
 }
 
 async function getGitDiff(cwd: string, base: string, head: string, files?: string[]): Promise<string> {
@@ -994,7 +986,6 @@ async function runTaskReviewPhase(
     const currentHead = await getGitHead(agentWorkdir);
 
     const reviewContext = await buildReviewContext(
-      itemId,
       repo.name,
       agentWorkdir,
       phaseBase,
@@ -1309,7 +1300,7 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
       const inProgressState = await markTaskInProgress(itemId, repo.name, nextTask.id, phaseBase);
       statesByRepo.set(repo.name, inProgressState);
 
-      const prompt = buildWorkerContext('engineer', repo.name, [nextTask], plan);
+      const prompt = buildWorkerContext('engineer', repo.name, [nextTask]);
 
       let taskSucceeded = false;
       let lastError = 'Engineer failed';
@@ -1435,8 +1426,7 @@ export async function startWorkers(itemId: string, options: StartWorkersOptions 
 function buildWorkerContext(
   role: AgentRole,
   repoName: string,
-  tasks: PlanTask[],
-  plan: Plan
+  tasks: PlanTask[]
 ): string {
   const taskList = tasks
     .map((task) => {
@@ -1556,7 +1546,6 @@ async function getFileSizeAtCommit(cwd: string, commitHash: string, filePath: st
 }
 
 async function buildReviewContext(
-  itemId: string,
   repoName: string,
   agentWorkdir: string,
   phaseBase: string,
@@ -1687,7 +1676,7 @@ function buildFeedbackPrompt(
     .join('\n');
 
   const commentList = comments
-    .map((c, i) => `- [${(c.severity || 'minor').toUpperCase()}] ${c.file}${c.line ? `:${c.line}` : ''}: ${c.comment}${c.suggestedFix ? ` (Fix: ${c.suggestedFix})` : ''}`)
+    .map((c) => `- [${(c.severity || 'minor').toUpperCase()}] ${c.file}${c.line ? `:${c.line}` : ''}: ${c.comment}${c.suggestedFix ? ` (Fix: ${c.suggestedFix})` : ''}`)
     .join('\n');
 
   const context = `## Working on: ${repo.name}
@@ -1748,8 +1737,4 @@ export async function getWorkerStatus(
   }
 
   return result;
-}
-
-export async function stopWorkers(itemId: string): Promise<void> {
-  stopAllGitSnapshots(itemId);
 }

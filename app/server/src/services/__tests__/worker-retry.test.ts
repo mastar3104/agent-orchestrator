@@ -1232,7 +1232,7 @@ describe('Worker task-state execution', () => {
       ],
     });
 
-    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+    mockExecuteAgent.mockImplementation(async (_params: any): Promise<any> => {
       throw new Error('Should not execute any agents');
     });
 

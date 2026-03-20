@@ -1,7 +1,6 @@
 import { mkdir, readdir, rm, symlink, cp, lstat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { spawn } from 'child_process';
-import { join } from 'path';
 import { nanoid } from 'nanoid';
 import type {
   AgentInfo,
@@ -19,7 +18,6 @@ import type {
   Plan,
   PlanTask,
   RepoPhase,
-  RepositoryConfig,
   PrCreatedEvent,
   ReviewReceiveCompletedEvent,
   RepoNoChangesEvent,
@@ -32,13 +30,12 @@ import type {
 import { getRepository, createRepository } from './repository-service';
 import { normalizeItemConfig } from '../lib/repository-config';
 import { sanitizeRepoAllowedTools, sanitizeRolePrompts } from '../lib/role-loader';
-import { readYaml, writeYaml, readYamlSafe } from '../lib/yaml';
+import { writeYaml, readYamlSafe } from '../lib/yaml';
 import { appendJsonl, readJsonl } from '../lib/jsonl';
 import {
   getItemsDir,
   getItemDir,
   getItemConfigPath,
-  getItemPlanPath,
   getItemEventsPath,
   getWorkspaceRoot,
   getRepoWorkspaceDir,
@@ -715,7 +712,6 @@ export function buildWorkflowSummary(params: {
   const totalSteps = jobs.reduce((sum, job) => sum + job.totalSteps, 0);
   const completedSteps = jobs.reduce((sum, job) => sum + job.completedSteps, 0);
   const failedSteps = jobs.reduce((sum, job) => sum + job.failedSteps, 0);
-  const jobsByRepo = new Map<string, ItemWorkflowJob>(jobs.map((job) => [job.repoName, job]));
   const runningExecutionActivities = jobs.flatMap((job) => {
     if (job.activeStage !== 'execution' || job.status !== 'running' || !job.currentTaskId) {
       return [];

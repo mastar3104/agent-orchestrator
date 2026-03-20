@@ -1,5 +1,4 @@
 import { existsSync } from 'fs';
-import { mkdir } from 'fs/promises';
 import { join } from 'path';
 import type {
   CompletedReviewFinding,
@@ -552,15 +551,6 @@ async function runCompletedReviewFixForRepoInternal(
   await executeCompletedReviewFixEngineer(itemId, repo, prompt);
   const hookSummary = await summarizeHooks(itemId, repo, round);
   return { hookSummary };
-}
-
-export async function runCompletedReviewFixForRepo(
-  itemId: string,
-  repoName: string,
-  findings: CompletedReviewFinding[]
-): Promise<void> {
-  const context = await loadCompletedReviewContext(itemId);
-  await runCompletedReviewFixForRepoInternal(itemId, context, repoName, findings, 1);
 }
 
 function groupFindingsByRepository(findings: CompletedReviewFinding[]): Map<string, CompletedReviewFinding[]> {

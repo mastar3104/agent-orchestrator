@@ -20,7 +20,7 @@ import type {
   RepoPhase,
 } from '@agent-orch/shared';
 import { readJsonl } from '../lib/jsonl';
-import { getItemEventsPath, getAgentEventsPath, getItemPlanPath, getWorkspaceRoot } from '../lib/paths';
+import { getItemEventsPath, getItemPlanPath, getWorkspaceRoot } from '../lib/paths';
 import { readYamlSafe } from '../lib/yaml';
 import type { Plan } from '@agent-orch/shared';
 import {
@@ -790,97 +790,11 @@ export async function deriveItemStatus(itemId: string): Promise<ItemStatus> {
   return 'created';
 }
 
-export async function deriveAgentStatus(
-  itemId: string,
-  agentId: string
-): Promise<AgentStatus> {
-  const events = await readJsonl<ItemEvent>(getAgentEventsPath(itemId, agentId));
-
-  if (events.length === 0) {
-    return 'idle';
-  }
-
-  let status: AgentStatus = 'idle';
-
-  for (const event of events) {
-    switch (event.type) {
-      case 'agent_started':
-        status = 'running';
-        break;
-      case 'agent_exited': {
-        const e = event as import('@agent-orch/shared').AgentExitedEvent;
-        if (status !== 'stopped') {
-          status = e.exitCode === 0 ? 'completed' : 'error';
-        }
-        break;
-      }
-      case 'approval_requested':
-        // Backward compat: map to running
-        status = 'running';
-        break;
-      case 'approval_decision':
-        // No-op for backward compat
-        break;
-      case 'status_changed': {
-        const e = event as import('@agent-orch/shared').StatusChangedEvent;
-        if (status !== 'stopped') {
-          status = mapAgentStatus(e.newStatus);
-        }
-        break;
-      }
-    }
-  }
-
-  return status;
-}
-
 /**
  * @deprecated Approvals no longer exist. Always returns empty array.
  */
 export async function getPendingApprovals(
-  itemId: string
+  _itemId: string
 ): Promise<ApprovalRequestEvent[]> {
   return [];
-}
-
-export async function getEventHistory(
-  itemId: string,
-  limit?: number,
-  agentId?: string
-): Promise<ItemEvent[]> {
-  const path = agentId
-    ? getAgentEventsPath(itemId, agentId)
-    : getItemEventsPath(itemId);
-
-  const events = await readJsonl<ItemEvent>(path);
-
-  if (limit) {
-    return events.slice(-limit);
-  }
-
-  return events;
-}
-
-export async function getAgentOutputHistory(
-  itemId: string,
-  agentId: string,
-  limit?: number
-): Promise<{ timestamp: string; data: string }[]> {
-  const events = await readJsonl<ItemEvent>(getAgentEventsPath(itemId, agentId));
-
-  const outputs = events
-    .filter((e) => e.type === 'stdout' || e.type === 'stderr')
-    .map((e) => {
-      const o = e as import('@agent-orch/shared').OutputEvent;
-      return {
-        timestamp: o.timestamp,
-        data: o.data,
-      };
-    });
-
-  if (limit) {
-    return outputs.slice(-limit);
-  }
-
-  return outputs;
 }

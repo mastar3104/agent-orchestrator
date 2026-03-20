@@ -61,20 +61,3 @@ export async function* streamJsonl<T>(filePath: string): AsyncGenerator<T> {
     }
   }
 }
-
-export async function readLastN<T>(filePath: string, n: number): Promise<T[]> {
-  const events = await readJsonl<T>(filePath);
-  return events.slice(-n);
-}
-
-export async function countLines(filePath: string): Promise<number> {
-  try {
-    const content = await readFile(filePath, 'utf-8');
-    return content.trim().split('\n').filter((line) => line.length > 0).length;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return 0;
-    }
-    throw error;
-  }
-}

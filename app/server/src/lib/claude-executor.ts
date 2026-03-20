@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'child_process';
+import { spawn } from 'child_process';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -380,90 +380,4 @@ export async function runClaude<T>(options: ClaudeExecutionOptions): Promise<Cla
       ));
     });
   });
-}
-
-// ─── Retry utility ───
-
-export interface ValidationContext {
-  workingDir: string;
-  agentId: string;
-  attemptBefore: string; // git rev-parse HEAD captured inside each attempt
-}
-
-export interface ExecuteWithRetryOptions<T> extends ClaudeExecutionOptions {
-  agentId: string;
-  maxAttempts?: number;
-  validate?: (result: T, ctx: ValidationContext) => Promise<string | null>;
-}
-
-async function captureGitHead(cwd: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn('git', ['rev-parse', 'HEAD'], { cwd, stdio: 'pipe' });
-    let stdout = '';
-    proc.stdout?.on('data', (d) => { stdout += d.toString(); });
-    proc.on('close', (code) => {
-      if (code === 0) resolve(stdout.trim());
-      else resolve('unknown'); // Don't fail if not a git repo
-    });
-    proc.on('error', () => resolve('unknown'));
-  });
-}
-
-export async function executeWithRetry<T>(
-  options: ExecuteWithRetryOptions<T>
-): Promise<ClaudeExecutionResult<T>> {
-  const maxAttempts = options.maxAttempts ?? 3;
-  let lastError: Error | null = null;
-  let lastFailureReason: string | null = null;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    // Capture git HEAD inside each attempt
-    const attemptBefore = await captureGitHead(options.cwd);
-
-    // Build prompt with retry context
-    let prompt = options.prompt;
-    if (attempt > 1 && lastFailureReason) {
-      prompt += `\n\n## Retry Context\nThis is retry attempt ${attempt} of ${maxAttempts}.\nFailure reason: ${lastFailureReason}\nYou must correct this issue. Output strictly valid JSON.`;
-    }
-
-    try {
-      const result = await runClaude<T>({
-        ...options,
-        prompt,
-      });
-
-      // Run validation if provided
-      if (options.validate) {
-        const validationError = await options.validate(result.output, {
-          workingDir: options.cwd,
-          agentId: options.agentId,
-          attemptBefore,
-        });
-
-        if (validationError) {
-          lastFailureReason = validationError;
-          lastError = new Error(`Validation failed on attempt ${attempt}: ${validationError}`);
-          console.warn(`[${options.agentId}] Attempt ${attempt}/${maxAttempts} validation failed: ${validationError}`);
-          continue;
-        }
-      }
-
-      return result;
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-      lastFailureReason = lastError.message;
-      console.warn(`[${options.agentId}] Attempt ${attempt}/${maxAttempts} failed: ${lastError.message}`);
-    }
-  }
-
-  throw lastError ?? new Error(`All ${maxAttempts} attempts failed`);
-}
-
-/**
- * Get a reference to the spawned process for external kill.
- * Used by agent-service to track running processes.
- */
-export interface SpawnedProcess {
-  proc: ChildProcess;
-  abort: AbortController;
 }

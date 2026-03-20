@@ -1,5 +1,4 @@
 import { mkdir, writeFile } from 'fs/promises';
-import { type ChildProcess } from 'child_process';
 import { nanoid } from 'nanoid';
 import type {
   AgentInfo,
@@ -13,7 +12,6 @@ import {
   runClaude,
   ClaudeExecutionError,
   ClaudeSchemaValidationError,
-  type ClaudeExecutionOptions,
   type ClaudeExecutionResult,
 } from '../lib/claude-executor';
 import { appendJsonl, readJsonl } from '../lib/jsonl';
@@ -279,60 +277,6 @@ export function getAgent(agentId: string): AgentInfo | undefined {
 
 export async function getAgentsByItem(itemId: string): Promise<AgentInfo[]> {
   return Array.from(agentState.values()).filter((agent) => agent.itemId === itemId);
-}
-
-// Reconstruct agent state from events on startup
-export async function reconstructAgentState(itemId: string): Promise<void> {
-  const events = await readJsonl<ItemEvent>(getItemEventsPath(itemId));
-
-  const agents = new Map<string, AgentInfo>();
-
-  for (const event of events) {
-    if (event.type === 'agent_started' && event.agentId) {
-      const e = event as import('@agent-orch/shared').AgentStartedEvent;
-      agents.set(e.agentId, {
-        id: e.agentId,
-        itemId: e.itemId,
-        role: e.role,
-        repoName: e.repoName,
-        status: 'running',
-        pid: e.pid,
-        startedAt: e.timestamp,
-      });
-    } else if (event.type === 'agent_exited' && event.agentId) {
-      const e = event as import('@agent-orch/shared').AgentExitedEvent;
-      const agent = agents.get(e.agentId);
-      if (agent) {
-        if (agent.status !== 'stopped') {
-          agent.status = e.exitCode === 0 ? 'completed' : 'error';
-        }
-        agent.stoppedAt = e.timestamp;
-        agent.exitCode = e.exitCode;
-      }
-    } else if (event.type === 'status_changed' && event.agentId) {
-      const e = event as import('@agent-orch/shared').StatusChangedEvent;
-      const agent = agents.get(event.agentId);
-      if (agent) {
-        if (agent.status !== 'stopped') {
-          // Backward compat: map old statuses to new ones
-          let newStatus = e.newStatus as AgentStatus;
-          if (newStatus === ('waiting_approval' as AgentStatus)) {
-            newStatus = 'running';
-          } else if (newStatus === ('waiting_orchestrator' as AgentStatus)) {
-            newStatus = 'completed';
-          }
-          agent.status = newStatus;
-        }
-      }
-    }
-  }
-
-  // Only keep non-running agents in state (running ones would have processes)
-  for (const [id, agent] of agents) {
-    if (agent.status !== 'running') {
-      agentState.set(id, agent);
-    }
-  }
 }
 
 // Clean up orphaned agents (running in events but no process exists)

@@ -1,8 +1,7 @@
 import { spawn } from 'child_process';
-import { existsSync } from 'fs';
 import { unlink } from 'fs/promises';
 import { join } from 'path';
-import type { ItemConfig, ItemRepositoryConfig } from '@agent-orch/shared';
+import type { ItemRepositoryConfig } from '@agent-orch/shared';
 import { getItemConfig } from './item-service';
 import { appendJsonl } from '../lib/jsonl';
 import {
@@ -212,9 +211,8 @@ export async function createDraftPrForRepo(
   }
 
   // ghユーザー名取得
-  let ghUsername: string;
   try {
-    ghUsername = await getGhUsername(repoDir);
+    await getGhUsername(repoDir);
   } catch (error) {
     await safeLogErrorEvent(eventsPath, itemId, `Failed to get GitHub username for ${repo.name}: ${getErrorMessage(error)}`, repo.name);
     prErrorLogged = true;
@@ -401,4 +399,3 @@ export async function createDraftPrsForAllRepos(
 
   return { results };
 }
-

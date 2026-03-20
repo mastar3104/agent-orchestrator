@@ -43,12 +43,10 @@ vi.mock('../item-service', () => ({
 
 import { createDraftPrForRepo, createDraftPrsForAllRepos } from '../git-pr-service';
 import { appendJsonl } from '../../lib/jsonl';
-import { createErrorEvent } from '../../lib/events';
 import { getItemConfig } from '../item-service';
 import type { ItemRepositoryConfig } from '@agent-orch/shared';
 
 const mockAppendJsonl = vi.mocked(appendJsonl);
-const mockCreateErrorEvent = vi.mocked(createErrorEvent);
 const mockGetItemConfig = vi.mocked(getItemConfig);
 
 function createMockProcess(exitCode: number, stdout = '', stderr = '') {

@@ -1,10 +1,8 @@
 import type {
   ApiResponse,
-  GitRepository,
   CreateRepositoryRequest,
   UpdateRepositoryRequest,
   ListRepositoriesResponse,
-  GetRepositoryResponse,
   CreateRepositoryResponse,
   UpdateRepositoryResponse,
   DeleteRepositoryResponse,
@@ -40,10 +38,6 @@ async function request<T>(
 
 export async function listRepositories(): Promise<ListRepositoriesResponse> {
   return request<ListRepositoriesResponse>('/repositories');
-}
-
-export async function getRepository(id: string): Promise<GetRepositoryResponse> {
-  return request<GetRepositoryResponse>(`/repositories/${id}`);
 }
 
 export async function createRepository(

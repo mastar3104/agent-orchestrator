@@ -33,12 +33,11 @@ import {
   validateWorkerStartPreconditions,
   WorkerStartValidationError,
 } from '../services/worker-service';
-import { getWorkspaceRoot, getAgentOutputPath, getItemPlanPath, getItemEventsPath } from '../lib/paths';
+import { getAgentOutputPath, getItemPlanPath, getItemEventsPath } from '../lib/paths';
 import { withItemLock, isItemLocked } from '../lib/locks';
 import { createErrorEvent } from '../lib/events';
 import { appendJsonl } from '../lib/jsonl';
 import { eventBus } from '../services/event-bus';
-import { stopAllGitSnapshots } from '../services/git-snapshot-service';
 import {
   approveTestPlan,
   deriveTestPlanApproval,

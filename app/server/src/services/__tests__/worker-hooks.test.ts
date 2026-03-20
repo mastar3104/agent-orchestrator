@@ -215,7 +215,6 @@ vi.mock('fs', () => {
 // Mock child_process spawn for git commands AND hook commands
 const mockSpawn = vi.fn();
 vi.mock('child_process', () => {
-  const EventEmitter = require('events');
   return {
     spawn: (...args: any[]) => mockSpawn(...args),
   };
