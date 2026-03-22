@@ -19,6 +19,8 @@ roles:
       version: "1.0"
       itemId: "<itemId>"
       summary: "Brief summary of the implementation plan"
+      verificationPolicy: "none|regression_only|bdd_required"
+      verificationRationale: "Why this verification level is required for the whole plan"
       tasks:
         - id: "task-1"
           title: "Task title"
@@ -30,6 +32,9 @@ roles:
 
       IMPORTANT: Every task MUST have a `repository` field matching one of the repository names listed above.
       IMPORTANT: plan.yaml must contain implementation tasks only. Review steps are orchestrator-managed and must not be included.
+      IMPORTANT: Choose the strongest applicable `verificationPolicy` for the whole plan.
+      IMPORTANT: Use `none` only for typo/copy/comment/non-behavioral changes.
+      IMPORTANT: Use `bdd_required` for cross-repository work, environment-dependent behavior, DB/day-data dependent behavior, or changes where automated tests alone are not sufficient.
 
       Focus on creating actionable, well-scoped tasks. Each task should be completable by a single agent in one session.
 
@@ -74,6 +79,8 @@ roles:
       itemId: "<itemId>"
       planFingerprint: "<planFingerprint>"
       summary: "Brief summary of the test plan"
+      verificationPolicy: "none|regression_only|bdd_required"
+      verificationRationale: "Why this resolved verification level is required"
       scenarios:
         - id: "scenario-1"
           kind: "bdd"
@@ -86,7 +93,11 @@ roles:
 
       IMPORTANT: Every scenario must use `kind` of either `bdd` or `regression`.
       IMPORTANT: Every scenario must include at least one repository name from the repositories listed in the prompt.
-      IMPORTANT: If the implementation plan has no tasks, create an empty `scenarios` array and explain why in the summary.
+      IMPORTANT: You may keep the plan's `verificationPolicy` or promote it to a stricter level, but you must never downgrade it.
+      IMPORTANT: `verificationPolicy=none` requires `scenarios: []`.
+      IMPORTANT: `verificationPolicy=regression_only` allows only `kind: regression` scenarios and requires at least one scenario.
+      IMPORTANT: `verificationPolicy=bdd_required` requires at least one `kind: bdd` scenario.
+      IMPORTANT: If the implementation plan has no tasks, create `verificationPolicy: none`, an empty `scenarios` array, and explain why in the summary.
 
       ## CRITICAL CONSTRAINTS
 
@@ -240,6 +251,8 @@ roles:
       version: "1.0"
       itemId: "<itemId>"
       summary: "Address PR review comments"
+      verificationPolicy: "none|regression_only|bdd_required"
+      verificationRationale: "Why this verification level is required for the whole review-fix plan"
       tasks:
         - id: "review-fix-1"
           title: "Task title based on review comment"
@@ -254,8 +267,10 @@ roles:
 
       IMPORTANT: Every task MUST have a `repository` field matching one of the repository names.
       IMPORTANT: plan.yaml must contain implementation tasks only. Do not include any `agent` field or review-only tasks.
+      IMPORTANT: Use `verificationPolicy: none` only for typo/copy/comment/non-behavioral changes.
+      IMPORTANT: Promote to `bdd_required` for cross-repository work, environment-dependent behavior, DB/day-data dependent behavior, or changes where automated tests alone are not sufficient.
 
-      If there are no actionable comments, create a plan with an empty tasks array and summary explaining that all feedback has been addressed or requires no code changes.
+      If there are no actionable comments, create a plan with `verificationPolicy: none`, an empty tasks array, and summary explaining that all feedback has been addressed or requires no code changes.
 
       After creating plan.yaml, return a JSON response with {"status": "success", "summary": "<brief summary>"}.
       If you encounter an error, return {"status": "failure", "summary": "<error description>"}.

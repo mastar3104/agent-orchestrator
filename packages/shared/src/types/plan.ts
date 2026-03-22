@@ -1,3 +1,22 @@
+export const VERIFICATION_POLICIES = [
+  'none',
+  'regression_only',
+  'bdd_required',
+] as const;
+
+export type VerificationPolicy = typeof VERIFICATION_POLICIES[number];
+
+export function getVerificationPolicyRank(policy: VerificationPolicy): number {
+  switch (policy) {
+    case 'none':
+      return 0;
+    case 'regression_only':
+      return 1;
+    case 'bdd_required':
+      return 2;
+  }
+}
+
 export interface PlanTask {
   id: string;
   title: string;
@@ -11,6 +30,8 @@ export interface Plan {
   version: string;
   itemId: string;
   summary: string;
+  verificationPolicy: VerificationPolicy;
+  verificationRationale: string;
   tasks: PlanTask[];
   createdAt: string;
 }
@@ -32,6 +53,8 @@ export interface TestPlan {
   itemId: string;
   planFingerprint: string;
   summary: string;
+  verificationPolicy: VerificationPolicy;
+  verificationRationale: string;
   scenarios: TestPlanScenario[];
   createdAt: string;
 }
@@ -60,7 +83,7 @@ export interface CompletedReviewFinding {
 }
 
 export interface CompletedReviewResult {
-  status: 'needs_fixes' | 'passed';
+  status: 'needs_fixes' | 'passed' | 'skipped';
   summary: string;
   findings: CompletedReviewFinding[];
   round: number;
@@ -72,6 +95,7 @@ export type CompletedReviewStatus =
   | 'running'
   | 'needs_fixes'
   | 'passed'
+  | 'skipped'
   | 'error';
 
 export interface CompletedReviewState {

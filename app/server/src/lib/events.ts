@@ -9,6 +9,7 @@ import type {
   TestPlanApprovedEvent,
   CompletedReviewFindingsExtractedEvent,
   CompletedReviewPassedEvent,
+  CompletedReviewSkippedEvent,
   ApprovalRequestEvent,
   ApprovalDecisionEvent,
   ApprovalFlags,
@@ -31,6 +32,7 @@ import type {
   AgentRole,
   ReviewFinding,
   CompletedReviewFinding,
+  VerificationPolicy,
   ReviewFindingsExtractedEvent,
   ReviewReceiveStartedEvent,
   ReviewReceiveCompletedEvent,
@@ -278,6 +280,23 @@ export function createCompletedReviewPassedEvent(
     agentId,
     summary,
     round,
+  };
+}
+
+export function createCompletedReviewSkippedEvent(
+  itemId: string,
+  agentId: string,
+  policy: VerificationPolicy,
+  reason: string
+): CompletedReviewSkippedEvent {
+  return {
+    id: createEventId(),
+    type: 'completed_review_skipped',
+    timestamp: timestamp(),
+    itemId,
+    agentId,
+    policy,
+    reason,
   };
 }
 

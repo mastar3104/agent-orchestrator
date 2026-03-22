@@ -197,7 +197,7 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
-      if (message.includes('Completed review must pass before publish')) {
+      if (message.includes('Completed review must be satisfied before publish')) {
         return reply.status(400).send({
           success: false,
           error: message,

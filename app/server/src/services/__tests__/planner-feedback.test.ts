@@ -80,6 +80,8 @@ const VALID_PLAN: Plan = {
   version: '1',
   itemId: 'item-1',
   summary: 'Test plan',
+  verificationPolicy: 'bdd_required',
+  verificationRationale: 'Cross-repository behavior needs BDD coverage.',
   createdAt: '2026-01-01T00:00:00Z',
   tasks: [
     { id: 'task-1', title: 'Task 1', repository: 'repo-a', description: 'desc' },
@@ -173,7 +175,14 @@ describe('planFeedback', () => {
     vi.mocked(existsSync).mockReturnValue(true);
     vi.mocked(readFile).mockResolvedValue(PLAN_YAML as any);
     vi.mocked(parseYaml).mockReturnValue(VALID_PLAN);
-    vi.mocked(executeAgent).mockResolvedValue(undefined as any);
+    vi.mocked(executeAgent).mockResolvedValue({
+      agent: { id: 'planner-1' },
+      result: {
+        output: 'Planner completed.',
+        usedSchemaFallback: true,
+        schemaValidationErrors: ["$: expected type 'object' but got 'string'"],
+      },
+    } as any);
   });
 
   it('startPlanner aggregates planner prompts and repo addDirs', async () => {
@@ -194,6 +203,7 @@ describe('planFeedback', () => {
     ]);
     expect(callArgs.appendSystemPrompt).toBe('You are a planner.');
     expect(callArgs.allowedTools).toEqual(['Read', 'Write', 'Bash(git status:*)']);
+    expect(callArgs.schemaFallbackMode).toBe('result_or_empty');
   });
 
   it('archives plan, calls executeAgent with feedback prompt, and emits plan_created', async () => {
@@ -217,6 +227,7 @@ describe('planFeedback', () => {
       '/workspace/repo-c',
     ]);
     expect(callArgs.allowedTools).toEqual(['Read', 'Write', 'Bash(git status:*)']);
+    expect(callArgs.schemaFallbackMode).toBe('result_or_empty');
 
     // plan_created event was emitted
     expect(appendJsonl).toHaveBeenCalled();

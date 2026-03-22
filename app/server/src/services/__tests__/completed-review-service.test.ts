@@ -119,6 +119,17 @@ vi.mock('../../lib/events', () => ({
       round,
     })
   ),
+  createCompletedReviewSkippedEvent: vi.fn().mockImplementation(
+    (itemId: string, agentId: string, policy: string, reason: string) => ({
+      id: `event-${events.length + 1}`,
+      type: 'completed_review_skipped',
+      timestamp: nextTimestamp(),
+      itemId,
+      agentId,
+      policy,
+      reason,
+    })
+  ),
   createErrorEvent: vi.fn().mockImplementation(
     (itemId: string, message: string, extra: Record<string, unknown> = {}) => ({
       id: `event-${events.length + 1}`,
@@ -166,6 +177,13 @@ vi.mock('../planner-service', () => ({
 vi.mock('../test-planner-service', () => ({
   getTestPlan: vi.fn(),
   ensureApprovedTestPlan: vi.fn().mockResolvedValue(undefined),
+  resolveVerificationPolicy: vi.fn().mockImplementation((plan, testPlan) => ({
+    planPolicy: plan.verificationPolicy,
+    resolvedPolicy: testPlan.verificationPolicy,
+    planRationale: plan.verificationRationale,
+    resolvedRationale: testPlan.verificationRationale,
+    promotedByTestPlan: false,
+  })),
 }));
 
 vi.mock('../agent-service', () => ({
@@ -258,6 +276,8 @@ function makePlan(): Plan {
     version: '1',
     itemId: 'item-1',
     summary: 'Plan summary',
+    verificationPolicy: 'bdd_required',
+    verificationRationale: 'Cross-repository behavior needs BDD coverage.',
     createdAt: '2026-01-01T00:00:00Z',
     tasks: [
       {
@@ -272,12 +292,14 @@ function makePlan(): Plan {
   };
 }
 
-function makeTestPlan(): TestPlan {
+function makeTestPlan(overrides: Partial<TestPlan> = {}): TestPlan {
   return {
     version: '1.0',
     itemId: 'item-1',
     planFingerprint: 'plan:T1',
     summary: 'Approved test plan',
+    verificationPolicy: 'bdd_required',
+    verificationRationale: 'Cross-repository behavior needs BDD coverage.',
     createdAt: '2026-01-01T00:00:00Z',
     scenarios: [
       {
@@ -290,6 +312,7 @@ function makeTestPlan(): TestPlan {
         then: 'the expected result is visible',
       },
     ],
+    ...overrides,
   };
 }
 
@@ -351,6 +374,7 @@ describe('completed-review-service', () => {
         appendSystemPrompt: 'You are a completed reviewer.',
         addDirs: [`${testPaths.workspaceRoot}/repo-a`, `${testPaths.workspaceRoot}/repo-b`],
         allowedTools: ['Read', 'Glob', 'Grep', 'Skill'],
+        schemaFallbackMode: 'result_or_empty',
       })
     );
     expect(mockExecuteAgent.mock.calls[0][0].prompt).toContain('Check repo-a acceptance conditions.');
@@ -395,7 +419,11 @@ describe('completed-review-service', () => {
         repoPorcelain.set(`${testPaths.workspaceRoot}/repo-a`, '');
         return {
           agent: { id: 'agent-engineer-1' },
-          result: { output: { status: 'success' } },
+          result: {
+            output: 'Completed review fix applied.',
+            usedSchemaFallback: true,
+            schemaValidationErrors: ["$: expected type 'object' but got 'string'"],
+          },
         } as never;
       })
       .mockImplementationOnce(async () => ({
@@ -450,33 +478,136 @@ describe('completed-review-service', () => {
     );
   });
 
-  it('rejects findings that do not assign a target repository', async () => {
+  it('skips completed review when resolved policy does not require BDD', async () => {
+    mockGetTestPlan.mockResolvedValue(
+      makeTestPlan({
+        verificationPolicy: 'regression_only',
+        verificationRationale: 'Regression coverage is sufficient for this change.',
+        scenarios: [
+          {
+            id: 'S1',
+            kind: 'regression',
+            title: 'Existing behavior remains stable',
+            repositories: ['repo-a'],
+            given: 'the current user flow',
+            when: 'the flow is exercised again',
+            then: 'the prior behavior still works',
+          },
+        ],
+      })
+    );
+
+    await maybeStartCompletedReviewAfterTasks('item-1');
+
+    expect(mockExecuteAgent).not.toHaveBeenCalled();
+    expect(events.map((event) => event.type)).toEqual([
+      'tasks_completed',
+      'completed_review_skipped',
+    ]);
+    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith('item-1', new Set(['repo-a']));
+
+    const completedReview = await getLatestCompletedReview('item-1');
+    expect(completedReview).toEqual(
+      expect.objectContaining({
+        status: 'skipped',
+        summary: expect.stringContaining('verificationPolicy=regression_only'),
+      })
+    );
+  });
+
+  it('treats semantically invalid completed reviewer findings as an invalid round and can still pass later', async () => {
+    mockExecuteAgent
+      .mockResolvedValueOnce({
+        agent: { id: 'agent-completed-review-invalid' },
+        result: {
+          output: {
+            review_status: 'needs_fixes',
+            summary: 'Invalid review output.',
+            findings: [
+              {
+                id: 'F1',
+                scenarioId: 'S1',
+                targetRepository: '',
+                relatedRepositories: [],
+                severity: 'major',
+                summary: 'Missing target repo.',
+                details: 'A repo must be assigned.',
+                suggestedFix: 'Assign the repo.',
+              },
+            ],
+          },
+        },
+      } as never)
+      .mockResolvedValueOnce({
+        agent: { id: 'agent-completed-review-approve' },
+        result: {
+          output: {
+            review_status: 'approve',
+            summary: 'Everything is acceptable now.',
+            findings: [],
+          },
+        },
+      } as never);
+
+    await startCompletedReview('item-1');
+
+    expect(events.map((event) => event.type)).toEqual([
+      'completed_review_findings_extracted',
+      'completed_review_passed',
+    ]);
+    expect(events[0]).toEqual(
+      expect.objectContaining({
+        type: 'completed_review_findings_extracted',
+        findings: [],
+        summary: expect.stringContaining('Finding F1 missing targetRepository'),
+      })
+    );
+    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith('item-1', new Set(['repo-a']));
+
+    const completedReview = await getLatestCompletedReview('item-1');
+    expect(completedReview).toEqual(
+      expect.objectContaining({
+        status: 'passed',
+        summary: 'Everything is acceptable now.',
+        round: 2,
+      })
+    );
+  });
+
+  it('skips completed review after repeated invalid completed reviewer output', async () => {
     mockExecuteAgent.mockResolvedValue({
       agent: { id: 'agent-completed-review-invalid' },
       result: {
-        output: {
-          review_status: 'needs_fixes',
-          summary: 'Invalid review output.',
-          findings: [
-            {
-              id: 'F1',
-              scenarioId: 'S1',
-              targetRepository: '',
-              relatedRepositories: [],
-              severity: 'major',
-              summary: 'Missing target repo.',
-              details: 'A repo must be assigned.',
-              suggestedFix: 'Assign the repo.',
-            },
-          ],
-        },
+        output: 'Freeform completed review response.',
+        usedSchemaFallback: true,
+        schemaValidationErrors: ["$: expected type 'object' but got 'string'"],
       },
     } as never);
 
-    await expect(startCompletedReview('item-1')).rejects.toThrow(
-      'Finding F1 missing targetRepository'
+    await startCompletedReview('item-1');
+
+    expect(mockExecuteAgent).toHaveBeenCalledTimes(3);
+    expect(events.map((event) => event.type)).toEqual([
+      'completed_review_findings_extracted',
+      'completed_review_findings_extracted',
+      'completed_review_findings_extracted',
+      'completed_review_skipped',
+    ]);
+    expect(events.at(-1)).toEqual(
+      expect.objectContaining({
+        type: 'completed_review_skipped',
+        reason: expect.stringContaining('invalid/non-actionable output'),
+      })
     );
-    expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
+    expect(mockCreateDraftPrsForAllRepos).toHaveBeenCalledWith('item-1', new Set(['repo-a']));
+
+    const completedReview = await getLatestCompletedReview('item-1');
+    expect(completedReview).toEqual(
+      expect.objectContaining({
+        status: 'skipped',
+        summary: expect.stringContaining('invalid/non-actionable output'),
+      })
+    );
   });
 
   it('ignores stale completed review results from before the latest plan cycle', async () => {

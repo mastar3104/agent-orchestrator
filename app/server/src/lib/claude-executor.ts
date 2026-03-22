@@ -11,6 +11,7 @@ export interface ClaudeExecutionOptions {
   addDirs?: string[];
   allowedTools: string[];
   jsonSchema: object;
+  schemaFallbackMode?: ClaudeSchemaFallbackMode;
   cwd: string;
   resumeSessionId?: string;
   env?: Record<string, string>;
@@ -18,9 +19,13 @@ export interface ClaudeExecutionOptions {
   signal?: AbortSignal;
 }
 
+export type ClaudeSchemaFallbackMode = 'strict' | 'result_or_empty';
+
 export interface ClaudeExecutionResult<T = unknown> {
   output: T;
   rawStdout: string;
+  usedSchemaFallback?: boolean;
+  schemaValidationErrors?: string[];
   sessionId?: string;
   exitCode: number;
   stderr: string;
@@ -164,6 +169,70 @@ export function findClaudePath(): string {
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
+function extractClaudeOutput(stdout: string): {
+  parsedOutput: unknown;
+  rawResult: unknown;
+  hasResult: boolean;
+  sessionId?: string;
+} {
+  const rawParsed = JSON.parse(stdout);
+
+  let sessionId: string | undefined;
+  if (
+    rawParsed &&
+    typeof rawParsed === 'object' &&
+    'session_id' in rawParsed &&
+    typeof rawParsed.session_id === 'string'
+  ) {
+    sessionId = rawParsed.session_id;
+  }
+
+  if (rawParsed && typeof rawParsed === 'object' && 'result' in rawParsed) {
+    const rawResult = rawParsed.result;
+
+    if ('structured_output' in rawParsed && rawParsed.structured_output != null) {
+      return {
+        parsedOutput: rawParsed.structured_output,
+        rawResult,
+        hasResult: true,
+        sessionId,
+      };
+    }
+
+    if (typeof rawResult === 'string') {
+      try {
+        return {
+          parsedOutput: JSON.parse(rawResult),
+          rawResult,
+          hasResult: true,
+          sessionId,
+        };
+      } catch {
+        return {
+          parsedOutput: rawResult,
+          rawResult,
+          hasResult: true,
+          sessionId,
+        };
+      }
+    }
+
+    return {
+      parsedOutput: rawResult,
+      rawResult,
+      hasResult: true,
+      sessionId,
+    };
+  }
+
+  return {
+    parsedOutput: rawParsed,
+    rawResult: '',
+    hasResult: false,
+    sessionId,
+  };
+}
+
 export async function runClaude<T>(options: ClaudeExecutionOptions): Promise<ClaudeExecutionResult<T>> {
   const claudePath = process.env.CLAUDE_PATH || findClaudePath();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -295,40 +364,12 @@ export async function runClaude<T>(options: ClaudeExecutionOptions): Promise<Cla
       }
 
       // Parse JSON output
-      let parsed: T;
+      let parsedOutput: unknown;
+      let rawResult: unknown = '';
+      let hasResult = false;
       let sessionId: string | undefined;
       try {
-        // claude -p --output-format json returns a JSON object with a "result" field
-        // The actual response is in the result field
-        const rawParsed = JSON.parse(stdout);
-        if (
-          rawParsed &&
-          typeof rawParsed === 'object' &&
-          'session_id' in rawParsed &&
-          typeof rawParsed.session_id === 'string'
-        ) {
-          sessionId = rawParsed.session_id;
-        }
-        // If the output has a result field containing the schema'd response, extract it
-        if (rawParsed && typeof rawParsed === 'object' && 'result' in rawParsed) {
-          // --json-schema 指定時は structured_output に構造化出力が入る
-          if ('structured_output' in rawParsed && rawParsed.structured_output != null) {
-            parsed = rawParsed.structured_output as T;
-          } else {
-            const resultValue = rawParsed.result;
-            if (typeof resultValue === 'string') {
-              try {
-                parsed = JSON.parse(resultValue) as T;
-              } catch {
-                parsed = resultValue as T;
-              }
-            } else {
-              parsed = resultValue as T;
-            }
-          }
-        } else {
-          parsed = rawParsed as T;
-        }
+        ({ parsedOutput, rawResult, hasResult, sessionId } = extractClaudeOutput(stdout));
       } catch {
         reject(new ClaudeSchemaValidationError(
           'Failed to parse JSON output from Claude',
@@ -343,10 +384,24 @@ export async function runClaude<T>(options: ClaudeExecutionOptions): Promise<Cla
 
       // Validate parsed output against jsonSchema before resolving
       const schemaErrors = validateAgainstSchema(
-        parsed,
+        parsedOutput,
         options.jsonSchema as Record<string, unknown>,
       );
       if (schemaErrors.length > 0) {
+        if (options.schemaFallbackMode === 'result_or_empty') {
+          resolve({
+            output: ((hasResult ? rawResult : '') ?? '') as T,
+            rawStdout: stdout,
+            usedSchemaFallback: true,
+            schemaValidationErrors: schemaErrors,
+            sessionId,
+            exitCode,
+            stderr,
+            durationMs,
+          });
+          return;
+        }
+
         reject(new ClaudeSchemaValidationError(
           `Claude output does not match expected schema: ${schemaErrors.join('; ')}`,
           stdout,
@@ -359,7 +414,7 @@ export async function runClaude<T>(options: ClaudeExecutionOptions): Promise<Cla
       }
 
       resolve({
-        output: parsed,
+        output: parsedOutput as T,
         rawStdout: stdout,
         sessionId,
         exitCode,

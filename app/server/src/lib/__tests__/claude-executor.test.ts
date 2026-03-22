@@ -148,6 +148,48 @@ describe('runClaude JSON parsing', () => {
     await expect(promise).rejects.toThrow("expected type 'object' but got 'string'");
   });
 
+  it('should fall back to raw result when schema mismatch and fallback mode is enabled', async () => {
+    const proc = createMockProc();
+    mockSpawn.mockReturnValue(proc);
+
+    const promise = runClaude<string>(baseOptions({ schemaFallbackMode: 'result_or_empty' }));
+
+    const output = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: 'plain text response',
+    });
+    proc.stdout!.emit('data', Buffer.from(output));
+    proc.emit('close', 0);
+
+    const result = await promise;
+    expect(result.output).toBe('plain text response');
+    expect(result.usedSchemaFallback).toBe(true);
+    expect(result.schemaValidationErrors).toEqual(["$: expected type 'object' but got 'string'"]);
+  });
+
+  it('should return empty string when fallback mode is enabled and result is absent', async () => {
+    const proc = createMockProc();
+    mockSpawn.mockReturnValue(proc);
+
+    const promise = runClaude<string>(baseOptions({
+      schemaFallbackMode: 'result_or_empty',
+      jsonSchema: ENGINEER_RESPONSE_SCHEMA,
+    }));
+
+    const output = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+    });
+    proc.stdout!.emit('data', Buffer.from(output));
+    proc.emit('close', 0);
+
+    const result = await promise;
+    expect(result.output).toBe('');
+    expect(result.usedSchemaFallback).toBe(true);
+    expect(result.schemaValidationErrors).toEqual(["$: missing required field 'status'"]);
+  });
+
   it('should pass -r when resumeSessionId is provided', async () => {
     const proc = createMockProc();
     mockSpawn.mockReturnValue(proc);

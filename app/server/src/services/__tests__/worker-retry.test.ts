@@ -1454,21 +1454,20 @@ describe('Worker task-state execution', () => {
     ]);
   });
 
-  it('retries when schema validation fails (structured_output absent) and succeeds on second attempt', async () => {
+  it('continues when engineer falls back to result after schema validation mismatch', async () => {
     let engineerCalls = 0;
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer') {
         engineerCalls += 1;
-        if (engineerCalls === 1) {
-          const { ClaudeSchemaValidationError } = await import('../../lib/claude-executor');
-          throw new ClaudeSchemaValidationError(
-            "Claude output does not match expected schema: $: expected type 'object' but got 'string'",
-            '{"type":"result","result":"Task completed successfully."}',
-            ["$: expected type 'object' but got 'string'"],
-            '', 0, 5000
-          );
-        }
-        return engineerSuccess();
+        return {
+          agent: { id: 'engineer-fallback-1' },
+          result: {
+            output: 'Task completed successfully.',
+            usedSchemaFallback: true,
+            schemaValidationErrors: ["$: expected type 'object' but got 'string'"],
+            sessionId: 'session-fallback-1',
+          },
+        } as any;
       }
       if (params.role === 'review') return reviewApprove();
       throw new Error(`Unexpected role: ${params.role}`);
@@ -1476,11 +1475,48 @@ describe('Worker task-state execution', () => {
 
     await startWorkers(ITEM_ID);
 
-    expect(engineerCalls).toBe(2);
+    expect(engineerCalls).toBe(1);
     expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
       id: 'T1',
       status: 'completed',
       attempts: 1,
+    });
+  });
+
+  it('continues reviewer loops when reviewer falls back after schema validation mismatch', async () => {
+    let reviewerCalls = 0;
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer' && params.currentTask === 'T1: Task 1') {
+        return engineerSuccess();
+      }
+      if (params.role === 'review') {
+        reviewerCalls += 1;
+        return {
+          agent: { id: `reviewer-fallback-${reviewerCalls}` },
+          result: {
+            output: 'Freeform review response.',
+            usedSchemaFallback: true,
+            schemaValidationErrors: ["$: expected type 'object' but got 'string'"],
+          },
+        } as any;
+      }
+      throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    expect(reviewerCalls).toBe(3);
+    const reviewCalls = mockExecuteAgent.mock.calls.filter((call) => call[0].role === 'review');
+    expect(reviewCalls).toHaveLength(3);
+    expect(reviewCalls.every((call) => call[0].schemaFallbackMode === 'result_or_empty')).toBe(true);
+    expect(
+      mockExecuteAgent.mock.calls.filter((call) => call[0].currentTask === 'T1: review-fix')
+    ).toHaveLength(0);
+    expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+      reviewRounds: 3,
+      reviewExhausted: true,
     });
   });
 

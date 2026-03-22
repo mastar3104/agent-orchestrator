@@ -21,8 +21,70 @@ export interface CompletedReviewerResponse {
   }>;
 }
 
+export function isCompletedReviewerResponse(output: unknown): output is CompletedReviewerResponse {
+  if (!output || typeof output !== 'object' || Array.isArray(output)) {
+    return false;
+  }
+
+  const candidate = output as {
+    review_status?: unknown;
+    summary?: unknown;
+    findings?: unknown;
+  };
+  if (candidate.review_status !== 'approve' && candidate.review_status !== 'needs_fixes') {
+    return false;
+  }
+  if (typeof candidate.summary !== 'string' || !Array.isArray(candidate.findings)) {
+    return false;
+  }
+
+  return candidate.findings.every((finding) => {
+    if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+      return false;
+    }
+
+    const completedFinding = finding as {
+      id?: unknown;
+      scenarioId?: unknown;
+      targetRepository?: unknown;
+      relatedRepositories?: unknown;
+      severity?: unknown;
+      summary?: unknown;
+      details?: unknown;
+      suggestedFix?: unknown;
+    };
+
+    return typeof completedFinding.id === 'string' &&
+      typeof completedFinding.scenarioId === 'string' &&
+      typeof completedFinding.targetRepository === 'string' &&
+      Array.isArray(completedFinding.relatedRepositories) &&
+      typeof completedFinding.summary === 'string' &&
+      typeof completedFinding.details === 'string' &&
+      typeof completedFinding.suggestedFix === 'string' &&
+      (
+        completedFinding.severity === 'critical' ||
+        completedFinding.severity === 'major' ||
+        completedFinding.severity === 'minor'
+      );
+  });
+}
+
 export interface EngineerResponse {
   status: 'success' | 'failure';
+}
+
+export function isEngineerResponse(output: unknown): output is EngineerResponse {
+  if (!output || typeof output !== 'object' || Array.isArray(output)) {
+    return false;
+  }
+
+  return 'status' in output &&
+    (((output as { status?: unknown }).status === 'success') ||
+      ((output as { status?: unknown }).status === 'failure'));
+}
+
+export function isEngineerFailureOutput(output: unknown): boolean {
+  return isEngineerResponse(output) && output.status === 'failure';
 }
 
 export interface ReviewComment {
@@ -36,6 +98,30 @@ export interface ReviewComment {
 export interface ReviewerResponse {
   review_status: 'approve' | 'request_changes';
   comments: ReviewComment[];
+}
+
+export function isReviewerResponse(output: unknown): output is ReviewerResponse {
+  if (!output || typeof output !== 'object' || Array.isArray(output)) {
+    return false;
+  }
+
+  const candidate = output as { review_status?: unknown; comments?: unknown };
+  if (candidate.review_status !== 'approve' && candidate.review_status !== 'request_changes') {
+    return false;
+  }
+
+  if (!Array.isArray(candidate.comments)) {
+    return false;
+  }
+
+  return candidate.comments.every((comment) => {
+    if (!comment || typeof comment !== 'object' || Array.isArray(comment)) {
+      return false;
+    }
+
+    const reviewComment = comment as { file?: unknown; comment?: unknown };
+    return typeof reviewComment.file === 'string' && typeof reviewComment.comment === 'string';
+  });
 }
 
 export type ReviewReceiverResponse = PlannerResponse;

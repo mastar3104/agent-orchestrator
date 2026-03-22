@@ -42,6 +42,8 @@ export interface AgentExecutionOutput {
   stdout: string;
   stderr: string;
   parsedOutput: unknown;
+  usedSchemaFallback?: boolean;
+  schemaValidationErrors?: string[];
   sessionId?: string;
   exitCode: number;
   durationMs: number;

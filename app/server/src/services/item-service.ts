@@ -17,6 +17,7 @@ import type {
   CreateItemRequest,
   Plan,
   PlanTask,
+  TestPlan,
   RepoPhase,
   PrCreatedEvent,
   ReviewReceiveCompletedEvent,
@@ -63,8 +64,13 @@ import {
   type RepoTaskStateFile,
   type RepoTaskStateTask,
 } from './task-state-service';
-import { deriveTestPlanApproval, getTestPlan } from './test-planner-service';
+import {
+  deriveTestPlanApproval,
+  getTestPlan,
+  resolveVerificationPolicy,
+} from './test-planner-service';
 import { getLatestCompletedReview } from './completed-review-service';
+import { isCompletedReviewRequired } from '../lib/verification-policy';
 
 export async function createItem(request: CreateItemRequest): Promise<ItemConfig> {
   const id = `ITEM-${nanoid(8)}`;
@@ -443,6 +449,7 @@ export function buildWorkflowSummary(params: {
   config: ItemConfig;
   itemStatus: import('@agent-orch/shared').ItemStatus;
   plan: Plan | null;
+  testPlan: TestPlan | null;
   testPlanApproval: import('@agent-orch/shared').TestPlanApprovalState;
   events: ItemEvent[];
   agents: AgentInfo[];
@@ -455,6 +462,7 @@ export function buildWorkflowSummary(params: {
     config,
     itemStatus,
     plan,
+    testPlan,
     testPlanApproval,
     events,
     agents,
@@ -481,7 +489,18 @@ export function buildWorkflowSummary(params: {
     .find((event): event is Extract<ItemEvent, { type: 'completed_review_passed' }> =>
       event.type === 'completed_review_passed'
     );
-  const completedReviewPassed = Boolean(latestCompletedReviewPass);
+  const latestCompletedReviewSkipped = [...currentCycleEvents]
+    .reverse()
+    .find((event): event is Extract<ItemEvent, { type: 'completed_review_skipped' }> =>
+      event.type === 'completed_review_skipped'
+    );
+  const verification = resolveVerificationPolicy(plan, testPlan);
+  const completedReviewRequired = verification
+    ? isCompletedReviewRequired(verification.resolvedPolicy)
+    : true;
+  const completedReviewSatisfied = completedReviewRequired
+    ? Boolean(latestCompletedReviewPass || latestCompletedReviewSkipped)
+    : testPlanApproval.status === 'approved';
   const completedReviewRunningAgents = agents.filter(
     (agent) =>
       (agent.role === 'completed-reviewer' ||
@@ -680,7 +699,7 @@ export function buildWorkflowSummary(params: {
         status = 'completed';
         currentTaskId = undefined;
         currentPhase = undefined;
-      } else if (completedReviewPassed) {
+      } else if (completedReviewSatisfied) {
         status = 'running';
         activeStage = 'publish';
       } else {
@@ -728,14 +747,15 @@ export function buildWorkflowSummary(params: {
   const completedReviewStageStatus: WorkflowStageStatus =
     !plan || totalSteps === 0 ? 'pending'
       : completedSteps < totalSteps ? 'pending'
+      : !completedReviewRequired ? 'completed'
       : jobs.some((job) => job.activeStage === 'completed_review' && job.status === 'error') || hasCompletedReviewError ? 'error'
-      : completedReviewPassed ? 'completed'
+      : completedReviewSatisfied ? 'completed'
       : completedReviewRunningAgents.length > 0 || jobs.some((job) => job.activeStage === 'completed_review' && job.status === 'running') ? 'running'
       : 'pending';
 
   const publishTargetRepos = jobs.map((job) => job.repoName);
   const publishStageStatus: WorkflowStageStatus =
-    publishTargetRepos.length === 0 || !completedReviewPassed ? 'pending'
+    publishTargetRepos.length === 0 || !completedReviewSatisfied ? 'pending'
       : jobs.some((job) => job.activeStage === 'publish' && job.status === 'error') ? 'error'
       : publishTargetRepos.every((repoName) => prEventByRepo.has(repoName) || noChangesByRepo.has(repoName)) ? 'completed'
       : jobs.some((job) => job.activeStage === 'publish' && job.status === 'running') ? 'running'
@@ -864,7 +884,7 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
 
   const status = await deriveItemStatus(itemId);
   const plan = await getPlan(itemId);
-  const testPlan = await getTestPlan(itemId);
+  const testPlan = await getTestPlan(itemId, plan);
   const testPlanApproval = await deriveTestPlanApproval(itemId, plan, testPlan);
   const completedReview = await getLatestCompletedReview(itemId);
   const agents = await getAgentsByItem(itemId);
@@ -886,6 +906,7 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
     config,
     itemStatus: status,
     plan,
+    testPlan,
     testPlanApproval,
     events,
     agents,

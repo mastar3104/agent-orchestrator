@@ -138,6 +138,7 @@ import {
   approveTestPlan,
   deriveTestPlanApproval,
   startTestPlanner,
+  testPlanFeedback,
 } from '../test-planner-service';
 
 const mockExecuteAgent = vi.mocked(executeAgent);
@@ -170,22 +171,33 @@ function writeCurrentPlan(plan: Plan) {
   files.set(testPaths.planPath, JSON.stringify(plan));
 }
 
-function makePlan(tasks: Plan['tasks']): Plan {
+function makePlan(
+  tasks: Plan['tasks'],
+  verificationPolicy: Plan['verificationPolicy'] = 'bdd_required',
+  verificationRationale = 'Cross-repository behavior needs BDD coverage.'
+): Plan {
   return {
     version: '1',
     itemId: 'item-1',
     summary: 'Plan summary',
+    verificationPolicy,
+    verificationRationale,
     createdAt: '2026-01-01T00:00:00Z',
     tasks,
   };
 }
 
-function makeGeneratedTestPlan(planFingerprint: string): TestPlan {
+function makeGeneratedTestPlan(
+  planFingerprint: string,
+  overrides: Partial<TestPlan> = {}
+): TestPlan {
   return {
     version: '1.0',
     itemId: 'item-1',
     planFingerprint,
     summary: 'Test plan summary',
+    verificationPolicy: 'bdd_required',
+    verificationRationale: 'Cross-repository behavior needs BDD coverage.',
     createdAt: '2026-01-01T00:00:00Z',
     scenarios: [
       {
@@ -198,6 +210,7 @@ function makeGeneratedTestPlan(planFingerprint: string): TestPlan {
         then: 'the change is visible',
       },
     ],
+    ...overrides,
   };
 }
 
@@ -226,7 +239,14 @@ describe('test-planner-service', () => {
         testPaths.generatedTestPlanPath,
         JSON.stringify(makeGeneratedTestPlan('plan:T1'))
       );
-      return undefined as never;
+      return {
+        agent: { id: 'test-planner-1' },
+        result: {
+          output: 'Test planner completed.',
+          usedSchemaFallback: true,
+          schemaValidationErrors: ["$: expected type 'object' but got 'string'"],
+        },
+      } as never;
     });
 
     await startTestPlanner('item-1');
@@ -240,6 +260,7 @@ describe('test-planner-service', () => {
         appendSystemPrompt: 'You are a test planner.',
         addDirs: [`${testPaths.workspaceRoot}/repo-a`, `${testPaths.workspaceRoot}/repo-b`],
         allowedTools: ['Read', 'Write', 'Skill'],
+        schemaFallbackMode: 'result_or_empty',
       })
     );
     expect(mockExecuteAgent.mock.calls[0][0].prompt).toContain('Focus on repo-a user flows first.');
@@ -324,5 +345,143 @@ describe('test-planner-service', () => {
         planFingerprint: 'plan:T1',
       })
     );
+  });
+
+  it('keeps regression-only plans pending with regression scenarios only', async () => {
+    const currentPlan = makePlan(
+      [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          description: 'desc',
+          repository: 'repo-a',
+          dependencies: [],
+          files: [],
+        },
+      ],
+      'regression_only',
+      'Single-repository behavior change needs regression coverage.'
+    );
+    writeCurrentPlan(currentPlan);
+    mockExecuteAgent.mockImplementation(async () => {
+      files.set(
+        testPaths.generatedTestPlanPath,
+        JSON.stringify(
+          makeGeneratedTestPlan('plan:T1', {
+            verificationPolicy: 'regression_only',
+            verificationRationale: 'Single-repository behavior change needs regression coverage.',
+            scenarios: [
+              {
+                id: 'S1',
+                kind: 'regression',
+                title: 'Existing behavior remains stable',
+                repositories: ['repo-a'],
+                given: 'an existing user flow',
+                when: 'the flow is re-run',
+                then: 'the previous behavior still works',
+              },
+            ],
+          })
+        )
+      );
+      return undefined as never;
+    });
+
+    await startTestPlanner('item-1');
+
+    const stored = JSON.parse(files.get(testPaths.testPlanPath) || '{}') as TestPlan;
+    expect(stored.verificationPolicy).toBe('regression_only');
+    expect(stored.scenarios.map((scenario) => scenario.kind)).toEqual(['regression']);
+
+    const approval = await deriveTestPlanApproval('item-1');
+    expect(approval.status).toBe('pending');
+  });
+
+  it('allows the test planner to promote plan verification policy', async () => {
+    const currentPlan = makePlan(
+      [
+        {
+          id: 'T1',
+          title: 'Task 1',
+          description: 'desc',
+          repository: 'repo-a',
+          dependencies: [],
+          files: [],
+        },
+      ],
+      'none',
+      'Planner classified the change as typo-level.'
+    );
+    writeCurrentPlan(currentPlan);
+    mockExecuteAgent.mockImplementation(async () => {
+      files.set(
+        testPaths.generatedTestPlanPath,
+        JSON.stringify(
+          makeGeneratedTestPlan('plan:T1', {
+            verificationPolicy: 'bdd_required',
+            verificationRationale: 'The behavior depends on environment-specific validation.',
+          })
+        )
+      );
+      return undefined as never;
+    });
+
+    await startTestPlanner('item-1');
+
+    const stored = JSON.parse(files.get(testPaths.testPlanPath) || '{}') as TestPlan;
+    expect(stored.verificationPolicy).toBe('bdd_required');
+    expect(stored.verificationRationale).toBe(
+      'The behavior depends on environment-specific validation.'
+    );
+
+    const approval = await deriveTestPlanApproval('item-1');
+    expect(approval.status).toBe('pending');
+  });
+
+  it('applies test plan feedback with relaxed schema handling and persists the generated file', async () => {
+    const currentPlan = makePlan([
+      {
+        id: 'T1',
+        title: 'Task 1',
+        description: 'desc',
+        repository: 'repo-a',
+        dependencies: [],
+        files: [],
+      },
+    ]);
+    writeCurrentPlan(currentPlan);
+    files.set(testPaths.testPlanPath, JSON.stringify(makeGeneratedTestPlan('plan:T1')));
+    mockExecuteAgent.mockImplementation(async () => {
+      files.set(
+        testPaths.generatedTestPlanPath,
+        JSON.stringify(
+          makeGeneratedTestPlan('plan:T1', {
+            summary: 'Updated test plan summary',
+          })
+        )
+      );
+      return {
+        agent: { id: 'test-planner-feedback-1' },
+        result: {
+          output: 'Updated test plan.',
+          usedSchemaFallback: true,
+          schemaValidationErrors: ["$: expected type 'object' but got 'string'"],
+        },
+      } as never;
+    });
+
+    await testPlanFeedback('item-1', [{ scenarioId: 'S1', feedback: 'Tighten the then clause.' }]);
+
+    expect(mockExecuteAgent).toHaveBeenCalledTimes(1);
+    expect(mockExecuteAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        itemId: 'item-1',
+        role: 'test-planner',
+        schemaFallbackMode: 'result_or_empty',
+      })
+    );
+    expect(mockExecuteAgent.mock.calls[0][0].prompt).toContain('Tighten the then clause.');
+    const stored = JSON.parse(files.get(testPaths.testPlanPath) || '{}') as TestPlan;
+    expect(stored.summary).toBe('Updated test plan summary');
   });
 });

@@ -10,7 +10,9 @@ import type {
   TestPlanApprovalState,
   TestPlanFeedbackItem,
   TestPlanScenario,
+  VerificationPolicy,
 } from '@agent-orch/shared';
+import { getVerificationPolicyRank } from '@agent-orch/shared';
 import { getItemConfig } from './item-service';
 import { getAgentsByItem, executeAgent } from './agent-service';
 import { appendJsonl, readJsonl } from '../lib/jsonl';
@@ -27,12 +29,17 @@ import {
   createTestPlanApprovedEvent,
   createTestPlanCreatedEvent,
 } from '../lib/events';
-import {
-  type TestPlannerResponse,
-} from '../lib/claude-schemas';
 import { getRole } from '../lib/role-loader';
 import { composeWorkspaceRolePrompts } from '../lib/repository-role-prompts';
 import { createArchiveTag, createPlanFingerprint } from './task-state-service';
+import {
+  normalizePlanVerification,
+  normalizePlanVerificationPolicy,
+  normalizePlanVerificationRationale,
+  normalizeTestPlanVerification,
+  shouldAutoApproveTestPlan,
+} from '../lib/verification-policy';
+const TEST_PLANNER_SCHEMA_FALLBACK_MODE = 'result_or_empty' as const;
 
 function normalizeScenario(scenario: TestPlanScenario): TestPlanScenario {
   return {
@@ -46,12 +53,29 @@ function normalizeScenario(scenario: TestPlanScenario): TestPlanScenario {
   };
 }
 
-function normalizeTestPlan(testPlan: TestPlan): TestPlan {
+function normalizeTestPlan(testPlan: TestPlan, currentPlan?: Plan | null): TestPlan {
+  const scenarios = Array.isArray(testPlan.scenarios)
+    ? testPlan.scenarios.map(normalizeScenario)
+    : [];
+  const verification = currentPlan
+    ? normalizeTestPlanVerification({ ...testPlan, scenarios }, currentPlan)
+    : {
+        verificationPolicy: normalizePlanVerificationPolicy(
+          testPlan.verificationPolicy,
+          scenarios.length === 0 ? 0 : 1
+        ),
+        verificationRationale: normalizePlanVerificationRationale(
+          testPlan.verificationRationale,
+          normalizePlanVerificationPolicy(testPlan.verificationPolicy, scenarios.length === 0 ? 0 : 1),
+          scenarios.length === 0 ? 0 : 1
+        ),
+      };
+
   return {
     ...testPlan,
-    scenarios: Array.isArray(testPlan.scenarios)
-      ? testPlan.scenarios.map(normalizeScenario)
-      : [],
+    verificationPolicy: verification.verificationPolicy,
+    verificationRationale: verification.verificationRationale,
+    scenarios,
   };
 }
 
@@ -68,7 +92,13 @@ function getGeneratedTestPlanSourcePath(itemId: string): string {
 }
 
 async function readCurrentPlan(itemId: string): Promise<Plan | null> {
-  return readYamlSafe<Plan>(getItemPlanPath(itemId));
+  const plan = await readYamlSafe<Plan>(getItemPlanPath(itemId));
+  return plan
+    ? {
+        ...plan,
+        ...normalizePlanVerification(plan),
+      }
+    : null;
 }
 
 async function emitTestPlanCreated(
@@ -125,6 +155,49 @@ async function loadGeneratedTestPlan(sourcePath: string): Promise<TestPlan> {
   return normalizeTestPlan(parseYaml<TestPlan>(content));
 }
 
+export function resolveVerificationPolicy(
+  currentPlan?: Plan | null,
+  currentTestPlan?: TestPlan | null
+): {
+  planPolicy: VerificationPolicy;
+  resolvedPolicy: VerificationPolicy;
+  planRationale: string;
+  resolvedRationale: string;
+  promotedByTestPlan: boolean;
+} | null {
+  if (!currentPlan) {
+    return null;
+  }
+
+  const normalizedPlan = {
+    ...currentPlan,
+    ...normalizePlanVerification(currentPlan),
+  };
+  const normalizedTestPlan = currentTestPlan
+    ? normalizeTestPlan(currentTestPlan, normalizedPlan)
+    : null;
+  const useTestPlan = Boolean(
+    normalizedTestPlan &&
+    normalizedTestPlan.planFingerprint === createPlanFingerprint(normalizedPlan)
+  );
+  const resolvedPolicy = useTestPlan
+    ? normalizedTestPlan!.verificationPolicy
+    : normalizedPlan.verificationPolicy;
+  const resolvedRationale = useTestPlan
+    ? normalizedTestPlan!.verificationRationale
+    : normalizedPlan.verificationRationale;
+
+  return {
+    planPolicy: normalizedPlan.verificationPolicy,
+    resolvedPolicy,
+    planRationale: normalizedPlan.verificationRationale,
+    resolvedRationale,
+    promotedByTestPlan:
+      getVerificationPolicyRank(resolvedPolicy) >
+      getVerificationPolicyRank(normalizedPlan.verificationPolicy),
+  };
+}
+
 export async function validateTestPlan(
   testPlan: TestPlan,
   itemConfig?: ItemConfig | null,
@@ -142,6 +215,14 @@ export async function validateTestPlan(
 
   if (!testPlan.summary) {
     errors.push('Missing summary field');
+  }
+
+  if (!testPlan.verificationPolicy) {
+    errors.push('Missing verificationPolicy field');
+  }
+
+  if (!testPlan.verificationRationale) {
+    errors.push('Missing verificationRationale field');
   }
 
   if (!Array.isArray(testPlan.scenarios)) {
@@ -162,6 +243,8 @@ export async function validateTestPlan(
     ? new Set(itemConfig.repositories.map((repository) => repository.name))
     : null;
   const scenarioIds = new Set<string>();
+  let bddScenarioCount = 0;
+  let regressionScenarioCount = 0;
 
   for (const scenario of testPlan.scenarios) {
     if (!scenario.id) {
@@ -177,6 +260,10 @@ export async function validateTestPlan(
     }
     if (scenario.kind !== 'bdd' && scenario.kind !== 'regression') {
       errors.push(`Scenario ${scenario.id || 'unknown'} has invalid kind`);
+    } else if (scenario.kind === 'bdd') {
+      bddScenarioCount += 1;
+    } else {
+      regressionScenarioCount += 1;
     }
     if (!Array.isArray(scenario.repositories) || scenario.repositories.length === 0) {
       errors.push(`Scenario ${scenario.id || 'unknown'} must include at least one repository`);
@@ -202,6 +289,32 @@ export async function validateTestPlan(
     }
   }
 
+  const planVerification = currentPlan
+    ? resolveVerificationPolicy(currentPlan, testPlan)
+    : null;
+  const resolvedPolicy = planVerification?.resolvedPolicy ?? testPlan.verificationPolicy;
+  if (resolvedPolicy === 'none' && testPlan.scenarios.length > 0) {
+    errors.push('verificationPolicy=none requires scenarios to be empty');
+  }
+  if (resolvedPolicy === 'regression_only') {
+    if (testPlan.scenarios.length === 0) {
+      errors.push('verificationPolicy=regression_only requires at least one scenario');
+    }
+    if (bddScenarioCount > 0) {
+      errors.push('verificationPolicy=regression_only allows regression scenarios only');
+    }
+  }
+  if (resolvedPolicy === 'bdd_required' && bddScenarioCount === 0) {
+    errors.push('verificationPolicy=bdd_required requires at least one bdd scenario');
+  }
+  if (
+    currentPlan &&
+    getVerificationPolicyRank(testPlan.verificationPolicy) <
+      getVerificationPolicyRank(normalizePlanVerification(currentPlan).verificationPolicy)
+  ) {
+    errors.push('verificationPolicy cannot downgrade the current plan policy');
+  }
+
   return errors;
 }
 
@@ -212,13 +325,17 @@ async function persistCurrentTestPlan(
   itemConfig?: ItemConfig | null,
   options?: { autoApprove?: boolean }
 ): Promise<{ testPlan: TestPlan; content: string; approval: TestPlanApprovalState }> {
+  const normalizedPlan = {
+    ...currentPlan,
+    ...normalizePlanVerification(currentPlan),
+  };
   const normalizedTestPlan = normalizeTestPlan({
     ...testPlan,
     itemId,
-    planFingerprint: createPlanFingerprint(currentPlan),
+    planFingerprint: createPlanFingerprint(normalizedPlan),
     createdAt: testPlan.createdAt || new Date().toISOString(),
-  });
-  const errors = await validateTestPlan(normalizedTestPlan, itemConfig, currentPlan);
+  }, normalizedPlan);
+  const errors = await validateTestPlan(normalizedTestPlan, itemConfig, normalizedPlan);
   if (errors.length > 0) {
     throw new Error(`Test plan validation errors: ${errors.join('; ')}`);
   }
@@ -233,11 +350,11 @@ async function persistCurrentTestPlan(
   const testPlanFingerprint = createTestPlanFingerprint(normalizedTestPlan);
   await emitTestPlanCreated(itemId, planFingerprint, testPlanFingerprint);
 
-  if (options?.autoApprove) {
+  if (options?.autoApprove || shouldAutoApproveTestPlan(normalizedTestPlan.verificationPolicy)) {
     await emitTestPlanApproved(itemId, planFingerprint, testPlanFingerprint, 'auto');
   }
 
-  const approval = await deriveTestPlanApproval(itemId, currentPlan, normalizedTestPlan);
+  const approval = await deriveTestPlanApproval(itemId, normalizedPlan, normalizedTestPlan);
   return { testPlan: normalizedTestPlan, content, approval };
 }
 
@@ -269,9 +386,14 @@ ${planContent}
 ## Test Planning Rules
 
 - Focus on externally observable behavior.
-- Use \`kind: bdd\` for new feature behavior and \`kind: regression\` for regression coverage.
-- If the plan is a refactor or bugfix with no new behavior, prefer regression scenarios only.
-- Preserve coverage for existing behavior that could regress due to the planned changes.`;
+- Preserve coverage for existing behavior that could regress due to the planned changes.
+- Always output top-level \`verificationPolicy\` and \`verificationRationale\`.
+- You may keep the plan's \`verificationPolicy\` or promote it to a stricter level, but you must never downgrade it.
+- Policy-specific constraints:
+  - \`none\`: only for typo/copy/comment/non-behavioral changes; \`scenarios\` must be empty.
+  - \`regression_only\`: use \`kind: regression\` only; include at least one scenario.
+  - \`bdd_required\`: include at least one \`kind: bdd\` scenario; add regression scenarios as needed.
+- Promote to \`bdd_required\` when the plan spans multiple repositories or when behavior depends on environment, DB/day data, or other conditions that automated tests alone do not sufficiently cover.`;
 }
 
 function buildTestPlannerPrompt(itemConfig: ItemConfig, plan: Plan): string {
@@ -304,6 +426,8 @@ function buildEmptyTestPlan(itemId: string, currentPlan: Plan): TestPlan {
     itemId,
     planFingerprint: createPlanFingerprint(currentPlan),
     summary: 'No executable test scenarios are required because the current plan has no implementation tasks.',
+    verificationPolicy: 'none',
+    verificationRationale: 'No implementation tasks are planned, so additional verification scenarios are not required.',
     scenarios: [],
     createdAt: new Date().toISOString(),
   };
@@ -314,21 +438,25 @@ async function runTestPlannerForCurrentPlan(
   itemConfig: ItemConfig,
   currentPlan: Plan
 ): Promise<void> {
+  const normalizedPlan = {
+    ...currentPlan,
+    ...normalizePlanVerification(currentPlan),
+  };
   if (currentPlan.tasks.length === 0) {
-    await persistCurrentTestPlan(itemId, buildEmptyTestPlan(itemId, currentPlan), currentPlan, itemConfig, {
+    await persistCurrentTestPlan(itemId, buildEmptyTestPlan(itemId, normalizedPlan), normalizedPlan, itemConfig, {
       autoApprove: true,
     });
     return;
   }
 
   const role = getRole('testPlanner');
-  const prompt = buildTestPlannerPrompt(itemConfig, currentPlan);
+  const prompt = buildTestPlannerPrompt(itemConfig, normalizedPlan);
   const workingDir = getGeneratedTestPlanWorkingDir(itemId);
   const sourcePath = getGeneratedTestPlanSourcePath(itemId);
   await mkdir(workingDir, { recursive: true });
   await rm(sourcePath, { force: true });
 
-  await executeAgent<TestPlannerResponse>({
+  await executeAgent<unknown>({
     itemId,
     role: 'test-planner',
     prompt,
@@ -337,17 +465,18 @@ async function runTestPlannerForCurrentPlan(
     workingDir,
     allowedTools: role.allowedTools,
     jsonSchema: role.jsonSchema,
+    schemaFallbackMode: TEST_PLANNER_SCHEMA_FALLBACK_MODE,
   });
 
   const generatedTestPlan = await loadGeneratedTestPlan(sourcePath);
-  await persistCurrentTestPlan(itemId, generatedTestPlan, currentPlan, itemConfig);
+  await persistCurrentTestPlan(itemId, generatedTestPlan, normalizedPlan, itemConfig);
 }
 
 export async function startTestPlanner(itemId: string): Promise<void> {
   const agents = await getAgentsByItem(itemId);
   const existingTestPlanner = agents.find((agent) => agent.role === 'test-planner');
   if (existingTestPlanner) {
-    if (existingTestPlanner.status !== 'error' && existingTestPlanner.status !== 'stopped') {
+    if (existingTestPlanner.status !== 'error' && existingTestPlanner.status !== 'stopped' && existingTestPlanner.status !== 'completed') {
       console.log(
         `[${itemId}] Test planner already exists (status: ${existingTestPlanner.status}), skipping`
       );
@@ -379,9 +508,9 @@ export async function synchronizeTestPlan(itemId: string, itemConfig: ItemConfig
   await runTestPlannerForCurrentPlan(itemId, itemConfig, currentPlan);
 }
 
-export async function getTestPlan(itemId: string): Promise<TestPlan | null> {
+export async function getTestPlan(itemId: string, currentPlan?: Plan | null): Promise<TestPlan | null> {
   const testPlan = await readYamlSafe<TestPlan>(getItemTestPlanPath(itemId));
-  return testPlan ? normalizeTestPlan(testPlan) : null;
+  return testPlan ? normalizeTestPlan(testPlan, currentPlan) : null;
 }
 
 export async function getTestPlanContent(itemId: string): Promise<string | null> {
@@ -392,7 +521,8 @@ export async function getTestPlanContent(itemId: string): Promise<string | null>
 
   const rawContent = await readFile(testPlanPath, 'utf-8');
   try {
-    return stringifyYaml(normalizeTestPlan(parseYaml<TestPlan>(rawContent)));
+    const currentPlan = await readCurrentPlan(itemId);
+    return stringifyYaml(normalizeTestPlan(parseYaml<TestPlan>(rawContent), currentPlan));
   } catch {
     return rawContent;
   }
@@ -494,7 +624,7 @@ export async function testPlanFeedback(
   if (!currentPlan) {
     throw new Error('No plan exists yet');
   }
-  const currentTestPlan = await getTestPlan(itemId);
+  const currentTestPlan = await getTestPlan(itemId, currentPlan);
   if (!currentTestPlan) {
     throw new Error('No test plan exists yet');
   }
@@ -512,7 +642,7 @@ export async function testPlanFeedback(
   await mkdir(workingDir, { recursive: true });
   await rm(sourcePath, { force: true });
 
-  await executeAgent<TestPlannerResponse>({
+  await executeAgent<unknown>({
     itemId,
     role: 'test-planner',
     prompt,
@@ -521,6 +651,7 @@ export async function testPlanFeedback(
     workingDir,
     allowedTools: role.allowedTools,
     jsonSchema: role.jsonSchema,
+    schemaFallbackMode: TEST_PLANNER_SCHEMA_FALLBACK_MODE,
   });
 
   const generatedTestPlan = await loadGeneratedTestPlan(sourcePath);
@@ -538,7 +669,7 @@ export async function deriveTestPlanApproval(
   }
 
   const planFingerprint = createPlanFingerprint(currentPlan);
-  const currentTestPlan = currentTestPlanArg ?? await getTestPlan(itemId);
+  const currentTestPlan = currentTestPlanArg ?? await getTestPlan(itemId, currentPlan);
   if (!currentTestPlan) {
     return { status: 'missing', planFingerprint };
   }
@@ -594,7 +725,7 @@ export async function approveTestPlan(itemId: string): Promise<TestPlanApprovalS
     throw new Error('No plan exists yet');
   }
 
-  const currentTestPlan = await getTestPlan(itemId);
+  const currentTestPlan = await getTestPlan(itemId, currentPlan);
   if (!currentTestPlan) {
     throw new Error('No test plan exists yet');
   }

@@ -12,6 +12,7 @@ import {
   runClaude,
   ClaudeExecutionError,
   ClaudeSchemaValidationError,
+  type ClaudeSchemaFallbackMode,
   type ClaudeExecutionResult,
 } from '../lib/claude-executor';
 import { appendJsonl, readJsonl } from '../lib/jsonl';
@@ -98,6 +99,7 @@ export async function executeAgent<T>(options: {
   workingDir: string;
   allowedTools: string[];
   jsonSchema: object;
+  schemaFallbackMode?: ClaudeSchemaFallbackMode;
   agentId?: string;
   resumeSessionId?: string;
   emitErrorEvent?: boolean;
@@ -149,6 +151,7 @@ export async function executeAgent<T>(options: {
       addDirs: options.addDirs,
       allowedTools: options.allowedTools,
       jsonSchema: options.jsonSchema,
+      schemaFallbackMode: options.schemaFallbackMode,
       cwd: options.workingDir,
       resumeSessionId: options.resumeSessionId,
       env: options.env,
@@ -162,11 +165,19 @@ export async function executeAgent<T>(options: {
       stdout: result.rawStdout,
       stderr: result.stderr,
       parsedOutput: result.output,
+      usedSchemaFallback: result.usedSchemaFallback,
+      schemaValidationErrors: result.schemaValidationErrors,
       sessionId: result.sessionId,
       exitCode: result.exitCode,
       durationMs: result.durationMs,
       timestamp: new Date().toISOString(),
     });
+
+    if (result.usedSchemaFallback) {
+      console.warn(
+        `[${agentId}] Claude output failed schema validation; continuing with fallback output: ${(result.schemaValidationErrors || []).join('; ')}`
+      );
+    }
 
     // Log claude_execution event
     const executionEvent = createClaudeExecutionEvent(
@@ -226,6 +237,7 @@ export async function executeAgent<T>(options: {
         stdout: error.rawOutput,
         stderr: error.stderr,
         parsedOutput: null,
+        schemaValidationErrors: error.validationErrors,
         exitCode: error.exitCode,
         durationMs: error.durationMs,
         timestamp: new Date().toISOString(),
