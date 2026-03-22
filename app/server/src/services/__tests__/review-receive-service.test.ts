@@ -41,9 +41,26 @@ vi.mock('../git-pr-service', () => ({
 }));
 
 vi.mock('../../lib/events', () => ({
-  createReviewReceiveStartedEvent: vi.fn().mockReturnValue({ type: 'review_receive_started' }),
-  createReviewReceiveCompletedEvent: vi.fn().mockReturnValue({ type: 'review_receive_completed' }),
-  createErrorEvent: vi.fn().mockReturnValue({ type: 'error' }),
+  createReviewReceiveStartedEvent: vi.fn((itemId: string, agentId: string, repoName: string) => ({
+    type: 'review_receive_started',
+    itemId,
+    agentId,
+    repoName,
+  })),
+  createReviewReceiveCompletedEvent: vi.fn((itemId: string, agentId: string, repoName: string) => ({
+    type: 'review_receive_completed',
+    itemId,
+    agentId,
+    repoName,
+  })),
+  createErrorEvent: vi.fn((itemId: string, message: string, options?: { repoName?: string; phase?: string; agentId?: string }) => ({
+    type: 'error',
+    itemId,
+    message,
+    repoName: options?.repoName,
+    phase: options?.phase,
+    agentId: options?.agentId,
+  })),
 }));
 
 vi.mock('../../lib/role-loader', () => ({
@@ -73,22 +90,27 @@ vi.mock('../state-service', () => ({
 
 import { startReviewReceive } from '../review-receive-service';
 import { getItemConfig } from '../item-service';
-import { readJsonl } from '../../lib/jsonl';
+import { appendJsonl, readJsonl } from '../../lib/jsonl';
 import { executeAgent } from '../agent-service';
 import { fetchPrComments } from '../git-pr-service';
 import { deriveRepoStatuses } from '../state-service';
 import { finalizeGeneratedPlan } from '../planner-service';
+import { synchronizeTestPlan } from '../test-planner-service';
 import { existsSync } from 'fs';
 import { rm } from 'fs/promises';
+import { eventBus } from '../event-bus';
 
 const mockGetItemConfig = vi.mocked(getItemConfig);
+const mockAppendJsonl = vi.mocked(appendJsonl);
 const mockReadJsonl = vi.mocked(readJsonl);
 const mockExecuteAgent = vi.mocked(executeAgent);
 const mockFetchPrComments = vi.mocked(fetchPrComments);
 const mockDeriveRepoStatuses = vi.mocked(deriveRepoStatuses);
 const mockFinalizeGeneratedPlan = vi.mocked(finalizeGeneratedPlan);
+const mockSynchronizeTestPlan = vi.mocked(synchronizeTestPlan);
 const mockExistsSync = vi.mocked(existsSync);
 const mockRm = vi.mocked(rm);
+const mockEventBusEmit = vi.mocked(eventBus.emit);
 
 function makeEvent(type: string, extra: Record<string, unknown> = {}): ItemEvent {
   return {
@@ -181,6 +203,42 @@ describe('startReviewReceive', () => {
 
     expect(mockExecuteAgent).toHaveBeenCalledTimes(1);
     expect(mockFinalizeGeneratedPlan).not.toHaveBeenCalled();
+    expect(mockRm).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [
+      'finalizeGeneratedPlan',
+      'finalize failed',
+      () => mockFinalizeGeneratedPlan.mockRejectedValueOnce(new Error('finalize failed')),
+    ],
+    [
+      'synchronizeTestPlan',
+      'sync failed',
+      () => mockSynchronizeTestPlan.mockRejectedValueOnce(new Error('sync failed')),
+    ],
+  ])('records a review_receive error when %s fails after agent success', async (_step, expectedMessage, arrangeFailure) => {
+    arrangeFailure();
+
+    await expect(startReviewReceive('item-1')).rejects.toThrow(expectedMessage);
+
+    const appendedEvents = mockAppendJsonl.mock.calls.map(([, event]) => event as Record<string, unknown>);
+    expect(appendedEvents).toContainEqual(expect.objectContaining({
+      type: 'error',
+      message: expectedMessage,
+      repoName: 'repoA',
+      phase: 'review_receive',
+    }));
+    expect(appendedEvents.some((event) => event.type === 'review_receive_completed')).toBe(false);
+    expect(mockEventBusEmit).toHaveBeenCalledWith('event', expect.objectContaining({
+      itemId: 'item-1',
+      event: expect.objectContaining({
+        type: 'error',
+        message: expectedMessage,
+        repoName: 'repoA',
+        phase: 'review_receive',
+      }),
+    }));
     expect(mockRm).toHaveBeenCalledTimes(1);
   });
 });

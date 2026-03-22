@@ -120,6 +120,32 @@ describe('cleanupOrphanedAgentsForItem - stuck review_receiving detection', () =
     expect(statusChangeEvent.newStatus).toBe('stopped');
   });
 
+  it('detects review_receive stuck after a successful agent exit without completion', async () => {
+    mockReadJsonl.mockResolvedValue([
+      makeEvent('plan_created', { planPath: '/plan.yaml' }),
+      makeEvent('agent_started', { agentId: 'eng1', role: 'engineer', repoName: 'repoA' }),
+      makeEvent('agent_exited', { agentId: 'eng1', exitCode: 0 }),
+      makeEvent('pr_created', { repoName: 'repoA', prUrl: 'http://pr', prNumber: 1 }),
+      makeEvent('review_receive_started', { agentId: 'rr1', repoName: 'repoA', prNumber: 1, prUrl: 'http://pr' }),
+      makeEvent('agent_started', { agentId: 'rr1', role: 'review-receiver', repoName: 'repoA' }),
+      makeEvent('agent_exited', { agentId: 'rr1', exitCode: 0 }),
+      // Server restarted here before review_receive_completed or error was recorded
+    ]);
+
+    await cleanupOrphanedAgentsForItem('item-1');
+
+    const errorCalls = mockAppendJsonl.mock.calls.filter(
+      call => (call[1] as any).type === 'error'
+    );
+    expect(errorCalls).toHaveLength(1);
+    expect(errorCalls[0][1]).toMatchObject({
+      type: 'error',
+      message: 'Review receive agent exited before completion event was recorded',
+      repoName: 'repoA',
+      phase: 'review_receive',
+    });
+  });
+
   it('does not treat review_receive with error as stuck', async () => {
     mockReadJsonl.mockResolvedValue([
       makeEvent('plan_created', { planPath: '/plan.yaml' }),

@@ -193,6 +193,27 @@ ${repoList}
 ${formattedComments}`;
 }
 
+async function emitReviewReceiveError(
+  itemId: string,
+  eventsPath: string,
+  repoName: string,
+  message: string
+): Promise<void> {
+  const errorEvent = createErrorEvent(itemId, message.slice(0, 500), {
+    repoName,
+    phase: 'review_receive',
+  });
+
+  try {
+    await appendJsonl(eventsPath, errorEvent);
+    eventBus.emit('event', { itemId, event: errorEvent });
+  } catch (error) {
+    console.error(
+      `[${itemId}/${repoName}] Failed to record review_receive error event: ${error instanceof Error ? error.message : error}`
+    );
+  }
+}
+
 /**
  * Review Receive プロセスを開始する
  */
@@ -303,9 +324,7 @@ export async function startReviewReceive(
     allPrComments = await fetchPrComments(repoDir, prInfo.prNumber);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const errorEvent = createErrorEvent(itemId, message.slice(0, 500), { repoName: targetRepoName, phase: 'review_receive' });
-    await appendJsonl(eventsPath, errorEvent);
-    eventBus.emit('event', { itemId, event: errorEvent });
+    await emitReviewReceiveError(itemId, eventsPath, targetRepoName, message);
     throw error;
   }
 
@@ -378,24 +397,30 @@ export async function startReviewReceive(
     jsonSchema: role.jsonSchema,
   });
 
-  if (!existsSync(repoPlanPath)) {
-    throw new Error(`Review receiver completed but plan.yaml was not created in repository workspace: ${repoPlanPath}`);
+  try {
+    if (!existsSync(repoPlanPath)) {
+      throw new Error(`Review receiver completed but plan.yaml was not created in repository workspace: ${repoPlanPath}`);
+    }
+
+    await finalizeGeneratedPlan(itemId, config, {
+      allowEmptyTasks: true,
+      sourcePath: repoPlanPath,
+    });
+    await synchronizeTestPlan(itemId, config);
+    await rm(repoPlanPath, { force: true });
+
+    // Record review_receive_completed after successful agent execution
+    const completedEvent = createReviewReceiveCompletedEvent(
+      itemId, agentId, targetRepoName, prInfo.prNumber,
+      commentsCutoffAt, allPrComments.length, newPrComments.length, allPrComments.length - newPrComments.length
+    );
+    await appendJsonl(eventsPath, completedEvent);
+    eventBus.emit('event', { itemId, event: completedEvent });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await emitReviewReceiveError(itemId, eventsPath, targetRepoName, message);
+    throw error;
   }
-
-  await finalizeGeneratedPlan(itemId, config, {
-    allowEmptyTasks: true,
-    sourcePath: repoPlanPath,
-  });
-  await synchronizeTestPlan(itemId, config);
-  await rm(repoPlanPath, { force: true });
-
-  // Record review_receive_completed after successful agent execution
-  const completedEvent = createReviewReceiveCompletedEvent(
-    itemId, agentId, targetRepoName, prInfo.prNumber,
-    commentsCutoffAt, allPrComments.length, newPrComments.length, allPrComments.length - newPrComments.length
-  );
-  await appendJsonl(eventsPath, completedEvent);
-  eventBus.emit('event', { itemId, event: completedEvent });
 
   return { started: true, prNumber: prInfo.prNumber, repoName: targetRepoName };
 }

@@ -390,14 +390,26 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
     }
   }
 
-  // Detect repos stuck in review_receiving (review_receive_started with no agent_started, completion, OR error)
-  // Note: fetchPrComments failure writes an error event before throwing — that case is NOT a stuck repo
-  const rrStates = new Map<string, { startIdx: number; completed: boolean; agentStarted: boolean; hadError: boolean }>();
+  // Detect repos stuck in review_receiving when the review receiver never started
+  // or when it exited successfully but no terminal event was recorded.
+  const rrStates = new Map<string, {
+    startIdx: number;
+    completed: boolean;
+    agentStarted: boolean;
+    agentExitedSuccessfully: boolean;
+    hadError: boolean;
+  }>();
   for (let i = 0; i < events.length; i++) {
     const ev = events[i];
     if (ev.type === 'review_receive_started') {
       const e = ev as import('@agent-orch/shared').ReviewReceiveStartedEvent;
-      rrStates.set(e.repoName, { startIdx: i, completed: false, agentStarted: false, hadError: false });
+      rrStates.set(e.repoName, {
+        startIdx: i,
+        completed: false,
+        agentStarted: false,
+        agentExitedSuccessfully: false,
+        hadError: false,
+      });
     } else if (ev.type === 'review_receive_completed') {
       const e = ev as import('@agent-orch/shared').ReviewReceiveCompletedEvent;
       const s = rrStates.get(e.repoName);
@@ -408,6 +420,16 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
         const s = rrStates.get(e.repoName);
         if (s && i > s.startIdx) s.agentStarted = true;
       }
+    } else if (ev.type === 'agent_exited' && ev.agentId) {
+      const e = ev as import('@agent-orch/shared').AgentExitedEvent;
+      if (e.exitCode !== 0) {
+        continue;
+      }
+      const agent = agents.get(e.agentId);
+      if (agent?.role === 'review-receiver' && agent.repoName) {
+        const s = rrStates.get(agent.repoName);
+        if (s && i > s.startIdx) s.agentExitedSuccessfully = true;
+      }
     } else if (ev.type === 'error') {
       const e = ev as import('@agent-orch/shared').ErrorEvent;
       if (e.repoName) {
@@ -417,9 +439,20 @@ export async function cleanupOrphanedAgentsForItem(itemId: string): Promise<numb
     }
   }
   for (const [repoName, s] of rrStates) {
-    if (!s.completed && !s.agentStarted && !s.hadError) {
+    if (s.completed || s.hadError) {
+      continue;
+    }
+
+    let message: string | null = null;
+    if (!s.agentStarted) {
+      message = 'Server restarted before review receive agent started';
+    } else if (s.agentExitedSuccessfully) {
+      message = 'Review receive agent exited before completion event was recorded';
+    }
+
+    if (message) {
       console.log(`[${itemId}] Cleaning up stuck review_receiving repo: ${repoName}`);
-      const errorEvent = createErrorEvent(itemId, 'Server restarted before review receive agent started', {
+      const errorEvent = createErrorEvent(itemId, message, {
         repoName,
         phase: 'review_receive',
       });
