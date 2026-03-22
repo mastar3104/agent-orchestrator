@@ -19,13 +19,14 @@ import {
   getRepoWorkspaceDir,
 } from '../lib/paths';
 import { eventBus } from './event-bus';
-import { type PlannerResponse } from '../lib/claude-schemas';
 import { getRole } from '../lib/role-loader';
 import { composePlannerRepositoryPrompts } from '../lib/repository-role-prompts';
 import { synchronizeTestPlan } from './test-planner-service';
+import { normalizePlanVerification } from '../lib/verification-policy';
 
 type LegacyPlanTask = PlanTask & { agent?: string };
 type LegacyPlan = Omit<Plan, 'tasks'> & { tasks: LegacyPlanTask[] };
+const PLANNER_SCHEMA_FALLBACK_MODE = 'result_or_empty' as const;
 
 function normalizeTask(task: LegacyPlanTask): PlanTask {
   const { agent: _agent, ...rest } = task;
@@ -40,8 +41,11 @@ function normalizeTask(task: LegacyPlanTask): PlanTask {
 }
 
 export function normalizePlan(plan: LegacyPlan): Plan {
+  const verification = normalizePlanVerification(plan);
   return {
     ...plan,
+    verificationPolicy: verification.verificationPolicy,
+    verificationRationale: verification.verificationRationale,
     tasks: Array.isArray(plan.tasks) ? plan.tasks.map(normalizeTask) : [],
   };
 }
@@ -148,7 +152,7 @@ export async function startPlanner(itemId: string): Promise<void> {
   const addDirs = getPlannerAddDirs(itemId, config);
 
   await archiveCurrentExecutionArtifacts(itemId);
-  await executeAgent<PlannerResponse>({
+  await executeAgent<unknown>({
     itemId,
     role: 'planner',
     prompt: context,
@@ -157,6 +161,7 @@ export async function startPlanner(itemId: string): Promise<void> {
     workingDir: workspaceRoot,
     allowedTools: role.allowedTools,
     jsonSchema: role.jsonSchema,
+    schemaFallbackMode: PLANNER_SCHEMA_FALLBACK_MODE,
   });
 
   await finalizeGeneratedPlan(itemId, config);
@@ -184,7 +189,13 @@ ${config.designDoc || 'No design document provided.'}
 ## Task Rules
 
 Use the \`repository\` field to specify which repository each task belongs to.
-Do not include review tasks or any \`agent\` field in plan.yaml.`;
+Do not include review tasks or any \`agent\` field in plan.yaml.
+Include top-level \`verificationPolicy\` and \`verificationRationale\`.
+
+Choose the strongest applicable verification policy for the whole plan:
+- \`none\`: typo, copy, comments, and other non-behavioral changes
+- \`regression_only\`: behavior changes that need regression coverage but not BDD-level acceptance
+- \`bdd_required\`: cross-repository work, environment-dependent behavior, DB/day-data dependent changes, or behavior where automated tests alone are not sufficient`;
 }
 
 function buildPlannerPrompt(config: ItemConfig): string {
@@ -266,6 +277,14 @@ export async function validatePlan(plan: Plan, itemConfig?: ItemConfig | null): 
 
   if (!plan.itemId) {
     errors.push('Missing itemId field');
+  }
+
+  if (!plan.verificationPolicy) {
+    errors.push('Missing verificationPolicy field');
+  }
+
+  if (!plan.verificationRationale) {
+    errors.push('Missing verificationRationale field');
   }
 
   if (!plan.tasks || !Array.isArray(plan.tasks)) {
@@ -396,7 +415,7 @@ export async function planFeedback(
   const addDirs = getPlannerAddDirs(itemId, config);
 
   await archiveCurrentExecutionArtifacts(itemId);
-  await executeAgent<PlannerResponse>({
+  await executeAgent<unknown>({
     itemId,
     role: 'planner',
     prompt: `${context}\n\n${feedbackSection}`,
@@ -405,6 +424,7 @@ export async function planFeedback(
     workingDir: workspaceRoot,
     allowedTools: role.allowedTools,
     jsonSchema: role.jsonSchema,
+    schemaFallbackMode: PLANNER_SCHEMA_FALLBACK_MODE,
   });
 
   await finalizeGeneratedPlan(itemId, config);

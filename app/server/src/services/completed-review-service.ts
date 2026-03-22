@@ -12,6 +12,7 @@ import type {
   Plan,
   TestPlan,
   AgentInfo,
+  VerificationPolicy,
 } from '@agent-orch/shared';
 
 import { appendJsonl, readJsonl } from '../lib/jsonl';
@@ -28,21 +29,28 @@ import { composeRepositoryRolePrompt, composeWorkspaceRolePrompts } from '../lib
 import {
   createCompletedReviewFindingsExtractedEvent,
   createCompletedReviewPassedEvent,
+  createCompletedReviewSkippedEvent,
   createErrorEvent,
   createHooksExecutedEvent,
   createTasksCompletedEvent,
 } from '../lib/events';
 import {
   type CompletedReviewerResponse,
-  type EngineerResponse,
+  isCompletedReviewerResponse,
+  isEngineerFailureOutput,
 } from '../lib/claude-schemas';
 import { executeAgent, getAgentsByItem } from './agent-service';
 import { getItemConfig } from './item-service';
 import { getPlan } from './planner-service';
-import { ensureApprovedTestPlan, getTestPlan } from './test-planner-service';
+import {
+  ensureApprovedTestPlan,
+  getTestPlan,
+  resolveVerificationPolicy,
+} from './test-planner-service';
 import { createDraftPrsForAllRepos, execGitInRepo } from './git-pr-service';
 import { readRepoTaskState } from './task-state-service';
 import { runShellCommands } from '../lib/command-runner';
+import { isCompletedReviewRequired } from '../lib/verification-policy';
 
 const COMPLETED_REVIEW_MAX_ROUNDS = 3;
 const COMPLETED_REVIEW_TIMEOUT_MS = 20 * 60 * 1000;
@@ -50,11 +58,15 @@ const COMPLETED_REVIEW_FIX_TIMEOUT_MS = 50 * 60 * 1000;
 const MAX_DIFF_LINES = 8000;
 const FIX_TASK_PREFIX = 'completed-review-fix';
 const TASKS_COMPLETED_AGENT_ID = 'system-completed-review';
+const ENGINEER_SCHEMA_FALLBACK_MODE = 'result_or_empty' as const;
+const COMPLETED_REVIEWER_SCHEMA_FALLBACK_MODE = 'result_or_empty' as const;
 
 interface CompletedReviewLoopContext {
   itemConfig: ItemConfig;
   plan: Plan;
   testPlan: TestPlan;
+  verificationPolicy: VerificationPolicy;
+  verificationRationale: string;
 }
 
 interface CompletedReviewRunResult {
@@ -63,6 +75,7 @@ interface CompletedReviewRunResult {
   summary: string;
   findings: CompletedReviewFinding[];
   round: number;
+  invalid?: boolean;
 }
 
 interface EngineerWorktreeState {
@@ -118,6 +131,49 @@ async function emitCompletedReviewError(
   repoName?: string
 ): Promise<void> {
   const event = createErrorEvent(itemId, message, { repoName, phase: 'completed_review' });
+  await appendJsonl(getItemEventsPath(itemId), event);
+  eventBus.emit('event', { itemId, event });
+}
+
+function buildCompletedReviewSkipReason(
+  policy: VerificationPolicy,
+  rationale: string
+): string {
+  return `Completed review skipped for verificationPolicy=${policy}: ${rationale}`;
+}
+
+async function emitCompletedReviewSkipped(
+  itemId: string,
+  policy: VerificationPolicy,
+  rationale: string
+): Promise<void> {
+  const event = createCompletedReviewSkippedEvent(
+    itemId,
+    TASKS_COMPLETED_AGENT_ID,
+    policy,
+    buildCompletedReviewSkipReason(policy, rationale)
+  );
+  await appendJsonl(getItemEventsPath(itemId), event);
+  eventBus.emit('event', { itemId, event });
+}
+
+function summarizeCompletedReviewIssues(errors: string[]): string {
+  return errors.join('; ') || 'unknown validation issue';
+}
+
+async function emitInvalidCompletedReviewRound(
+  itemId: string,
+  agentId: string,
+  round: number,
+  summary: string
+): Promise<void> {
+  const event = createCompletedReviewFindingsExtractedEvent(
+    itemId,
+    agentId,
+    [],
+    summary,
+    round
+  );
   await appendJsonl(getItemEventsPath(itemId), event);
   eventBus.emit('event', { itemId, event });
 }
@@ -325,7 +381,7 @@ async function runCompletedReviewer(
     context.testPlan,
     hookWarningsByRepo
   );
-  const { agent, result } = await executeAgent<CompletedReviewerResponse>({
+  const { agent, result } = await executeAgent<unknown>({
     itemId,
     role: 'completed-reviewer',
     prompt,
@@ -334,16 +390,49 @@ async function runCompletedReviewer(
     workingDir: getWorkspaceRoot(itemId),
     allowedTools: role.allowedTools,
     jsonSchema: role.jsonSchema,
+    schemaFallbackMode: COMPLETED_REVIEWER_SCHEMA_FALLBACK_MODE,
     timeoutMs: COMPLETED_REVIEW_TIMEOUT_MS,
   });
 
-  const response = {
+  if (result.usedSchemaFallback) {
+    console.warn(
+      `[${itemId}] Completed reviewer output failed schema validation; continuing completed review loop with an invalid round.`
+    );
+  }
+
+  if (!isCompletedReviewerResponse(result.output)) {
+    const summary = `Completed reviewer produced invalid output in round ${round}: ${summarizeCompletedReviewIssues(
+      result.schemaValidationErrors || ['schema mismatch or non-structured result']
+    )}`;
+    await emitInvalidCompletedReviewRound(itemId, agent.id, round, summary);
+    return {
+      agentId: agent.id,
+      reviewStatus: 'needs_fixes',
+      summary,
+      findings: [],
+      round,
+      invalid: true,
+    };
+  }
+
+  const response: CompletedReviewerResponse = {
     ...result.output,
-    findings: (result.output.findings || []).map((finding) => normalizeCompletedReviewFinding(finding)),
+    findings: result.output.findings.map((finding) => normalizeCompletedReviewFinding(finding)),
   };
   const errors = validateCompletedReviewResponse(response, context.itemConfig, context.testPlan);
   if (errors.length > 0) {
-    throw new Error(`Completed review validation failed: ${errors.join('; ')}`);
+    const summary = `Completed reviewer output failed validation in round ${round}: ${summarizeCompletedReviewIssues(
+      errors
+    )}`;
+    await emitInvalidCompletedReviewRound(itemId, agent.id, round, summary);
+    return {
+      agentId: agent.id,
+      reviewStatus: 'needs_fixes',
+      summary,
+      findings: [],
+      round,
+      invalid: true,
+    };
   }
 
   if (response.review_status === 'approve') {
@@ -460,7 +549,7 @@ async function executeCompletedReviewFixEngineer(
 
   try {
     const composedPrompt = composeRepositoryRolePrompt(prompt, repo.rolePrompts, 'engineer');
-    const { result } = await executeAgent<EngineerResponse>({
+    const { result } = await executeAgent<unknown>({
       itemId,
       role: 'engineer',
       repoName: repo.name,
@@ -470,10 +559,17 @@ async function executeCompletedReviewFixEngineer(
       workingDir,
       allowedTools: effectiveTools,
       jsonSchema: engineerRole.jsonSchema,
+      schemaFallbackMode: ENGINEER_SCHEMA_FALLBACK_MODE,
       timeoutMs: COMPLETED_REVIEW_FIX_TIMEOUT_MS,
     });
 
-    if (result.output.status !== 'success') {
+    if (result.usedSchemaFallback) {
+      console.warn(
+        `[${itemId}/${repo.name}] Completed review fix engineer output failed schema validation; continuing with fallback result.`
+      );
+    }
+
+    if (isEngineerFailureOutput(result.output)) {
       throw new Error(`Completed review fix engineer reported failure for ${repo.name}`);
     }
 
@@ -576,13 +672,23 @@ async function loadCompletedReviewContext(itemId: string): Promise<CompletedRevi
   if (!plan) {
     throw new Error(`No plan found for item ${itemId}`);
   }
-  const testPlan = await getTestPlan(itemId);
+  const testPlan = await getTestPlan(itemId, plan);
   if (!testPlan) {
     throw new Error(`No test plan found for item ${itemId}`);
   }
   await ensureApprovedTestPlan(itemId);
+  const verification = resolveVerificationPolicy(plan, testPlan);
+  if (!verification) {
+    throw new Error(`Unable to resolve verification policy for item ${itemId}`);
+  }
 
-  return { itemConfig, plan, testPlan };
+  return {
+    itemConfig,
+    plan,
+    testPlan,
+    verificationPolicy: verification.resolvedPolicy,
+    verificationRationale: verification.resolvedRationale,
+  };
 }
 
 async function ensureAllTasksCompleted(itemId: string, plan: Plan): Promise<void> {
@@ -603,6 +709,16 @@ async function publishTasksCompleted(itemId: string): Promise<void> {
 export async function runCompletedReviewFixLoop(itemId: string): Promise<void> {
   const context = await loadCompletedReviewContext(itemId);
   await ensureAllTasksCompleted(itemId, context.plan);
+  if (!isCompletedReviewRequired(context.verificationPolicy)) {
+    await emitCompletedReviewSkipped(
+      itemId,
+      context.verificationPolicy,
+      context.verificationRationale
+    );
+    const targetRepos = new Set(context.plan.tasks.map((task) => task.repository));
+    await createDraftPrsForAllRepos(itemId, targetRepos);
+    return;
+  }
 
   const hookWarningsByRepo = new Map<string, string>();
 
@@ -612,6 +728,20 @@ export async function runCompletedReviewFixLoop(itemId: string): Promise<void> {
       const targetRepos = new Set(context.plan.tasks.map((task) => task.repository));
       await createDraftPrsForAllRepos(itemId, targetRepos);
       return;
+    }
+
+    if (reviewResult.invalid) {
+      if (round >= COMPLETED_REVIEW_MAX_ROUNDS) {
+        const targetRepos = new Set(context.plan.tasks.map((task) => task.repository));
+        await emitCompletedReviewSkipped(
+          itemId,
+          context.verificationPolicy,
+          `Completed reviewer exhausted after ${COMPLETED_REVIEW_MAX_ROUNDS} rounds due to invalid/non-actionable output. Last issue: ${reviewResult.summary}`
+        );
+        await createDraftPrsForAllRepos(itemId, targetRepos);
+        return;
+      }
+      continue;
     }
 
     if (round >= COMPLETED_REVIEW_MAX_ROUNDS) {
@@ -651,6 +781,10 @@ export async function runCompletedReviewFixLoop(itemId: string): Promise<void> {
 }
 
 export async function startCompletedReview(itemId: string): Promise<void> {
+  const state = await getLatestCompletedReview(itemId);
+  if (state.status === 'passed' || state.status === 'skipped') {
+    return;
+  }
   await runCompletedReviewFixLoop(itemId);
 }
 
@@ -674,6 +808,10 @@ export async function getLatestCompletedReview(itemId: string): Promise<Complete
     (event): event is Extract<ItemEvent, { type: 'completed_review_passed' }> =>
       event.type === 'completed_review_passed'
   );
+  const latestSkipped = [...currentCycleEvents].reverse().find(
+    (event): event is Extract<ItemEvent, { type: 'completed_review_skipped' }> =>
+      event.type === 'completed_review_skipped'
+  );
   const latestError = [...currentCycleEvents].reverse().find(
     (event): event is Extract<ItemEvent, { type: 'error' }> =>
       event.type === 'error' && event.phase === 'completed_review'
@@ -688,13 +826,28 @@ export async function getLatestCompletedReview(itemId: string): Promise<Complete
   });
 
   let latestResult: CompletedReviewResult | undefined;
-  if (latestPass && (!latestFindings || latestPass.timestamp >= latestFindings.timestamp)) {
+  if (
+    latestPass &&
+    (!latestFindings || latestPass.timestamp >= latestFindings.timestamp) &&
+    (!latestSkipped || latestPass.timestamp >= latestSkipped.timestamp)
+  ) {
     latestResult = {
       status: 'passed',
       summary: latestPass.summary,
       findings: [],
       round: latestPass.round,
       reviewedAt: latestPass.timestamp,
+    };
+  } else if (
+    latestSkipped &&
+    (!latestFindings || latestSkipped.timestamp >= latestFindings.timestamp)
+  ) {
+    latestResult = {
+      status: 'skipped',
+      summary: latestSkipped.reason,
+      findings: [],
+      round: 0,
+      reviewedAt: latestSkipped.timestamp,
     };
   } else if (latestFindings) {
     latestResult = {
@@ -731,6 +884,9 @@ export async function getLatestCompletedReview(itemId: string): Promise<Complete
   if (latestResult?.status === 'passed') {
     return baseStateFromEvent('passed', latestResult);
   }
+  if (latestResult?.status === 'skipped') {
+    return baseStateFromEvent('skipped', latestResult);
+  }
   if (latestResult?.status === 'needs_fixes') {
     return baseStateFromEvent('needs_fixes', latestResult);
   }
@@ -740,8 +896,10 @@ export async function getLatestCompletedReview(itemId: string): Promise<Complete
 
 export async function ensureCompletedReviewPassed(itemId: string): Promise<CompletedReviewState> {
   const state = await getLatestCompletedReview(itemId);
-  if (state.status !== 'passed') {
-    throw new Error(`Completed review must pass before publish (current status: ${state.status})`);
+  if (state.status !== 'passed' && state.status !== 'skipped') {
+    throw new Error(
+      `Completed review must be satisfied before publish (current status: ${state.status})`
+    );
   }
   return state;
 }
@@ -751,10 +909,20 @@ export async function maybeStartCompletedReviewAfterTasks(itemId: string): Promi
   await ensureAllTasksCompleted(itemId, context.plan);
 
   const completedReview = await getLatestCompletedReview(itemId);
-  if (completedReview.status === 'passed') {
+  if (completedReview.status === 'passed' || completedReview.status === 'skipped') {
     return;
   }
 
   await publishTasksCompleted(itemId);
+  if (!isCompletedReviewRequired(context.verificationPolicy)) {
+    await emitCompletedReviewSkipped(
+      itemId,
+      context.verificationPolicy,
+      context.verificationRationale
+    );
+    const targetRepos = new Set(context.plan.tasks.map((task) => task.repository));
+    await createDraftPrsForAllRepos(itemId, targetRepos);
+    return;
+  }
   await runCompletedReviewFixLoop(itemId);
 }

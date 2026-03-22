@@ -43,6 +43,8 @@ function makeItem(overrides: Partial<ItemDetail> = {}): ItemDetail {
       version: '1',
       itemId: 'ITEM-1',
       summary: 'Plan summary',
+      verificationPolicy: 'bdd_required',
+      verificationRationale: 'Cross-repository behavior needs BDD coverage.',
       createdAt: '2026-01-01T00:00:00Z',
       tasks: [
         {

@@ -65,7 +65,7 @@ describe('item routes', () => {
 
   it('rejects publish before completed review passes', async () => {
     mockEnsureCompletedReviewPassed.mockRejectedValue(
-      new Error('Completed review must pass before publish (current status: needs_fixes)')
+      new Error('Completed review must be satisfied before publish (current status: needs_fixes)')
     );
     const app = buildApp();
 
@@ -77,7 +77,7 @@ describe('item routes', () => {
     expect(res.statusCode).toBe(400);
     expect(res.json()).toEqual({
       success: false,
-      error: 'Completed review must pass before publish (current status: needs_fixes)',
+      error: 'Completed review must be satisfied before publish (current status: needs_fixes)',
     });
     expect(mockCreateDraftPrsForAllRepos).not.toHaveBeenCalled();
   });

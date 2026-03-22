@@ -2,13 +2,16 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import type {
   ItemEvent,
+  ItemDetail,
   ItemWorkflowJob,
   ItemWorkflowSummary,
   ReviewFindingsExtractedEvent,
   TaskProgressPhase,
+  VerificationPolicy,
   WorkflowStageId,
   WorkflowStageStatus,
 } from '@agent-orch/shared';
+import { getVerificationPolicyRank } from '@agent-orch/shared';
 import { useItem } from '../hooks/useItems';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { AgentCard } from '../components/AgentCard';
@@ -49,8 +52,50 @@ const COMPLETED_REVIEW_STATUS_STYLES: Record<string, string> = {
   running: 'bg-amber-500/20 text-amber-200',
   needs_fixes: 'bg-red-500/20 text-red-200',
   passed: 'bg-emerald-500/20 text-emerald-200',
+  skipped: 'bg-sky-500/20 text-sky-200',
   error: 'bg-red-500/20 text-red-200',
 };
+
+function formatVerificationPolicy(policy: VerificationPolicy): string {
+  switch (policy) {
+    case 'none':
+      return 'None';
+    case 'regression_only':
+      return 'Regression Only';
+    case 'bdd_required':
+      return 'BDD Required';
+  }
+}
+
+function resolveVerificationView(item: ItemDetail): {
+  planPolicy: VerificationPolicy;
+  resolvedPolicy: VerificationPolicy;
+  planRationale: string;
+  resolvedRationale: string;
+  promotedByTestPlan: boolean;
+  completedReviewRequired: boolean;
+} | null {
+  if (!item.plan) {
+    return null;
+  }
+
+  const liveTestPlan = item.testPlan && item.testPlanApproval.status !== 'stale'
+    ? item.testPlan
+    : null;
+  const resolvedPolicy = liveTestPlan?.verificationPolicy ?? item.plan.verificationPolicy;
+  const resolvedRationale = liveTestPlan?.verificationRationale ?? item.plan.verificationRationale;
+
+  return {
+    planPolicy: item.plan.verificationPolicy,
+    resolvedPolicy,
+    planRationale: item.plan.verificationRationale,
+    resolvedRationale,
+    promotedByTestPlan:
+      getVerificationPolicyRank(resolvedPolicy) >
+      getVerificationPolicyRank(item.plan.verificationPolicy),
+    completedReviewRequired: resolvedPolicy === 'bdd_required',
+  };
+}
 
 function formatPhase(phase?: TaskProgressPhase): string {
   if (!phase) return '';
@@ -251,6 +296,7 @@ export function ItemDetailPage() {
       event.type === 'test_plan_approved' ||
       event.type === 'completed_review_findings_extracted' ||
       event.type === 'completed_review_passed' ||
+      event.type === 'completed_review_skipped' ||
       event.type === 'hooks_executed' ||
       event.type === 'review_receive_started' ||
       event.type === 'review_receive_completed' ||
@@ -359,6 +405,7 @@ export function ItemDetailPage() {
     (item.status === 'ready' ||
       (item.status === 'error' && !!item.plan));
   const testPlanScenarios = item.testPlan?.scenarios ?? [];
+  const verificationView = resolveVerificationView(item);
 
   // Error repos for partial re-run
   const failedRepos = item.repos?.filter(r => r.status === 'error').map(r => r.repoName) ?? [];
@@ -371,9 +418,11 @@ export function ItemDetailPage() {
     item.workflow.overall.totalSteps > 0 &&
     item.workflow.overall.completedSteps === item.workflow.overall.totalSteps;
   const canStartCompletedReview =
+    verificationView?.completedReviewRequired === true &&
     allWorkflowStepsCompleted &&
     item.completedReview.status !== 'running' &&
-    item.completedReview.status !== 'passed';
+    item.completedReview.status !== 'passed' &&
+    item.completedReview.status !== 'skipped';
 
   // "Review Receive (All)" only shown for single-PR items
   const prRepos = item.repos?.filter(r => r.prUrl) ?? [];
@@ -706,6 +755,16 @@ export function ItemDetailPage() {
               <p className="text-sm text-gray-400">
                 {item.plan.tasks.length} tasks
               </p>
+              {verificationView && (
+                <div className="mt-3 space-y-1">
+                  <p className="text-xs text-gray-400">
+                    Verification Policy: <span className="text-gray-200">{formatVerificationPolicy(verificationView.planPolicy)}</span>
+                  </p>
+                  <p className="text-xs text-gray-500">
+                    {verificationView.planRationale}
+                  </p>
+                </div>
+              )}
             </div>
             <button
               onClick={handleOpenPlanEditor}
@@ -871,6 +930,21 @@ export function ItemDetailPage() {
               <p className="text-sm text-gray-400">
                 {item.testPlan?.scenarios.length ?? 0} scenarios
               </p>
+              {verificationView && (
+                <div className="mt-3 space-y-1">
+                  <p className="text-xs text-gray-400">
+                    Resolved Policy: <span className="text-gray-200">{formatVerificationPolicy(verificationView.resolvedPolicy)}</span>
+                  </p>
+                  <p className="text-xs text-gray-500">
+                    {verificationView.resolvedRationale}
+                  </p>
+                </div>
+              )}
+              {verificationView?.promotedByTestPlan && item.testPlanApproval.status !== 'stale' && (
+                <p className="text-xs text-amber-300 mt-2">
+                  Test Planner promoted verification from {formatVerificationPolicy(verificationView.planPolicy)} to {formatVerificationPolicy(verificationView.resolvedPolicy)}.
+                </p>
+              )}
               {item.testPlanApproval.status === 'stale' && (
                 <p className="text-xs text-yellow-300 mt-2">
                   This test plan is stale for the current live plan. Regenerate or edit it before approval.
@@ -1073,6 +1147,13 @@ export function ItemDetailPage() {
               <p className="text-sm text-gray-400">
                 Round {item.completedReview.round || 0} · {item.completedReview.findings.length} findings
               </p>
+              {verificationView && (
+                <p className="text-xs text-gray-500 mt-2">
+                  {verificationView.completedReviewRequired
+                    ? `Completed review is required for ${formatVerificationPolicy(verificationView.resolvedPolicy)}.`
+                    : `Completed review is not required for ${formatVerificationPolicy(verificationView.resolvedPolicy)}.`}
+                </p>
+              )}
               {item.completedReview.errorMessage && (
                 <p className="text-xs text-red-300 mt-2">{item.completedReview.errorMessage}</p>
               )}

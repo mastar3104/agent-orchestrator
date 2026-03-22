@@ -128,6 +128,8 @@ describe('test plan routes', () => {
       itemId: 'item-1',
       planFingerprint: 'plan:T1',
       summary: 'Test plan',
+      verificationPolicy: 'bdd_required',
+      verificationRationale: 'Cross-repository behavior needs BDD coverage.',
       createdAt: '2026-01-01T00:00:00Z',
       scenarios: [
         {
@@ -147,6 +149,8 @@ describe('test plan routes', () => {
         itemId: 'item-1',
         planFingerprint: 'plan:T1',
         summary: 'Updated',
+        verificationPolicy: 'none',
+        verificationRationale: 'No behavior-level validation is required.',
         createdAt: '2026-01-01T00:00:00Z',
         scenarios: [],
       },

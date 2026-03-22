@@ -27,7 +27,8 @@ import {
 } from '../lib/events';
 import type { HookResult } from '@agent-orch/shared';
 import {
-  type EngineerResponse,
+  isEngineerFailureOutput,
+  isReviewerResponse,
   type ReviewerResponse,
   type ReviewComment,
 } from '../lib/claude-schemas';
@@ -53,6 +54,8 @@ const REVIEW_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const ENGINEER_TIMEOUT_MS = 50 * 60 * 1000; // 50 minutes
 const AGENT_MAX_RETRIES = 2;
 const HOOK_TIMEOUT_MS = COMMAND_TIMEOUT_MS;
+const ENGINEER_SCHEMA_FALLBACK_MODE = 'result_or_empty' as const;
+const REVIEWER_SCHEMA_FALLBACK_MODE = 'result_or_empty' as const;
 
 export class WorkerStartValidationError extends Error {
   constructor(message: string) {
@@ -190,7 +193,7 @@ async function executeSuccessfulEngineerAttempt(
     'engineer'
   );
 
-  const { result } = await executeAgent<EngineerResponse>({
+  const { result } = await executeAgent<unknown>({
     itemId: options.itemId,
     role: 'engineer',
     repoName: options.repoName,
@@ -200,12 +203,19 @@ async function executeSuccessfulEngineerAttempt(
     workingDir: options.workingDir,
     allowedTools: options.allowedTools,
     jsonSchema: options.jsonSchema,
+    schemaFallbackMode: ENGINEER_SCHEMA_FALLBACK_MODE,
     resumeSessionId,
     emitErrorEvent,
     timeoutMs: options.timeoutMs,
   });
 
-  if (result.output.status !== 'success') {
+  if (result.usedSchemaFallback) {
+    console.warn(
+      `[${options.itemId}/${options.repoName}] Engineer output failed schema validation; continuing with fallback result.`
+    );
+  }
+
+  if (isEngineerFailureOutput(result.output)) {
     throw new Error(`[${options.itemId}/${options.repoName}] Engineer reported failure`);
   }
 
@@ -934,6 +944,36 @@ async function runFinalNonFatalHooksPass(
   return { state: currentState, exhausted: !allPassed, hookResults };
 }
 
+async function completeTaskAfterReviewExhaustion(
+  itemId: string,
+  repo: ItemRepositoryConfig,
+  task: PlanTask,
+  agentWorkdir: string,
+  reviewRound: number
+): Promise<{ state: RepoTaskStateFile; errorMessage?: string; shouldAbortRun?: boolean }> {
+  let finalHooks: HooksPhaseResult;
+  try {
+    finalHooks = await runFinalNonFatalHooksPass(
+      itemId,
+      repo,
+      task,
+      agentWorkdir,
+      reviewRound
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const failure = await failTaskWithError(itemId, repo.name, task.id, 'hooks', message);
+    return { state: failure.state, errorMessage: failure.errorMessage, shouldAbortRun: false };
+  }
+
+  const finalHead = await getGitHead(agentWorkdir);
+  const state = await markTaskCompleted(itemId, repo.name, task.id, finalHead, {
+    reviewExhausted: true,
+    hooksExhausted: finalHooks.exhausted,
+  });
+  return { state };
+}
+
 async function runTaskReviewPhase(
   itemId: string,
   plan: Plan,
@@ -1000,10 +1040,12 @@ async function runTaskReviewPhase(
       'reviewer'
     );
     let reviewResponse: ReviewerResponse | null = null;
+    let reviewUsedSchemaFallback = false;
+    let reviewSchemaValidationErrors: string[] | undefined;
     let reviewError = 'Reviewer failed';
     for (let attempt = 0; attempt <= AGENT_MAX_RETRIES; attempt++) {
       try {
-        const { result: reviewResult } = await executeAgent<ReviewerResponse>({
+        const { result: reviewResult } = await executeAgent<unknown>({
           itemId,
           role: 'review',
           repoName: repo.name,
@@ -1013,9 +1055,19 @@ async function runTaskReviewPhase(
           workingDir: agentWorkdir,
           allowedTools: reviewerRole.allowedTools,
           jsonSchema: reviewerRole.jsonSchema,
+          schemaFallbackMode: REVIEWER_SCHEMA_FALLBACK_MODE,
           timeoutMs: REVIEW_TIMEOUT_MS,
         });
-        reviewResponse = reviewResult.output;
+        reviewUsedSchemaFallback = !!reviewResult.usedSchemaFallback;
+        reviewSchemaValidationErrors = reviewResult.schemaValidationErrors;
+        if (reviewResult.usedSchemaFallback) {
+          console.warn(
+            `[${itemId}/${repo.name}] Reviewer output failed schema validation; advancing review loop if structured review is unavailable.`
+          );
+        }
+        if (isReviewerResponse(reviewResult.output)) {
+          reviewResponse = reviewResult.output;
+        }
         break;
       } catch (error) {
         reviewError = error instanceof Error ? error.message : String(error);
@@ -1028,7 +1080,7 @@ async function runTaskReviewPhase(
       }
     }
 
-    if (!reviewResponse) {
+    if (!reviewResponse && !reviewUsedSchemaFallback) {
       const failure = await failTaskWithError(
         itemId,
         repo.name,
@@ -1037,6 +1089,33 @@ async function runTaskReviewPhase(
         `Review failed for ${repo.name} during task ${task.id}: ${reviewError}`
       );
       return { state: failure.state, errorMessage: failure.errorMessage, shouldAbortRun: true };
+    }
+
+    if (!reviewResponse) {
+      const fallbackRound = (taskStateAfterHooks.reviewRounds || 0) + 1;
+      const fallbackErrors = (reviewSchemaValidationErrors || []).join('; ') || 'unknown schema mismatch';
+      const findingsEvent = createReviewFindingsExtractedEvent(
+        itemId,
+        `review-${repo.name}-${task.id}-cycle${fallbackRound}`,
+        repo.name,
+        [],
+        'needs_fixes',
+        `Reviewer output did not match schema in round ${fallbackRound}; advancing without structured findings. ${fallbackErrors}`
+      );
+      await appendJsonl(getItemEventsPath(itemId), findingsEvent);
+      eventBus.publish(itemId, findingsEvent);
+
+      currentState = await incrementTaskReviewRounds(itemId, repo.name, task.id);
+      if (fallbackRound >= MAX_FEEDBACK_ROUNDS) {
+        return completeTaskAfterReviewExhaustion(
+          itemId,
+          repo,
+          task,
+          agentWorkdir,
+          fallbackRound
+        );
+      }
+      continue;
     }
 
     const comments = reviewResponse.comments ?? [];
@@ -1138,28 +1217,13 @@ async function runTaskReviewPhase(
 
     if (isFinalFeedbackRound) {
       const finalTaskState = getRepoTaskEntry(currentState, task.id);
-      let finalHooks: HooksPhaseResult;
-      try {
-        finalHooks = await runFinalNonFatalHooksPass(
-          itemId,
-          repo,
-          task,
-          agentWorkdir,
-          finalTaskState.reviewRounds || 0
-        );
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const failure = await failTaskWithError(itemId, repo.name, task.id, 'hooks', message);
-        return { state: failure.state, errorMessage: failure.errorMessage, shouldAbortRun: false };
-      }
-
-      currentState = finalHooks.state;
-      const finalHead = await getGitHead(agentWorkdir);
-      currentState = await markTaskCompleted(itemId, repo.name, task.id, finalHead, {
-        reviewExhausted: true,
-        hooksExhausted: finalHooks.exhausted,
-      });
-      return { state: currentState };
+      return completeTaskAfterReviewExhaustion(
+        itemId,
+        repo,
+        task,
+        agentWorkdir,
+        finalTaskState.reviewRounds || 0
+      );
     }
   }
 }

@@ -109,8 +109,10 @@ export async function deriveRepoStatuses(itemId: string): Promise<Map<string, Re
   // Track review_receive state for restore logic
   const reviewReceivePreStates = new Map<string, RepoDerivedState>();
   const reviewReceivingRepos = new Set<string>();
-  const hasCompletedReviewPassInCurrentCycle = events.some(
-    (event, index) => index > lastPlanCreatedIdx && event.type === 'completed_review_passed'
+  const hasCompletedReviewSatisfiedInCurrentCycle = events.some(
+    (event, index) =>
+      index > lastPlanCreatedIdx &&
+      (event.type === 'completed_review_passed' || event.type === 'completed_review_skipped')
   );
 
   // Process events in order
@@ -367,7 +369,7 @@ export async function deriveRepoStatuses(itemId: string): Promise<Map<string, Re
     events,
     repoStates,
     currentPlanRepos,
-    hasCompletedReviewPassInCurrentCycle
+    hasCompletedReviewSatisfiedInCurrentCycle
   );
 
   return repoStates;
@@ -378,7 +380,7 @@ async function overlayExecutionStateFromTaskState(
   events: ItemEvent[],
   repoStates: Map<string, RepoDerivedState>,
   currentPlanRepos: Set<string> | null,
-  hasCompletedReviewPass: boolean
+  hasCompletedReviewSatisfied: boolean
 ): Promise<void> {
   if (!currentPlanRepos || currentPlanRepos.size === 0) {
     return;
@@ -417,7 +419,7 @@ async function overlayExecutionStateFromTaskState(
       repoState,
       persistedState,
       hasStaleExecutionStop(events, repoName),
-      hasCompletedReviewPass,
+      hasCompletedReviewSatisfied,
       allExecutionCompleted
     );
   }
@@ -427,7 +429,7 @@ function applyExecutionStateFromTaskState(
   repoState: RepoDerivedState,
   taskState: RepoTaskStateFile,
   interruptedExecutionStopped: boolean,
-  hasCompletedReviewPass: boolean,
+  hasCompletedReviewSatisfied: boolean,
   allExecutionCompleted: boolean
 ): void {
   if (repoState.status === 'review_receiving' || repoState.activePhase === 'review_receive') {
@@ -482,7 +484,7 @@ function applyExecutionStateFromTaskState(
 
   if (allExecutionCompleted) {
     repoState.status = 'running';
-    repoState.activePhase = hasCompletedReviewPass ? 'pr' : 'completed_review';
+    repoState.activePhase = hasCompletedReviewSatisfied ? 'pr' : 'completed_review';
   } else {
     repoState.status = 'completed';
     repoState.activePhase = undefined;

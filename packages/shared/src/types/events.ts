@@ -1,5 +1,5 @@
 import type { TaskExecutionStatus, TaskProgressPhase } from './item';
-import type { CompletedReviewFinding } from './plan';
+import type { CompletedReviewFinding, VerificationPolicy } from './plan';
 
 export type EventType =
   | 'agent_started'
@@ -12,6 +12,7 @@ export type EventType =
   | 'test_plan_approved'
   | 'completed_review_findings_extracted'
   | 'completed_review_passed'
+  | 'completed_review_skipped'
   | 'approval_requested'
   | 'approval_decision'
   | 'git_snapshot'
@@ -105,6 +106,13 @@ export interface CompletedReviewPassedEvent extends BaseEvent {
   agentId: string;
   summary: string;
   round: number;
+}
+
+export interface CompletedReviewSkippedEvent extends BaseEvent {
+  type: 'completed_review_skipped';
+  agentId: string;
+  policy: VerificationPolicy;
+  reason: string;
 }
 
 export type ApprovalTool = 'bash' | 'read' | 'write' | 'edit' | 'unknown';
@@ -346,6 +354,7 @@ export type ItemEvent =
   | TestPlanApprovedEvent
   | CompletedReviewFindingsExtractedEvent
   | CompletedReviewPassedEvent
+  | CompletedReviewSkippedEvent
   | StatusChangedEvent
   | ErrorEvent
   | PrCreatedEvent

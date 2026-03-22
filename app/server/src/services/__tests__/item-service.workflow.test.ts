@@ -3,6 +3,7 @@ import type {
   AgentInfo,
   ItemConfig,
   ItemEvent,
+  TestPlan,
   TestPlanApprovalState,
   Plan,
   PrCreatedEvent,
@@ -27,11 +28,17 @@ function makeConfig(repos: Array<{ name: string; type?: 'remote' | 'local' }> = 
   };
 }
 
-function makePlan(tasks: Array<{ id: string; repository: string; title?: string }>): Plan {
+function makePlan(
+  tasks: Array<{ id: string; repository: string; title?: string }>,
+  verificationPolicy: Plan['verificationPolicy'] = 'bdd_required',
+  verificationRationale = 'Cross-repository behavior needs BDD coverage.'
+): Plan {
   return {
     version: '1',
     itemId: 'ITEM-1',
     summary: 'summary',
+    verificationPolicy,
+    verificationRationale,
     createdAt: '2026-01-01T00:00:00Z',
     tasks: tasks.map((task) => ({
       id: task.id,
@@ -41,6 +48,44 @@ function makePlan(tasks: Array<{ id: string; repository: string; title?: string 
       dependencies: [],
       files: [],
     })),
+  };
+}
+
+function makeTestPlan(
+  verificationPolicy: TestPlan['verificationPolicy'],
+  verificationRationale: string
+): TestPlan {
+  return {
+    version: '1.0',
+    itemId: 'ITEM-1',
+    planFingerprint: 'fingerprint',
+    summary: 'test plan',
+    verificationPolicy,
+    verificationRationale,
+    createdAt: '2026-01-01T00:00:00Z',
+    scenarios: verificationPolicy === 'bdd_required'
+      ? [
+          {
+            id: 'S1',
+            kind: 'bdd',
+            title: 'BDD scenario',
+            repositories: ['repo-a'],
+            given: 'given',
+            when: 'when',
+            then: 'then',
+          },
+        ]
+      : [
+          {
+            id: 'S1',
+            kind: 'regression',
+            title: 'Regression scenario',
+            repositories: ['repo-a'],
+            given: 'given',
+            when: 'when',
+            then: 'then',
+          },
+        ],
   };
 }
 
@@ -90,12 +135,14 @@ function buildSummary(params: {
   noChangesEvents?: RepoNoChangesEvent[];
   taskStates?: Map<string, RepoTaskStateFile>;
   config?: ItemConfig;
+  testPlan?: TestPlan | null;
   testPlanApproval?: TestPlanApprovalState;
 }) {
   return buildWorkflowSummary({
     config: params.config || makeConfig(),
     itemStatus: params.itemStatus || 'created',
     plan: params.plan ?? null,
+    testPlan: params.testPlan ?? null,
     testPlanApproval: params.testPlanApproval || { status: 'missing' },
     events: params.events || [],
     agents: params.agents || [],
@@ -279,6 +326,40 @@ describe('buildWorkflowSummary', () => {
       expect.objectContaining({
         status: 'running',
         activeStage: 'completed_review',
+      })
+    );
+  });
+
+  it('treats completed review as completed when resolved policy is regression_only', () => {
+    const summary = buildSummary({
+      itemStatus: 'running',
+      plan: makePlan(
+        [{ id: 'T1', repository: 'repo-a', title: 'Task 1' }],
+        'regression_only',
+        'Single-repository behavior change needs regression coverage.'
+      ),
+      testPlan: makeTestPlan(
+        'regression_only',
+        'Single-repository behavior change needs regression coverage.'
+      ),
+      testPlanApproval: {
+        status: 'approved',
+        planFingerprint: 'fingerprint',
+        testPlanFingerprint: 'tp-1',
+      },
+      repoStatuses: new Map([['repo-a', makeRepoState({ status: 'running', inCurrentPlan: true })]]),
+      taskStates: new Map([
+        ['repo-a', makeTaskState('repo-a', [{ id: 'T1', title: 'Task 1', status: 'completed', attempts: 1 }])],
+      ]),
+    });
+
+    expect(getStageStatus(summary, 'execution')).toBe('completed');
+    expect(getStageStatus(summary, 'completed_review')).toBe('completed');
+    expect(getStageStatus(summary, 'publish')).toBe('running');
+    expect(summary.jobs[0]).toEqual(
+      expect.objectContaining({
+        status: 'running',
+        activeStage: 'publish',
       })
     );
   });

@@ -69,6 +69,9 @@ Item 作成 → リポジトリ clone/link → Planner Agent → plan.yaml 生�
                                                  │  (最大3回)      │
                                                  └───────┬───────┘
                                                          │
+                                      verificationPolicy を評価
+                              (`bdd_required` のときだけ Completed Review)
+                                                         │
                                                    Draft PR 作成
                                                    (gh CLI 経由)
                                                          │
@@ -208,6 +211,8 @@ created → cloning → planning → ready → running → completed | error
 version: "1.0"
 itemId: "ITEM-xxxxx"
 summary: "実装計画の概要"
+verificationPolicy: "bdd_required"
+verificationRationale: "複数 repository を跨ぐ変更で、BDD ベースの受入確認が必要"
 tasks:
   - id: "task-1"
     title: "API エンドポイント作成"
@@ -219,6 +224,10 @@ tasks:
 
 `plan.yaml` は implementation task のみを表し、review task は含めない。
 
+- `verificationPolicy` は plan 全体の受入保証レベルを表す
+- 値は `none` / `regression_only` / `bdd_required`
+- `verificationRationale` には、そのレベルが必要な理由を記録する
+
 ### Test Plan / TestApprove
 
 `test-plan.yaml` は、現在の `plan.yaml` に対する振る舞いベースの検証観点を表す。`TestPlanner` はコードを変更せず、このファイルだけを生成・更新する。
@@ -228,6 +237,8 @@ version: "1.0"
 itemId: "ITEM-xxxxx"
 planFingerprint: "<current plan fingerprint>"
 summary: "テスト計画の概要"
+verificationPolicy: "bdd_required"
+verificationRationale: "環境依存の挙動を含むため BDD での受入確認が必要"
 scenarios:
   - id: "scenario-1"
     kind: "bdd"
@@ -240,6 +251,10 @@ scenarios:
 
 - 各 scenario は `kind: bdd` または `kind: regression` のどちらかを使う
 - `repositories` には、その scenario に関係する repository 名を 1 つ以上入れる
+- `TestPlanner` は plan の `verificationPolicy` を引き継ぐか、より強いレベルへ昇格できるが、弱めることはできない
+- `verificationPolicy: none` の test plan は `scenarios: []` 必須で、自動承認される
+- `verificationPolicy: regression_only` の test plan は `kind: regression` のみを含み、手動承認が必要
+- `verificationPolicy: bdd_required` の test plan は少なくとも 1 件の `kind: bdd` を含み、手動承認が必要
 - Planner 完了後、Plan Feedback 後、手動 `plan.yaml` 更新後、Review Receive による plan 再生成後に、現在の plan と同期する `test-plan.yaml` が再生成される
 - `POST /items/:id/test-planner/start` でも手動再生成できる
 - `POST /items/:id/test-plan/approve` が `Approve Test Plan` に相当し、現在の `plan.yaml` と `test-plan.yaml` の組み合わせに対して承認イベントを記録する
@@ -257,7 +272,8 @@ Worker の起動時、以下の流れで処理される:
 
 1. **Task Execution** — `plan.yaml` の task を依存関係を見ながら 1 件ずつ直列実行。Engineer が task を実装しコミット
 2. **Task Review Loop** — 各 task の直後に hooks と reviewer を実行し、`approve` されるまで同じ task を修正し続ける。hooks は通常の engineer 後も review-fix 後も走り、失敗して retry を使い切っても task failure にはせず `hooks exhausted` warning として reviewer へ進む。`request_changes` は最大 3 回まで feedback fix を試し、最後の review-fix が終わった時点で再度 reviewer は起動せず、その直後に hooks を 1 回だけ流して task を完了させる。そこで hooks が失敗しても `review exhausted` / `hooks exhausted` warning 付きの completed として次へ進む
-3. **Push & PR** — その repository の task がすべて完了したら `gh` CLI で Draft PR を作成
+3. **Completed Review / Skip** — 全 task 完了後、resolved `verificationPolicy` が `bdd_required` の場合のみ Completed Review を実行する。`none` / `regression_only` の場合は `completed_review_skipped` を記録して publish へ進む
+4. **Push & PR** — publish 条件を満たしたら `gh` CLI で Draft PR を作成
 
 ### Git 差分管理
 
@@ -311,6 +327,7 @@ Planner が生成した `plan.yaml` に対して、タスク単位でフィー�
 - **手動編集**: `PUT /items/:id/test-plan` で YAML を直接更新できる。保存後は承認を取り直す
 - **承認**: `POST /items/:id/test-plan/approve` で現在の `planFingerprint` と `testPlanFingerprint` の組に対して承認を記録する
 - **前提条件**: `stale` 状態の test plan は承認できない
+- **Completed Review**: resolved policy が `bdd_required` のときだけ必須。`none` / `regression_only` では skip 扱いで publish できる
 
 ### Repository Setup Commands
 
