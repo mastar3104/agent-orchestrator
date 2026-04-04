@@ -16,6 +16,10 @@ export const GLOBAL_ROLE_TOOL_KEYS = [
   'completedReviewer',
   'engineer',
   'reviewer',
+  'architectureReviewer',
+  'securityReviewer',
+  'testingReviewer',
+  'requirementsReviewer',
   'reviewReceiver',
 ] as const;
 

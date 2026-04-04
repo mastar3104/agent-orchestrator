@@ -250,6 +250,28 @@ export interface RepoNoChangesEvent extends BaseEvent {
   repoName: string;
 }
 
+export type ReviewPerspective =
+  | 'architecture'
+  | 'security'
+  | 'testing'
+  | 'requirements';
+
+export type ReviewPerspectiveStatus =
+  | 'approve'
+  | 'request_changes'
+  | 'error'
+  | 'schema_fallback';
+
+export interface ReviewPerspectiveSummary {
+  perspective: ReviewPerspective;
+  status: ReviewPerspectiveStatus;
+  summary: string;
+  agentId: string;
+  criticalCount: number;
+  majorCount: number;
+  minorCount: number;
+}
+
 export interface ReviewFinding {
   severity: 'critical' | 'major' | 'minor';
   file: string;
@@ -257,6 +279,7 @@ export interface ReviewFinding {
   description: string;
   suggestedFix: string;
   targetAgent: string;
+  perspective?: ReviewPerspective;
 }
 
 export interface ReviewFindingsExtractedEvent extends BaseEvent {
@@ -264,6 +287,7 @@ export interface ReviewFindingsExtractedEvent extends BaseEvent {
   agentId: string;
   repoName: string;
   findings: ReviewFinding[];
+  perspectives?: ReviewPerspectiveSummary[];
   overallAssessment: 'pass' | 'needs_fixes';
   summary: string;
   criticalCount: number;

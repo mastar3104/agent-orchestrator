@@ -39,6 +39,7 @@ export interface AgentOutput {
 
 export interface AgentExecutionOutput {
   prompt: string;
+  systemPrompt?: string;
   stdout: string;
   stderr: string;
   parsedOutput: unknown;

@@ -31,6 +31,7 @@ import type {
   RepoNoChangesEvent,
   AgentRole,
   ReviewFinding,
+  ReviewPerspectiveSummary,
   CompletedReviewFinding,
   VerificationPolicy,
   ReviewFindingsExtractedEvent,
@@ -504,7 +505,8 @@ export function createReviewFindingsExtractedEvent(
   repoName: string,
   findings: ReviewFinding[],
   overallAssessment: 'pass' | 'needs_fixes',
-  summary: string
+  summary: string,
+  perspectives?: ReviewPerspectiveSummary[]
 ): ReviewFindingsExtractedEvent {
   const criticalCount = findings.filter(f => f.severity === 'critical').length;
   const majorCount = findings.filter(f => f.severity === 'major').length;
@@ -518,6 +520,7 @@ export function createReviewFindingsExtractedEvent(
     agentId,
     repoName,
     findings,
+    perspectives,
     overallAssessment,
     summary,
     criticalCount,
