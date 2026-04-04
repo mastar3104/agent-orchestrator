@@ -29,6 +29,10 @@ describe('role-loader', () => {
       'completedReviewer',
       'engineer',
       'reviewer',
+      'architectureReviewer',
+      'securityReviewer',
+      'testingReviewer',
+      'requirementsReviewer',
       'reviewReceiver',
     ]);
 

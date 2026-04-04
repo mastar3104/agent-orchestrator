@@ -12,6 +12,10 @@ const EDITABLE_ROLE_PROMPT_KEYS: EditableRolePromptKey[] = [
   'planner',
   'engineer',
   'reviewer',
+  'architectureReviewer',
+  'securityReviewer',
+  'testingReviewer',
+  'requirementsReviewer',
   'reviewReceiver',
   'testPlanner',
   'completedReviewer',
@@ -23,6 +27,10 @@ const GLOBAL_ROLE_TOOL_KEYS = [
   'completedReviewer',
   'engineer',
   'reviewer',
+  'architectureReviewer',
+  'securityReviewer',
+  'testingReviewer',
+  'requirementsReviewer',
   'reviewReceiver',
 ] as const;
 

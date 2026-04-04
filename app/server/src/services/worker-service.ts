@@ -5,6 +5,10 @@ import type {
   PlanTask,
   AgentRole,
   ItemRepositoryConfig,
+  ReviewFinding,
+  ReviewPerspective,
+  ReviewPerspectiveStatus,
+  ReviewPerspectiveSummary,
   StartWorkersMode,
   TaskProgressPhase,
 } from '@agent-orch/shared';
@@ -30,7 +34,6 @@ import {
   isEngineerFailureOutput,
   isReviewerResponse,
   type ReviewerResponse,
-  type ReviewComment,
 } from '../lib/claude-schemas';
 import { getRole, mergeAllowedTools } from '../lib/role-loader';
 import { composeRepositoryRolePrompt } from '../lib/repository-role-prompts';
@@ -56,6 +59,83 @@ const AGENT_MAX_RETRIES = 2;
 const HOOK_TIMEOUT_MS = COMMAND_TIMEOUT_MS;
 const ENGINEER_SCHEMA_FALLBACK_MODE = 'result_or_empty' as const;
 const REVIEWER_SCHEMA_FALLBACK_MODE = 'result_or_empty' as const;
+const REVIEW_PERSPECTIVE_RUN_ORDER: ReviewPerspective[] = [
+  'architecture',
+  'security',
+  'testing',
+  'requirements',
+];
+const REVIEW_PERSPECTIVE_FEEDBACK_ORDER: ReviewPerspective[] = [
+  'security',
+  'requirements',
+  'architecture',
+  'testing',
+];
+
+type ReviewPerspectiveRoleKey =
+  | 'reviewer'
+  | 'architectureReviewer'
+  | 'securityReviewer'
+  | 'testingReviewer'
+  | 'requirementsReviewer';
+
+interface ReviewPerspectiveConfig {
+  perspective: ReviewPerspective;
+  roleName: ReviewPerspectiveRoleKey;
+  promptKey: ReviewPerspectiveRoleKey;
+  label: string;
+}
+
+interface ReviewPerspectiveExecutionResult {
+  perspective: ReviewPerspective;
+  status: ReviewPerspectiveStatus;
+  findings: ReviewFinding[];
+  summary: string;
+  agentId: string;
+  hasStructuredSignal: boolean;
+  detail?: string;
+}
+
+interface ReviewCycleResult {
+  findings: ReviewFinding[];
+  overallAssessment: 'pass' | 'needs_fixes';
+  summary: string;
+  perspectives?: ReviewPerspectiveSummary[];
+  feedbackFiles: string[];
+  hardFailureMessage?: string;
+  skipFeedbackFix?: boolean;
+}
+
+const REVIEW_PERSPECTIVE_CONFIGS: ReviewPerspectiveConfig[] = [
+  {
+    perspective: 'architecture',
+    roleName: 'architectureReviewer',
+    promptKey: 'architectureReviewer',
+    label: 'Architecture',
+  },
+  {
+    perspective: 'security',
+    roleName: 'securityReviewer',
+    promptKey: 'securityReviewer',
+    label: 'Security',
+  },
+  {
+    perspective: 'testing',
+    roleName: 'testingReviewer',
+    promptKey: 'testingReviewer',
+    label: 'Testing',
+  },
+  {
+    perspective: 'requirements',
+    roleName: 'requirementsReviewer',
+    promptKey: 'requirementsReviewer',
+    label: 'Requirements',
+  },
+];
+
+const REVIEW_PERSPECTIVE_LABELS: Record<ReviewPerspective, string> = Object.fromEntries(
+  REVIEW_PERSPECTIVE_CONFIGS.map((config) => [config.perspective, config.label])
+) as Record<ReviewPerspective, string>;
 
 export class WorkerStartValidationError extends Error {
   constructor(message: string) {
@@ -71,6 +151,435 @@ function getRoleDescription(role: string): string {
     'review-receiver': 'Receiving and processing PR review comments',
   };
   return descriptions[role] || `${role} development`;
+}
+
+function getReviewPerspectiveConfig(
+  perspective: ReviewPerspective
+): ReviewPerspectiveConfig {
+  const config = REVIEW_PERSPECTIVE_CONFIGS.find(
+    (candidate) => candidate.perspective === perspective
+  );
+  if (!config) {
+    throw new Error(`Unknown review perspective: ${perspective}`);
+  }
+  return config;
+}
+
+function getSeverityRank(severity: ReviewFinding['severity']): number {
+  switch (severity) {
+    case 'critical':
+      return 0;
+    case 'major':
+      return 1;
+    case 'minor':
+      return 2;
+  }
+}
+
+export function sortReviewFindings(findings: ReviewFinding[]): ReviewFinding[] {
+  return [...findings].sort((left, right) => {
+    const severityDiff = getSeverityRank(left.severity) - getSeverityRank(right.severity);
+    if (severityDiff !== 0) {
+      return severityDiff;
+    }
+
+    const perspectiveLeft = left.perspective
+      ? REVIEW_PERSPECTIVE_FEEDBACK_ORDER.indexOf(left.perspective)
+      : Number.MAX_SAFE_INTEGER;
+    const perspectiveRight = right.perspective
+      ? REVIEW_PERSPECTIVE_FEEDBACK_ORDER.indexOf(right.perspective)
+      : Number.MAX_SAFE_INTEGER;
+    if (perspectiveLeft !== perspectiveRight) {
+      return perspectiveLeft - perspectiveRight;
+    }
+
+    const fileDiff = left.file.localeCompare(right.file);
+    if (fileDiff !== 0) {
+      return fileDiff;
+    }
+
+    return (left.line || 0) - (right.line || 0);
+  });
+}
+
+function countFindingsBySeverity(findings: ReviewFinding[]): {
+  criticalCount: number;
+  majorCount: number;
+  minorCount: number;
+} {
+  return {
+    criticalCount: findings.filter((finding) => finding.severity === 'critical').length,
+    majorCount: findings.filter((finding) => finding.severity === 'major').length,
+    minorCount: findings.filter((finding) => finding.severity === 'minor').length,
+  };
+}
+
+function createSyntheticReviewFinding(
+  perspective: ReviewPerspective,
+  description: string,
+  suggestedFix: string
+): ReviewFinding {
+  return {
+    perspective,
+    severity: 'major',
+    file: '<reviewer-output>',
+    description,
+    suggestedFix,
+    targetAgent: perspective,
+  };
+}
+
+function mapReviewCommentsToFindings(
+  repoName: string,
+  perspective: ReviewPerspective,
+  comments: ReviewerResponse['comments']
+): ReviewFinding[] {
+  return comments.map((comment) => ({
+    perspective,
+    severity: (comment.severity || 'minor') as ReviewFinding['severity'],
+    file: comment.file,
+    line: comment.line,
+    description: comment.comment,
+    suggestedFix: comment.suggestedFix || '',
+    targetAgent: repoName,
+  }));
+}
+
+function buildPerspectiveSummary(
+  perspective: ReviewPerspective,
+  status: ReviewPerspectiveStatus,
+  findings: ReviewFinding[],
+  detail?: string
+): string {
+  const label = REVIEW_PERSPECTIVE_LABELS[perspective];
+  switch (status) {
+    case 'approve':
+      return `${label} review approved.`;
+    case 'request_changes':
+      return findings.length > 0
+        ? `${label} review found ${findings.length} issue${findings.length === 1 ? '' : 's'}.`
+        : `${label} review requested changes.`;
+    case 'schema_fallback':
+      return `${label} review returned invalid structured output.${detail ? ` ${detail}` : ''}`;
+    case 'error':
+      return `${label} review failed after retries.${detail ? ` ${detail}` : ''}`;
+  }
+}
+
+function buildReviewPerspectiveSummary(
+  result: ReviewPerspectiveExecutionResult
+): ReviewPerspectiveSummary {
+  return {
+    perspective: result.perspective,
+    status: result.status,
+    summary: result.summary,
+    agentId: result.agentId,
+    ...countFindingsBySeverity(result.findings),
+  };
+}
+
+function resolveReviewPerspectiveRole(
+  roleName: ReviewPerspectiveRoleKey
+): ReturnType<typeof getRole> {
+  const reviewerRole = getRole('reviewer');
+  if (roleName === 'reviewer') {
+    return reviewerRole;
+  }
+
+  try {
+    const perspectiveRole = getRole(roleName);
+    return {
+      systemPrompt: perspectiveRole.systemPrompt,
+      allowedTools: mergeAllowedTools(
+        reviewerRole.allowedTools,
+        perspectiveRole.allowedTools
+      ),
+      jsonSchema: perspectiveRole.jsonSchema,
+    };
+  } catch {
+    return reviewerRole;
+  }
+}
+
+// Best-effort guard only: this avoids obviously write-capable reviewer roles,
+// but it is not a security boundary because tool patterns may still permit writes.
+function isCompatibleReviewerRole(role: ReturnType<typeof getRole>): boolean {
+  return !role.allowedTools.includes('Write') && !role.allowedTools.includes('Edit');
+}
+
+function supportsMultiPerspectiveReviews(): boolean {
+  try {
+    return REVIEW_PERSPECTIVE_CONFIGS.every((config) => {
+      const role = getRole(config.roleName);
+      return isCompatibleReviewerRole(role);
+    });
+  } catch {
+    return false;
+  }
+}
+
+async function runReviewPerspective(
+  itemId: string,
+  repo: ItemRepositoryConfig,
+  task: PlanTask,
+  agentWorkdir: string,
+  reviewContext: string,
+  reviewCycle: number,
+  perspective: ReviewPerspective
+): Promise<ReviewPerspectiveExecutionResult> {
+  const config = getReviewPerspectiveConfig(perspective);
+  const role = resolveReviewPerspectiveRole(config.roleName);
+  const prompt = composeRepositoryRolePrompt(
+    reviewContext,
+    repo.rolePrompts,
+    config.promptKey,
+    'reviewer'
+  );
+
+  let reviewResponse: ReviewerResponse | null = null;
+  let reviewUsedSchemaFallback = false;
+  let reviewSchemaValidationErrors: string[] | undefined;
+  let reviewError = 'Reviewer failed';
+  let lastAgentId = '';
+
+  for (let attempt = 0; attempt <= AGENT_MAX_RETRIES; attempt++) {
+    lastAgentId = buildSyntheticReviewAgentId(
+      repo.name,
+      task.id,
+      reviewCycle,
+      perspective,
+      attempt + 1
+    );
+    try {
+      const { agent, result } = await executeAgent<unknown>({
+        itemId,
+        agentId: lastAgentId,
+        role: 'review',
+        repoName: repo.name,
+        currentTask: `${task.id}: review:${perspective}`,
+        prompt,
+        appendSystemPrompt: role.systemPrompt,
+        workingDir: agentWorkdir,
+        allowedTools: role.allowedTools,
+        jsonSchema: role.jsonSchema,
+        schemaFallbackMode: REVIEWER_SCHEMA_FALLBACK_MODE,
+        emitErrorEvent: false,
+        timeoutMs: REVIEW_TIMEOUT_MS,
+      });
+      lastAgentId = agent.id;
+      reviewUsedSchemaFallback = !!result.usedSchemaFallback;
+      reviewSchemaValidationErrors = result.schemaValidationErrors;
+      if (result.usedSchemaFallback) {
+        console.warn(
+          `[${itemId}/${repo.name}] ${perspective} reviewer output failed schema validation; continuing if structured review is unavailable.`
+        );
+      }
+      if (isReviewerResponse(result.output)) {
+        reviewResponse = result.output;
+      }
+      break;
+    } catch (error) {
+      reviewError = error instanceof Error ? error.message : String(error);
+      if (attempt < AGENT_MAX_RETRIES) {
+        console.warn(
+          `[${itemId}/${repo.name}] ${perspective} review attempt ${attempt + 1} failed for ${task.id}: ${reviewError}, retrying...`
+        );
+        continue;
+      }
+    }
+  }
+
+  if (reviewResponse) {
+    const findings = mapReviewCommentsToFindings(
+      repo.name,
+      perspective,
+      reviewResponse.comments ?? []
+    );
+    if (reviewResponse.review_status === 'request_changes' && findings.length === 0) {
+      findings.push(
+        createSyntheticReviewFinding(
+          perspective,
+          `The ${config.label.toLowerCase()} reviewer requested changes but did not provide structured findings. Manual confirmation is required.`,
+          `Re-run the ${config.label.toLowerCase()} review or manually inspect the implementation for ${config.label.toLowerCase()} concerns.`
+        )
+      );
+    }
+
+    return {
+      perspective,
+      status: reviewResponse.review_status,
+      findings,
+      summary: buildPerspectiveSummary(
+        perspective,
+        reviewResponse.review_status,
+        findings
+      ),
+      agentId: lastAgentId,
+      hasStructuredSignal: true,
+    };
+  }
+
+  if (reviewUsedSchemaFallback) {
+    const detail = (reviewSchemaValidationErrors || []).join('; ') || 'Unknown schema mismatch.';
+    const findings = [
+      createSyntheticReviewFinding(
+        perspective,
+        `The ${config.label.toLowerCase()} reviewer did not return structured output, so manual confirmation is required before considering this review complete.`,
+        `Re-run the ${config.label.toLowerCase()} review and verify the code manually. Schema errors: ${detail}`
+      ),
+    ];
+    return {
+      perspective,
+      status: 'schema_fallback',
+      findings,
+      summary: buildPerspectiveSummary(perspective, 'schema_fallback', findings, detail),
+      agentId: lastAgentId,
+      hasStructuredSignal: false,
+      detail,
+    };
+  }
+
+  const findings = [
+    createSyntheticReviewFinding(
+      perspective,
+      `The ${config.label.toLowerCase()} reviewer failed to complete, so manual confirmation is required before considering this review complete.`,
+      `Re-run the ${config.label.toLowerCase()} review and verify the code manually. Last error: ${reviewError}`
+    ),
+  ];
+  return {
+    perspective,
+    status: 'error',
+    findings,
+    summary: buildPerspectiveSummary(perspective, 'error', findings, reviewError),
+    agentId: lastAgentId,
+    hasStructuredSignal: false,
+    detail: reviewError,
+  };
+}
+
+async function runLegacyReviewCycle(
+  itemId: string,
+  repo: ItemRepositoryConfig,
+  task: PlanTask,
+  agentWorkdir: string,
+  reviewContext: string
+): Promise<ReviewCycleResult> {
+  const reviewerRole = getRole('reviewer');
+  const reviewerPrompt = composeRepositoryRolePrompt(
+    reviewContext,
+    repo.rolePrompts,
+    'reviewer'
+  );
+  let reviewResponse: ReviewerResponse | null = null;
+  let reviewUsedSchemaFallback = false;
+  let reviewSchemaValidationErrors: string[] | undefined;
+  let reviewError = 'Reviewer failed';
+  for (let attempt = 0; attempt <= AGENT_MAX_RETRIES; attempt++) {
+    try {
+      const { result: reviewResult } = await executeAgent<unknown>({
+        itemId,
+        role: 'review',
+        repoName: repo.name,
+        currentTask: `${task.id}: review`,
+        prompt: reviewerPrompt,
+        appendSystemPrompt: reviewerRole.systemPrompt,
+        workingDir: agentWorkdir,
+        allowedTools: reviewerRole.allowedTools,
+        jsonSchema: reviewerRole.jsonSchema,
+        schemaFallbackMode: REVIEWER_SCHEMA_FALLBACK_MODE,
+        timeoutMs: REVIEW_TIMEOUT_MS,
+      });
+      reviewUsedSchemaFallback = !!reviewResult.usedSchemaFallback;
+      reviewSchemaValidationErrors = reviewResult.schemaValidationErrors;
+      if (reviewResult.usedSchemaFallback) {
+        console.warn(
+          `[${itemId}/${repo.name}] Reviewer output failed schema validation; advancing review loop if structured review is unavailable.`
+        );
+      }
+      if (isReviewerResponse(reviewResult.output)) {
+        reviewResponse = reviewResult.output;
+      }
+      break;
+    } catch (error) {
+      reviewError = error instanceof Error ? error.message : String(error);
+      if (attempt < AGENT_MAX_RETRIES) {
+        console.warn(
+          `[${itemId}/${repo.name}] Review attempt ${attempt + 1} failed for ${task.id}: ${reviewError}, retrying...`
+        );
+        continue;
+      }
+    }
+  }
+
+  if (!reviewResponse && !reviewUsedSchemaFallback) {
+    return {
+      findings: [],
+      overallAssessment: 'needs_fixes',
+      summary: '',
+      feedbackFiles: [],
+      hardFailureMessage: `Review failed for ${repo.name} during task ${task.id}: ${reviewError}`,
+    };
+  }
+
+  if (!reviewResponse) {
+    const fallbackErrors = (reviewSchemaValidationErrors || []).join('; ') || 'unknown schema mismatch';
+    return {
+      findings: [],
+      overallAssessment: 'needs_fixes',
+      summary: `Reviewer output did not match schema; advancing without structured findings. ${fallbackErrors}`,
+      feedbackFiles: [],
+      skipFeedbackFix: true,
+    };
+  }
+
+  const findings = reviewResponse.comments.map((comment) => ({
+    severity: (comment.severity || 'minor') as ReviewFinding['severity'],
+    file: comment.file,
+    line: comment.line,
+    description: comment.comment,
+    suggestedFix: comment.suggestedFix || '',
+    targetAgent: repo.name,
+  }));
+
+  return {
+    findings,
+    overallAssessment: reviewResponse.review_status === 'approve' ? 'pass' : 'needs_fixes',
+    summary: reviewResponse.review_status === 'approve'
+      ? `Code review passed for ${task.id}`
+      : `${reviewResponse.comments.length} issues found for ${task.id}`,
+    feedbackFiles: reviewResponse.comments.map((comment) => comment.file).filter(Boolean),
+  };
+}
+
+function shouldIncludeFindingFileInDiff(file: string): boolean {
+  return file.trim().length > 0 && !file.startsWith('<');
+}
+
+function summarizeAggregatedReviewResults(
+  task: PlanTask,
+  results: ReviewPerspectiveExecutionResult[],
+  findings: ReviewFinding[]
+): string {
+  const blocking = results.filter((result) => result.status !== 'approve');
+  if (blocking.length === 0) {
+    return `All review perspectives approved ${task.id}.`;
+  }
+
+  const blockingLabels = blocking
+    .map((result) => REVIEW_PERSPECTIVE_LABELS[result.perspective])
+    .join(', ');
+
+  return `${findings.length} review issue${findings.length === 1 ? '' : 's'} found across ${blocking.length} perspective${blocking.length === 1 ? '' : 's'} (${blockingLabels}) for ${task.id}.`;
+}
+
+function buildSyntheticReviewAgentId(
+  repoName: string,
+  taskId: string,
+  reviewCycle: number,
+  perspective: ReviewPerspective,
+  attempt: number
+): string {
+  return `review-${repoName}-${taskId}-cycle${reviewCycle}-${perspective}-attempt${attempt}`;
 }
 
 // ─── Git helpers ───
@@ -981,7 +1490,6 @@ async function runTaskReviewPhase(
   task: PlanTask,
   agentWorkdir: string
 ): Promise<{ state: RepoTaskStateFile; errorMessage?: string; shouldAbortRun?: boolean }> {
-  const reviewerRole = getRole('reviewer');
   const engineerRole = getRole('engineer');
   const effectiveTools = mergeAllowedTools(engineerRole.allowedTools, repo.allowedTools);
 
@@ -1022,6 +1530,7 @@ async function runTaskReviewPhase(
     currentState = await markTaskInReview(itemId, repo.name, task.id, 'review');
 
     const taskStateAfterHooks = getRepoTaskEntry(currentState, task.id);
+    const reviewCycle = (taskStateAfterHooks.reviewRounds || 0) + 1;
     const phaseBase = taskStateAfterHooks.phaseBase!;
     const currentHead = await getGitHead(agentWorkdir);
 
@@ -1034,77 +1543,85 @@ async function runTaskReviewPhase(
       plan,
       hookPhase.exhausted ? summarizeHookFailures(hookPhase.hookResults) : undefined
     );
-    const reviewerPrompt = composeRepositoryRolePrompt(
-      reviewContext,
-      repo.rolePrompts,
-      'reviewer'
-    );
-    let reviewResponse: ReviewerResponse | null = null;
-    let reviewUsedSchemaFallback = false;
-    let reviewSchemaValidationErrors: string[] | undefined;
-    let reviewError = 'Reviewer failed';
-    for (let attempt = 0; attempt <= AGENT_MAX_RETRIES; attempt++) {
-      try {
-        const { result: reviewResult } = await executeAgent<unknown>({
-          itemId,
-          role: 'review',
-          repoName: repo.name,
-          currentTask: `${task.id}: review`,
-          prompt: reviewerPrompt,
-          appendSystemPrompt: reviewerRole.systemPrompt,
-          workingDir: agentWorkdir,
-          allowedTools: reviewerRole.allowedTools,
-          jsonSchema: reviewerRole.jsonSchema,
-          schemaFallbackMode: REVIEWER_SCHEMA_FALLBACK_MODE,
-          timeoutMs: REVIEW_TIMEOUT_MS,
-        });
-        reviewUsedSchemaFallback = !!reviewResult.usedSchemaFallback;
-        reviewSchemaValidationErrors = reviewResult.schemaValidationErrors;
-        if (reviewResult.usedSchemaFallback) {
-          console.warn(
-            `[${itemId}/${repo.name}] Reviewer output failed schema validation; advancing review loop if structured review is unavailable.`
+    const reviewCycleResult: ReviewCycleResult = supportsMultiPerspectiveReviews()
+      ? await (async () => {
+          const reviewResults = await Promise.all(
+            REVIEW_PERSPECTIVE_RUN_ORDER.map((perspective) =>
+              runReviewPerspective(
+                itemId,
+                repo,
+                task,
+                agentWorkdir,
+                reviewContext,
+                reviewCycle,
+                perspective
+              )
+            )
           );
-        }
-        if (isReviewerResponse(reviewResult.output)) {
-          reviewResponse = reviewResult.output;
-        }
-        break;
-      } catch (error) {
-        reviewError = error instanceof Error ? error.message : String(error);
-        if (attempt < AGENT_MAX_RETRIES) {
-          console.warn(
-            `[${itemId}/${repo.name}] Review attempt ${attempt + 1} failed for ${task.id}: ${reviewError}, retrying...`
-          );
-          continue;
-        }
-      }
-    }
+          const hasStructuredSignal = reviewResults.some((result) => result.hasStructuredSignal);
+          if (!hasStructuredSignal) {
+            const detail = reviewResults
+              .map((result) => `${REVIEW_PERSPECTIVE_LABELS[result.perspective]}: ${result.detail || result.summary}`)
+              .join(' | ');
+            return {
+              findings: [],
+              overallAssessment: 'needs_fixes',
+              summary: '',
+              feedbackFiles: [],
+              hardFailureMessage: `All review perspectives failed for ${repo.name} during task ${task.id}: ${detail}`,
+            };
+          }
 
-    if (!reviewResponse && !reviewUsedSchemaFallback) {
+          const findings = sortReviewFindings(
+            reviewResults.flatMap((result) => result.findings)
+          );
+          return {
+            findings,
+            overallAssessment: reviewResults.every((result) => result.status === 'approve')
+              ? 'pass'
+              : 'needs_fixes',
+            summary: summarizeAggregatedReviewResults(task, reviewResults, findings),
+            perspectives: reviewResults.map(buildReviewPerspectiveSummary),
+            feedbackFiles: findings
+              .map((finding) => finding.file)
+              .filter(shouldIncludeFindingFileInDiff),
+          };
+        })()
+      : await runLegacyReviewCycle(itemId, repo, task, agentWorkdir, reviewContext);
+
+    if (reviewCycleResult.hardFailureMessage) {
       const failure = await failTaskWithError(
         itemId,
         repo.name,
         task.id,
         'review',
-        `Review failed for ${repo.name} during task ${task.id}: ${reviewError}`
+        reviewCycleResult.hardFailureMessage
       );
       return { state: failure.state, errorMessage: failure.errorMessage, shouldAbortRun: true };
     }
 
-    if (!reviewResponse) {
-      const fallbackRound = (taskStateAfterHooks.reviewRounds || 0) + 1;
-      const fallbackErrors = (reviewSchemaValidationErrors || []).join('; ') || 'unknown schema mismatch';
-      const findingsEvent = createReviewFindingsExtractedEvent(
-        itemId,
-        `review-${repo.name}-${task.id}-cycle${fallbackRound}`,
-        repo.name,
-        [],
-        'needs_fixes',
-        `Reviewer output did not match schema in round ${fallbackRound}; advancing without structured findings. ${fallbackErrors}`
-      );
-      await appendJsonl(getItemEventsPath(itemId), findingsEvent);
-      eventBus.publish(itemId, findingsEvent);
+    const findings = reviewCycleResult.findings;
+    const findingsEvent = createReviewFindingsExtractedEvent(
+      itemId,
+      `review-${repo.name}-${task.id}-cycle${reviewCycle}`,
+      repo.name,
+      findings,
+      reviewCycleResult.overallAssessment,
+      reviewCycleResult.summary,
+      reviewCycleResult.perspectives
+    );
+    await appendJsonl(getItemEventsPath(itemId), findingsEvent);
+    eventBus.publish(itemId, findingsEvent);
 
+    if (reviewCycleResult.overallAssessment === 'pass') {
+      currentState = await markTaskCompleted(itemId, repo.name, task.id, currentHead, {
+        hooksExhausted: taskStateAfterHooks.hooksExhausted,
+      });
+      return { state: currentState };
+    }
+
+    if (reviewCycleResult.skipFeedbackFix) {
+      const fallbackRound = (taskStateAfterHooks.reviewRounds || 0) + 1;
       currentState = await incrementTaskReviewRounds(itemId, repo.name, task.id);
       if (fallbackRound >= MAX_FEEDBACK_ROUNDS) {
         return completeTaskAfterReviewExhaustion(
@@ -1118,42 +1635,12 @@ async function runTaskReviewPhase(
       continue;
     }
 
-    const comments = reviewResponse.comments ?? [];
-    const findings = comments.map((comment) => ({
-      severity: (comment.severity || 'minor') as 'critical' | 'major' | 'minor',
-      file: comment.file,
-      line: comment.line,
-      description: comment.comment,
-      suggestedFix: comment.suggestedFix || '',
-      targetAgent: repo.name,
-    }));
-
-    const findingsEvent = createReviewFindingsExtractedEvent(
-      itemId,
-      `review-${repo.name}-${task.id}-cycle${(taskStateAfterHooks.reviewRounds || 0) + 1}`,
-      repo.name,
-      findings,
-      reviewResponse.review_status === 'approve' ? 'pass' : 'needs_fixes',
-      reviewResponse.review_status === 'approve'
-        ? `Code review passed for ${task.id}`
-        : `${comments.length} issues found for ${task.id}`
-    );
-    await appendJsonl(getItemEventsPath(itemId), findingsEvent);
-    eventBus.publish(itemId, findingsEvent);
-
-    if (reviewResponse.review_status === 'approve') {
-      currentState = await markTaskCompleted(itemId, repo.name, task.id, currentHead, {
-        hooksExhausted: taskStateAfterHooks.hooksExhausted,
-      });
-      return { state: currentState };
-    }
-
     const completedFeedbackRounds = taskStateAfterHooks.reviewRounds || 0;
     const isFinalFeedbackRound = completedFeedbackRounds + 1 >= MAX_FEEDBACK_ROUNDS;
 
     let feedbackDiff: string;
     try {
-      const commentFiles = comments.map((comment) => comment.file).filter(Boolean);
+      const commentFiles = [...new Set(reviewCycleResult.feedbackFiles)];
       feedbackDiff = await getGitDiff(
         agentWorkdir,
         phaseBase,
@@ -1164,7 +1651,7 @@ async function runTaskReviewPhase(
       feedbackDiff = '<unable to generate diff>';
     }
 
-    const feedbackPrompt = buildFeedbackPrompt(plan, repo, comments, feedbackDiff, [task]);
+    const feedbackPrompt = buildFeedbackPrompt(plan, repo, findings, feedbackDiff, [task]);
 
     let feedbackError = 'Feedback engineer failed';
     let feedbackSucceeded = false;
@@ -1728,10 +2215,10 @@ ${skippedSection}
 ${taskDescriptions}`;
 }
 
-function buildFeedbackPrompt(
+export function buildFeedbackPrompt(
   _plan: Plan,
   repo: ItemRepositoryConfig,
-  comments: ReviewComment[],
+  findings: ReviewFinding[],
   diff: string,
   originalTasks: PlanTask[]
 ): string {
@@ -1739,9 +2226,39 @@ function buildFeedbackPrompt(
     .map(t => `- ${t.id}: ${t.title}`)
     .join('\n');
 
-  const commentList = comments
-    .map((c) => `- [${(c.severity || 'minor').toUpperCase()}] ${c.file}${c.line ? `:${c.line}` : ''}: ${c.comment}${c.suggestedFix ? ` (Fix: ${c.suggestedFix})` : ''}`)
-    .join('\n');
+  const groupedFindings = new Map<ReviewPerspective, ReviewFinding[]>();
+  for (const perspective of REVIEW_PERSPECTIVE_FEEDBACK_ORDER) {
+    groupedFindings.set(perspective, []);
+  }
+  for (const finding of sortReviewFindings(findings)) {
+    if (!finding.perspective) {
+      continue;
+    }
+    groupedFindings.get(finding.perspective)?.push(finding);
+  }
+
+  const hasPerspectiveSections = findings.some((finding) => Boolean(finding.perspective));
+  const commentSections = hasPerspectiveSections
+    ? REVIEW_PERSPECTIVE_FEEDBACK_ORDER
+        .map((perspective) => {
+          const perspectiveFindings = groupedFindings.get(perspective) || [];
+          if (perspectiveFindings.length === 0) {
+            return null;
+          }
+
+          const items = perspectiveFindings.map((finding) => (
+            `- [${finding.severity.toUpperCase()}] ${finding.file}${finding.line ? `:${finding.line}` : ''}: ${finding.description}${finding.suggestedFix ? ` (Fix: ${finding.suggestedFix})` : ''}`
+          )).join('\n');
+
+          return `### ${REVIEW_PERSPECTIVE_LABELS[perspective]}\n${items}`;
+        })
+        .filter((section): section is string => section !== null)
+        .join('\n\n')
+    : sortReviewFindings(findings)
+        .map((finding) => (
+          `- [${finding.severity.toUpperCase()}] ${finding.file}${finding.line ? `:${finding.line}` : ''}: ${finding.description}${finding.suggestedFix ? ` (Fix: ${finding.suggestedFix})` : ''}`
+        ))
+        .join('\n');
 
   const context = `## Working on: ${repo.name}
 
@@ -1752,7 +2269,7 @@ ${taskList}
 The previous implementation was reviewed and rejected.
 
 Review comments:
-${commentList}
+${commentSections}
 
 ## Current Changes (git diff from phase start)
 \`\`\`diff

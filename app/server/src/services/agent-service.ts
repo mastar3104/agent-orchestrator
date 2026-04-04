@@ -162,6 +162,7 @@ export async function executeAgent<T>(options: {
     // Save output.json (best-effort)
     await saveAgentOutput(options.itemId, agentId, {
       prompt: options.prompt,
+      systemPrompt: options.appendSystemPrompt,
       stdout: result.rawStdout,
       stderr: result.stderr,
       parsedOutput: result.output,
@@ -224,6 +225,7 @@ export async function executeAgent<T>(options: {
     if (error instanceof ClaudeExecutionError) {
       await saveAgentOutput(options.itemId, agentId, {
         prompt: options.prompt,
+        systemPrompt: options.appendSystemPrompt,
         stdout: error.stdout,
         stderr: error.stderr,
         parsedOutput: null,
@@ -234,6 +236,7 @@ export async function executeAgent<T>(options: {
     } else if (error instanceof ClaudeSchemaValidationError) {
       await saveAgentOutput(options.itemId, agentId, {
         prompt: options.prompt,
+        systemPrompt: options.appendSystemPrompt,
         stdout: error.rawOutput,
         stderr: error.stderr,
         parsedOutput: null,

@@ -199,11 +199,50 @@ describe('ItemDetailPage workflow UI', () => {
     expect(view.getByText('Jobs')).toBeInTheDocument();
     expect(view.getByText('Workspace')).toBeInTheDocument();
     expect(view.getByText('Execution')).toBeInTheDocument();
-    expect(view.getByText('Completed Review')).toBeInTheDocument();
+    expect(view.getAllByText('Completed Review').length).toBeGreaterThan(0);
     expect(view.getByText('repo-a: T1: Implement workflow (Hooks)')).toBeInTheDocument();
     expect(view.getByText('0 / 1 steps')).toBeInTheDocument();
     expect(view.getAllByText('Hooks').length).toBeGreaterThan(0);
     expect(view.getByText('PR #1')).toBeInTheDocument();
+  });
+
+  it('renders separate reviewer cards for distinct review-cycle agent IDs', () => {
+    mockUseItem.mockReturnValue(
+      makeUseItemResult({
+        item: makeItem({
+          agents: [
+            {
+              id: 'review-repo-a-T1-cycle1-security-attempt1',
+              itemId: 'ITEM-1',
+              role: 'review',
+              repoName: 'repo-a',
+              status: 'completed',
+              currentTask: 'T1: review:security',
+              startedAt: '2026-01-01T00:00:00Z',
+              stoppedAt: '2026-01-01T00:01:00Z',
+              exitCode: 0,
+            },
+            {
+              id: 'review-repo-a-T1-cycle2-security-attempt1',
+              itemId: 'ITEM-1',
+              role: 'review',
+              repoName: 'repo-a',
+              status: 'completed',
+              currentTask: 'T1: review:security',
+              startedAt: '2026-01-01T00:02:00Z',
+              stoppedAt: '2026-01-01T00:03:00Z',
+              exitCode: 0,
+            },
+          ],
+        }),
+      })
+    );
+
+    const view = renderPage();
+
+    expect(view.getByText('review-repo-a-T1-cycle1-security-attempt1')).toBeInTheDocument();
+    expect(view.getByText('review-repo-a-T1-cycle2-security-attempt1')).toBeInTheDocument();
+    expect(view.getAllByText('Click to view output')).toHaveLength(2);
   });
 
   it('refreshes when task_state_changed is received', () => {
@@ -230,6 +269,9 @@ describe('ItemDetailPage workflow UI', () => {
     mockUseItem.mockReturnValue(makeUseItemResult({
       item: makeItem({
         status: 'error',
+        testPlanApproval: {
+          status: 'approved',
+        },
         repos: [
           {
             repoName: 'repo-a',
@@ -454,5 +496,108 @@ describe('ItemDetailPage workflow UI', () => {
 
     expect(view.queryByText('review exhausted')).not.toBeInTheDocument();
     expect(view.queryByText('hooks exhausted')).not.toBeInTheDocument();
+  });
+
+  it('renders perspective-grouped review findings when a multi-perspective event arrives', () => {
+    const view = renderPage();
+
+    const wsOptions = mockUseWebSocket.mock.calls[0][0];
+    act(() => {
+      wsOptions.onEvent?.({
+        id: 'evt-review-1',
+        type: 'review_findings_extracted',
+        timestamp: '2026-01-01T00:00:00Z',
+        itemId: 'ITEM-1',
+        repoName: 'repo-a',
+        overallAssessment: 'needs_fixes',
+        summary: 'Multiple review perspectives requested changes.',
+        findings: [
+          {
+            perspective: 'security',
+            file: 'auth.ts',
+            line: 8,
+            description: 'Enforce authorization before executing the task.',
+            severity: 'critical',
+            suggestedFix: 'Require authorization before the task dispatch path.',
+            targetAgent: 'repo-a',
+          },
+          {
+            perspective: 'architecture',
+            file: 'workflow.ts',
+            line: 21,
+            description: 'Split orchestration concerns more clearly.',
+            severity: 'minor',
+            suggestedFix: 'Extract review aggregation into a dedicated helper.',
+            targetAgent: 'repo-a',
+          },
+        ],
+        criticalCount: 1,
+        majorCount: 0,
+        minorCount: 1,
+        perspectives: [
+          {
+            perspective: 'architecture',
+            status: 'request_changes',
+            summary: 'Architecture review found 1 issue.',
+            criticalCount: 0,
+            majorCount: 0,
+            minorCount: 1,
+            agentId: 'arch-1',
+          },
+          {
+            perspective: 'security',
+            status: 'request_changes',
+            summary: 'Security review found 1 issue.',
+            criticalCount: 1,
+            majorCount: 0,
+            minorCount: 0,
+            agentId: 'sec-1',
+          },
+        ],
+      } as any);
+    });
+
+    expect(view.getByText('Review Findings')).toBeInTheDocument();
+    expect(view.getByText('Architecture')).toBeInTheDocument();
+    expect(view.getByText('Security')).toBeInTheDocument();
+    expect(view.getByText('Architecture review found 1 issue.')).toBeInTheDocument();
+    expect(view.getByText('Security review found 1 issue.')).toBeInTheDocument();
+    expect(view.getByText('Split orchestration concerns more clearly.')).toBeInTheDocument();
+    expect(view.getByText('Enforce authorization before executing the task.')).toBeInTheDocument();
+    expect(view.getAllByText('request changes')).toHaveLength(2);
+  });
+
+  it('keeps rendering legacy review findings when perspectives are absent', () => {
+    const view = renderPage();
+
+    const wsOptions = mockUseWebSocket.mock.calls[0][0];
+    act(() => {
+      wsOptions.onEvent?.({
+        id: 'evt-review-legacy',
+        type: 'review_findings_extracted',
+        timestamp: '2026-01-01T00:00:00Z',
+        itemId: 'ITEM-1',
+        repoName: 'repo-a',
+        overallAssessment: 'needs_fixes',
+        summary: 'Legacy review output requested changes.',
+        findings: [
+          {
+            file: 'legacy.ts',
+            line: 5,
+            description: 'Keep the old review payload readable.',
+            severity: 'major',
+            suggestedFix: 'Continue supporting legacy events.',
+            targetAgent: 'repo-a',
+          },
+        ],
+        criticalCount: 0,
+        majorCount: 1,
+        minorCount: 0,
+      } as any);
+    });
+
+    expect(view.getByText('Legacy review output requested changes.')).toBeInTheDocument();
+    expect(view.getByText('Keep the old review payload readable.')).toBeInTheDocument();
+    expect(view.queryByText('Architecture')).not.toBeInTheDocument();
   });
 });

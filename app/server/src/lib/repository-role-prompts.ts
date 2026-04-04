@@ -2,7 +2,13 @@ import type { EditableRolePromptKey, RolePrompts } from '@agent-orch/shared';
 
 type RepoScopedRolePromptKey = Extract<
   EditableRolePromptKey,
-  'engineer' | 'reviewer' | 'reviewReceiver'
+  | 'engineer'
+  | 'reviewer'
+  | 'architectureReviewer'
+  | 'securityReviewer'
+  | 'testingReviewer'
+  | 'requirementsReviewer'
+  | 'reviewReceiver'
 >;
 
 type WorkspaceScopedRolePromptKey = Extract<
@@ -13,16 +19,27 @@ type WorkspaceScopedRolePromptKey = Extract<
 export function composeRepositoryRolePrompt(
   basePrompt: string,
   rolePrompts: RolePrompts | undefined,
-  roleKey: RepoScopedRolePromptKey
+  roleKey: RepoScopedRolePromptKey,
+  fallbackRoleKey?: RepoScopedRolePromptKey
 ): string {
+  const promptSections: string[] = [];
+  const fallbackPrompt = fallbackRoleKey ? rolePrompts?.[fallbackRoleKey]?.trim() : '';
+  if (fallbackPrompt) {
+    promptSections.push(fallbackPrompt);
+  }
+
   const repositoryPrompt = rolePrompts?.[roleKey]?.trim();
-  if (!repositoryPrompt) {
+  if (repositoryPrompt && (!fallbackRoleKey || roleKey !== fallbackRoleKey)) {
+    promptSections.push(repositoryPrompt);
+  }
+
+  if (promptSections.length === 0) {
     return basePrompt;
   }
 
   return `## Repository-Specific Instructions
 
-${repositoryPrompt}
+${promptSections.join('\n\n')}
 
 ${basePrompt}`;
 }
