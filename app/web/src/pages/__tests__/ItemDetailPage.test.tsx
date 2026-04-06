@@ -1,5 +1,5 @@
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { act, render } from '@testing-library/react';
+import { act, render, fireEvent } from '@testing-library/react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { ItemDetail } from '@agent-orch/shared';
 import { ItemDetailPage } from '../ItemDetailPage';
@@ -703,5 +703,129 @@ describe('ItemDetailPage workflow UI', () => {
 
     expect(view.getByText('Setup failed')).toBeInTheDocument();
     expect(view.getByRole('button', { name: 'Re-run Setup' })).toBeInTheDocument();
+  });
+
+  it('displays current setup commands in non-editing mode', () => {
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install', 'npm run build'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'not_started' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    expect(view.getByText('npm install')).toBeInTheDocument();
+    expect(view.getByText('npm run build')).toBeInTheDocument();
+  });
+
+  it('saves edited setup commands via updateRepoSetup and closes editor', async () => {
+    vi.mocked(api.updateRepoSetup).mockResolvedValue(undefined as any);
+    refresh.mockResolvedValue(undefined);
+
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'not_started' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    // Click Edit to open the editor
+    fireEvent.click(view.getByRole('button', { name: 'Edit' }));
+
+    // Textarea should appear pre-filled with existing commands
+    const textarea = view.getByPlaceholderText('One command per line...');
+    expect(textarea).toBeInTheDocument();
+    expect((textarea as HTMLTextAreaElement).value).toBe('npm install');
+
+    // Change the content
+    fireEvent.change(textarea, { target: { value: 'npm ci\nnpm run build' } });
+
+    // Click Save
+    await act(async () => {
+      fireEvent.click(view.getByRole('button', { name: 'Save' }));
+    });
+
+    expect(api.updateRepoSetup).toHaveBeenCalledWith('ITEM-1', 'repo-a', ['npm ci', 'npm run build']);
+    // Editor should be closed (textarea gone)
+    expect(view.queryByPlaceholderText('One command per line...')).not.toBeInTheDocument();
+  });
+
+  it('displays error message when runRepoSetup fails', async () => {
+    vi.mocked(api.runRepoSetup).mockRejectedValue(new Error('Setup execution failed'));
+
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'not_started' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    await act(async () => {
+      fireEvent.click(view.getByRole('button', { name: 'Run Setup' }));
+    });
+
+    expect(view.getByText('Setup execution failed')).toBeInTheDocument();
+  });
+
+  it('displays error message when updateRepoSetup fails', async () => {
+    vi.mocked(api.updateRepoSetup).mockRejectedValue(new Error('Save failed'));
+
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'not_started' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    fireEvent.click(view.getByRole('button', { name: 'Edit' }));
+
+    await act(async () => {
+      fireEvent.click(view.getByRole('button', { name: 'Save' }));
+    });
+
+    expect(view.getByText('Save failed')).toBeInTheDocument();
   });
 });

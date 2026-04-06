@@ -414,6 +414,11 @@ export function ItemDetailPage() {
         .filter(Boolean);
       await api.updateRepoSetup(id, setupEditingRepo, commands);
       setSetupEditingRepo(null);
+      setSetupResults((prev) => {
+        const next = new Map(prev);
+        next.delete(setupEditingRepo!);
+        return next;
+      });
       await refresh();
     } catch (err) {
       setSetupError(err instanceof Error ? err.message : 'Failed to save setup commands');

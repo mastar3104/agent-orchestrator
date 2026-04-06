@@ -26,7 +26,7 @@ export const SETUP_STATUS_ICONS: Record<SetupCommandStatus, string> = {
   failed: '\u2715',
 };
 
-export const POST_SETUP_PHASES = new Set([
+const POST_SETUP_PHASES = new Set([
   'engineer', 'hooks', 'review', 'completed_review', 'pr', 'review_receive',
 ]);
 
