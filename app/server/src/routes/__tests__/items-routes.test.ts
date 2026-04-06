@@ -34,7 +34,7 @@ vi.mock('../../lib/locks', () => ({
   isItemLocked: vi.fn().mockReturnValue(false),
 }));
 
-import { createItem, getItemConfig, updateRepoSetup, rerunRepoSetup, repoWorkspaceExists } from '../../services/item-service';
+import { createItem, getItemConfig, updateRepoSetup, rerunRepoSetup, repoWorkspaceExists, RepoNotFoundError, UnsupportedRepoTypeError } from '../../services/item-service';
 import { ensureCompletedReviewPassed } from '../../services/completed-review-service';
 import { createDraftPrsForAllRepos } from '../../services/git-pr-service';
 
@@ -413,7 +413,7 @@ describe('item routes', () => {
     });
 
     it('returns 404 when repo not found', async () => {
-      mockUpdateRepoSetup.mockRejectedValue(new Error('Repository "repo-x" not found in item item-1'));
+      mockUpdateRepoSetup.mockRejectedValue(new RepoNotFoundError('repo-x', 'item-1'));
       const app = buildApp();
       const res = await app.inject({
         method: 'PATCH',
@@ -427,7 +427,7 @@ describe('item routes', () => {
     });
 
     it('returns 400 when repo is local', async () => {
-      mockUpdateRepoSetup.mockRejectedValue(new Error('setup is only supported for remote repositories'));
+      mockUpdateRepoSetup.mockRejectedValue(new UnsupportedRepoTypeError());
       const app = buildApp();
       const res = await app.inject({
         method: 'PATCH',

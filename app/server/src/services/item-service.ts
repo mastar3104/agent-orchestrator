@@ -72,6 +72,20 @@ import {
 import { getLatestCompletedReview } from './completed-review-service';
 import { isCompletedReviewRequired } from '../lib/verification-policy';
 
+export class RepoNotFoundError extends Error {
+  constructor(repoName: string, itemId: string) {
+    super(`Repository "${repoName}" not found in item ${itemId}`);
+    this.name = 'RepoNotFoundError';
+  }
+}
+
+export class UnsupportedRepoTypeError extends Error {
+  constructor(message = 'setup is only supported for remote repositories') {
+    super(message);
+    this.name = 'UnsupportedRepoTypeError';
+  }
+}
+
 export async function createItem(request: CreateItemRequest): Promise<ItemConfig> {
   const id = `ITEM-${nanoid(8)}`;
   const now = new Date().toISOString();
@@ -966,12 +980,12 @@ export async function updateRepoSetup(
 
   const repoIndex = config.repositories.findIndex(r => r.name === repoName);
   if (repoIndex === -1) {
-    throw new Error(`Repository "${repoName}" not found in item ${itemId}`);
+    throw new RepoNotFoundError(repoName, itemId);
   }
 
   const repo = config.repositories[repoIndex];
   if (repo.type !== 'remote') {
-    throw new Error('setup is only supported for remote repositories');
+    throw new UnsupportedRepoTypeError();
   }
 
   const updated: ItemConfig = {
@@ -997,7 +1011,11 @@ export async function rerunRepoSetup(
 
   const repo = config.repositories.find(r => r.name === repoName);
   if (!repo) {
-    throw new Error(`Repository "${repoName}" not found in item ${itemId}`);
+    throw new RepoNotFoundError(repoName, itemId);
+  }
+
+  if (repo.type !== 'remote') {
+    throw new UnsupportedRepoTypeError();
   }
 
   const repoDir = getRepoWorkspaceDir(itemId, repoName);

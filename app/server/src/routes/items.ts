@@ -17,6 +17,8 @@ import {
   rerunRepoSetup,
   repoWorkspaceExists,
   deleteItem,
+  RepoNotFoundError,
+  UnsupportedRepoTypeError,
 } from '../services/item-service';
 import { createDraftPrsForAllRepos } from '../services/git-pr-service';
 import { ensureCompletedReviewPassed } from '../services/completed-review-service';
@@ -213,13 +215,13 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
 
       return reply.send({ success: true, data: { item } });
     } catch (error) {
+      if (error instanceof RepoNotFoundError) {
+        return reply.status(404).send({ success: false, error: error.message });
+      }
+      if (error instanceof UnsupportedRepoTypeError) {
+        return reply.status(400).send({ success: false, error: error.message });
+      }
       const message = error instanceof Error ? error.message : 'Unknown error';
-      if (message.includes('not found in item')) {
-        return reply.status(404).send({ success: false, error: message });
-      }
-      if (message.includes('only supported for remote')) {
-        return reply.status(400).send({ success: false, error: message });
-      }
       return reply.status(500).send({ success: false, error: message });
     }
   });
@@ -257,8 +259,10 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
         });
       }
 
-      // Fire-and-forget
-      rerunRepoSetup(request.params.id, request.params.repoName).catch((error) => {
+      // Fire-and-forget with item lock to prevent concurrent runs
+      withItemLock(request.params.id, () =>
+        rerunRepoSetup(request.params.id, request.params.repoName)
+      ).catch((error) => {
         fastify.log.error(
           { itemId: request.params.id, repoName: request.params.repoName, error },
           'Setup command re-run failed'
