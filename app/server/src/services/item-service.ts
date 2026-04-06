@@ -120,6 +120,7 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
         linkMode: repoInput.repository.linkMode,
         allowedTools: repoInput.allowedTools || repoInput.repository.allowedTools,
         rolePrompts: repoInput.repository.rolePrompts,
+        setup: repoInput.repository.setup,
         hooks: repoInput.repository.hooks,
       };
 
@@ -136,6 +137,7 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
           directoryName: repoInput.name,
           allowedTools: repoConfig.allowedTools,
           rolePrompts: repoConfig.rolePrompts,
+          setup: repoConfig.setup,
           hooks: repoConfig.hooks,
         });
       }
