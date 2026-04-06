@@ -39,6 +39,7 @@ export interface RepositoryConfig {
   allowedTools?: string[];
   rolePrompts?: RolePrompts;
   hooks?: string[];
+  setup?: string[];
 }
 
 export interface CreateItemRepositoryInput {

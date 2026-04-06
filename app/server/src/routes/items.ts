@@ -12,7 +12,14 @@ import {
   listItems,
   getItemDetail,
   updateItem,
+  updateRepoSetup,
+  rerunRepoSetup,
+  validateRepoSetupRunPreConditions,
   deleteItem,
+  ItemNotFoundError,
+  RepoNotFoundError,
+  UnsupportedRepoTypeError,
+  WorkspaceNotExistsError,
 } from '../services/item-service';
 import { createDraftPrsForAllRepos } from '../services/git-pr-service';
 import { ensureCompletedReviewPassed } from '../services/completed-review-service';
@@ -23,6 +30,7 @@ import {
 } from '../services/review-receive-service';
 import { withItemLock, isItemLocked } from '../lib/locks';
 import { AllowedToolsFormatError, RolePromptsFormatError } from '../lib/role-loader';
+import { normalizeCommandList } from '../lib/validation';
 
 export const itemRoutes: FastifyPluginAsync = async (fastify) => {
   // Create a new item
@@ -31,7 +39,30 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
     Reply: ApiResponse<CreateItemResponse>;
   }>('/items', async (request, reply) => {
     try {
-      const item = await createItem(request.body);
+      // Validate and normalize setup commands, building a clean copy of repositories
+      const normalizedRepositories = [];
+      for (const repoInput of request.body.repositories || []) {
+        if (repoInput.repository?.setup !== undefined) {
+          if (repoInput.repository.type === 'local') {
+            return reply.status(400).send({
+              success: false,
+              error: 'setup is only supported for remote repositories',
+            });
+          }
+          const normalizedSetup = normalizeCommandList('setup', repoInput.repository.setup, 'setup command');
+          if (normalizedSetup.error) {
+            return reply.status(400).send({ success: false, error: normalizedSetup.error });
+          }
+          normalizedRepositories.push({
+            ...repoInput,
+            repository: { ...repoInput.repository, setup: normalizedSetup.commands },
+          });
+        } else {
+          normalizedRepositories.push(repoInput);
+        }
+      }
+
+      const item = await createItem({ ...request.body, repositories: normalizedRepositories });
 
       // Start workspace setup in background (clone or link)
       setupWorkspace(item.id).catch((error) => {
@@ -156,6 +187,95 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
         success: false,
         error: message,
       });
+    }
+  });
+
+  // Update setup commands for a repository
+  fastify.patch<{
+    Params: { id: string; repoName: string };
+    Body: { setup: unknown };
+    Reply: ApiResponse<{ item: import('@agent-orch/shared').ItemConfig }>;
+  }>('/items/:id/repositories/:repoName/setup', async (request, reply) => {
+    try {
+      const normalizedSetup = normalizeCommandList('setup', request.body.setup, 'setup command');
+      if (normalizedSetup.error) {
+        return reply.status(400).send({ success: false, error: normalizedSetup.error });
+      }
+      if (!normalizedSetup.commands) {
+        return reply.status(400).send({ success: false, error: 'setup is required' });
+      }
+
+      const item = await updateRepoSetup(
+        request.params.id,
+        request.params.repoName,
+        normalizedSetup.commands
+      );
+      if (!item) {
+        return reply.status(404).send({ success: false, error: 'Item not found' });
+      }
+
+      return reply.send({ success: true, data: { item } });
+    } catch (error) {
+      if (error instanceof RepoNotFoundError) {
+        return reply.status(404).send({ success: false, error: error.message });
+      }
+      if (error instanceof UnsupportedRepoTypeError) {
+        return reply.status(400).send({ success: false, error: error.message });
+      }
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return reply.status(500).send({ success: false, error: message });
+    }
+  });
+
+  // Re-run setup commands for a repository
+  fastify.post<{
+    Params: { id: string; repoName: string };
+    Reply: ApiResponse<{ started: boolean }>;
+  }>('/items/:id/repositories/:repoName/setup/run', async (request, reply) => {
+    try {
+      if (isItemLocked(request.params.id)) {
+        return reply.status(409).send({
+          success: false,
+          error: 'Operation already in progress for this item',
+        });
+      }
+
+      // Validate pre-conditions (synchronous, fast)
+      try {
+        await validateRepoSetupRunPreConditions(request.params.id, request.params.repoName);
+      } catch (error) {
+        if (error instanceof ItemNotFoundError) {
+          return reply.status(404).send({ success: false, error: error.message });
+        }
+        if (error instanceof RepoNotFoundError) {
+          return reply.status(404).send({ success: false, error: error.message });
+        }
+        if (error instanceof UnsupportedRepoTypeError) {
+          return reply.status(400).send({ success: false, error: error.message });
+        }
+        if (error instanceof WorkspaceNotExistsError) {
+          return reply.status(400).send({ success: false, error: error.message });
+        }
+        throw error;
+      }
+
+      // Fire-and-forget with item lock to prevent concurrent runs
+      withItemLock(request.params.id, () =>
+        rerunRepoSetup(request.params.id, request.params.repoName)
+      ).catch((error) => {
+        fastify.log.error(
+          { itemId: request.params.id, repoName: request.params.repoName, error },
+          'Setup command re-run failed'
+        );
+      });
+
+      return reply.status(202).send({
+        success: true,
+        data: { started: true },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return reply.status(500).send({ success: false, error: message });
     }
   });
 

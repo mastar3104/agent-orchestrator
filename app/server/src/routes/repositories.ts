@@ -17,32 +17,7 @@ import {
   deleteRepository,
 } from '../services/repository-service';
 import { AllowedToolsFormatError, RolePromptsFormatError } from '../lib/role-loader';
-
-function normalizeCommandList(
-  fieldName: string,
-  value: unknown,
-  itemLabel: string
-): { commands?: string[]; error?: string } {
-  if (value === undefined) {
-    return {};
-  }
-  if (!Array.isArray(value)) {
-    return { error: `${fieldName} must be an array` };
-  }
-
-  const commands: string[] = [];
-  for (const entry of value) {
-    if (typeof entry !== 'string') {
-      return { error: `Each ${itemLabel} must be a non-empty string` };
-    }
-    const trimmed = entry.trim();
-    if (trimmed.length > 0) {
-      commands.push(trimmed);
-    }
-  }
-
-  return { commands };
-}
+import { normalizeCommandList } from '../lib/validation';
 
 export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
   // List all repositories
@@ -127,12 +102,12 @@ export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(400).send({ success: false, error: normalizedHooks.error });
       }
 
+      if (request.body.type === 'local' && request.body.setup !== undefined) {
+        return reply.status(400).send({ success: false, error: 'setup is only supported for remote repositories' });
+      }
       const normalizedSetup = normalizeCommandList('setup', request.body.setup, 'setup command');
       if (normalizedSetup.error) {
         return reply.status(400).send({ success: false, error: normalizedSetup.error });
-      }
-      if (request.body.type === 'local' && request.body.setup !== undefined) {
-        return reply.status(400).send({ success: false, error: 'setup is only supported for remote repositories' });
       }
 
       const repository = await createRepository({
@@ -168,14 +143,16 @@ export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(400).send({ success: false, error: normalizedHooks.error });
       }
 
-      const existing = request.body.setup !== undefined ? await getRepository(request.params.id) : null;
-      if (request.body.setup !== undefined && !existing) {
+      // Fetch existing repo unconditionally — PATCH should verify existence up front
+      const existing = await getRepository(request.params.id);
+      if (!existing) {
         return reply.status(404).send({
           success: false,
           error: 'Repository not found',
         });
       }
-      if (existing?.type === 'local') {
+
+      if (request.body.setup !== undefined && existing.type === 'local') {
         return reply.status(400).send({ success: false, error: 'setup is only supported for remote repositories' });
       }
 

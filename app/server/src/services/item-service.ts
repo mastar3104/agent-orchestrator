@@ -72,6 +72,34 @@ import {
 import { getLatestCompletedReview } from './completed-review-service';
 import { isCompletedReviewRequired } from '../lib/verification-policy';
 
+export class ItemNotFoundError extends Error {
+  constructor(itemId: string) {
+    super('Item not found');
+    this.name = 'ItemNotFoundError';
+  }
+}
+
+export class RepoNotFoundError extends Error {
+  constructor(repoName: string, itemId: string) {
+    super(`Repository "${repoName}" not found in item ${itemId}`);
+    this.name = 'RepoNotFoundError';
+  }
+}
+
+export class UnsupportedRepoTypeError extends Error {
+  constructor(message = 'setup is only supported for remote repositories') {
+    super(message);
+    this.name = 'UnsupportedRepoTypeError';
+  }
+}
+
+export class WorkspaceNotExistsError extends Error {
+  constructor(repoName: string) {
+    super(`Workspace directory does not exist for repository "${repoName}"`);
+    this.name = 'WorkspaceNotExistsError';
+  }
+}
+
 export async function createItem(request: CreateItemRequest): Promise<ItemConfig> {
   const id = `ITEM-${nanoid(8)}`;
   const now = new Date().toISOString();
@@ -120,6 +148,7 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
         linkMode: repoInput.repository.linkMode,
         allowedTools: repoInput.allowedTools || repoInput.repository.allowedTools,
         rolePrompts: repoInput.repository.rolePrompts,
+        setup: repoInput.repository.setup,
         hooks: repoInput.repository.hooks,
       };
 
@@ -136,6 +165,7 @@ export async function createItem(request: CreateItemRequest): Promise<ItemConfig
           directoryName: repoInput.name,
           allowedTools: repoConfig.allowedTools,
           rolePrompts: repoConfig.rolePrompts,
+          setup: repoConfig.setup,
           hooks: repoConfig.hooks,
         });
       }
@@ -363,6 +393,7 @@ async function runRepoSetupCommands(
   try {
     results = await runShellCommands(commands, repoDir, {
       logDir: getRepoSetupLogDir(itemId, repo.name),
+      // Re-runs intentionally use attempt 1, replacing previous log files
       attempt: 1,
       stopOnError: true,
     });
@@ -950,6 +981,91 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
     repos,
     workflow,
   };
+}
+
+export async function updateRepoSetup(
+  itemId: string,
+  repoName: string,
+  setup: string[]
+): Promise<ItemConfig | null> {
+  const config = await getItemConfig(itemId);
+  if (!config) {
+    return null;
+  }
+
+  const repoIndex = config.repositories.findIndex(r => r.name === repoName);
+  if (repoIndex === -1) {
+    throw new RepoNotFoundError(repoName, itemId);
+  }
+
+  const repo = config.repositories[repoIndex];
+  if (repo.type !== 'remote') {
+    throw new UnsupportedRepoTypeError();
+  }
+
+  const updated: ItemConfig = {
+    ...config,
+    repositories: config.repositories.map((r, i) =>
+      i === repoIndex ? { ...r, setup } : r
+    ),
+    updatedAt: new Date().toISOString(),
+  };
+
+  await writeYaml(getItemConfigPath(itemId), updated);
+  return updated;
+}
+
+export async function rerunRepoSetup(
+  itemId: string,
+  repoName: string
+): Promise<void> {
+  const config = await getItemConfig(itemId);
+  if (!config) {
+    throw new Error(`Item ${itemId} not found`);
+  }
+
+  const repo = config.repositories.find(r => r.name === repoName);
+  if (!repo) {
+    throw new RepoNotFoundError(repoName, itemId);
+  }
+
+  if (repo.type !== 'remote') {
+    throw new UnsupportedRepoTypeError();
+  }
+
+  const repoDir = getRepoWorkspaceDir(itemId, repoName);
+  if (!existsSync(repoDir)) {
+    throw new Error(`Workspace directory does not exist for repository "${repoName}" in item ${itemId}`);
+  }
+  const eventsPath = getItemEventsPath(itemId);
+  await runRepoSetupCommands(itemId, repo, repoDir, eventsPath);
+}
+
+export function repoWorkspaceExists(itemId: string, repoName: string): boolean {
+  return existsSync(getRepoWorkspaceDir(itemId, repoName));
+}
+
+export async function validateRepoSetupRunPreConditions(
+  itemId: string,
+  repoName: string
+): Promise<void> {
+  const config = await getItemConfig(itemId);
+  if (!config) {
+    throw new ItemNotFoundError(itemId);
+  }
+
+  const repo = config.repositories.find(r => r.name === repoName);
+  if (!repo) {
+    throw new RepoNotFoundError(repoName, itemId);
+  }
+
+  if (repo.type !== 'remote') {
+    throw new UnsupportedRepoTypeError();
+  }
+
+  if (!repoWorkspaceExists(itemId, repoName)) {
+    throw new WorkspaceNotExistsError(repoName);
+  }
 }
 
 export async function updateItem(

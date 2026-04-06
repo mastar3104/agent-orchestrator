@@ -226,3 +226,31 @@ export async function startReviewReceive(
     }
   );
 }
+
+// Setup Commands
+export async function updateRepoSetup(
+  itemId: string,
+  repoName: string,
+  setup: string[]
+): Promise<{ item: ItemConfig }> {
+  return request<{ item: ItemConfig }>(
+    `/items/${encodeURIComponent(itemId)}/repositories/${encodeURIComponent(repoName)}/setup`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ setup }),
+    }
+  );
+}
+
+export async function runRepoSetup(
+  itemId: string,
+  repoName: string
+): Promise<StartAsyncResponse> {
+  return request<StartAsyncResponse>(
+    `/items/${encodeURIComponent(itemId)}/repositories/${encodeURIComponent(repoName)}/setup/run`,
+    {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }
+  );
+}

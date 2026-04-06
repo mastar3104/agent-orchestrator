@@ -92,13 +92,14 @@ vi.mock('../../lib/command-runner', () => ({
 }));
 
 import { writeYaml } from '../../lib/yaml';
-import { getRepository } from '../repository-service';
+import { getRepository, createRepository } from '../repository-service';
 import { createItem } from '../item-service';
 
 const mockWriteYaml = vi.mocked(writeYaml);
 const mockGetRepository = vi.mocked(getRepository);
+const mockCreateRepository = vi.mocked(createRepository);
 
-describe('createItem hooksMaxAttempts propagation', () => {
+describe('createItem repository config propagation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -179,6 +180,65 @@ describe('createItem hooksMaxAttempts propagation', () => {
             setup: ['yarn install --frozen-lockfile'],
           }),
         ],
+      })
+    );
+  });
+
+  it('copies setup commands from an inline repository config into item.yaml runtime config', async () => {
+    const item = await createItem({
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        {
+          name: 'repo-a',
+          repository: {
+            type: 'remote',
+            url: 'https://github.com/example/repo.git',
+            setup: ['npm ci', 'npm run build'],
+          },
+        },
+      ],
+    });
+
+    expect(item.repositories[0]).toMatchObject({
+      name: 'repo-a',
+      setup: ['npm ci', 'npm run build'],
+    });
+    expect(mockWriteYaml).toHaveBeenCalledWith(
+      '/items/ITEM-testitem/item.yaml',
+      expect.objectContaining({
+        repositories: [
+          expect.objectContaining({
+            name: 'repo-a',
+            setup: ['npm ci', 'npm run build'],
+          }),
+        ],
+      })
+    );
+  });
+
+  it('forwards setup commands to createRepository when saveRepository is true', async () => {
+    await createItem({
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        {
+          name: 'repo-a',
+          repository: {
+            type: 'remote',
+            url: 'https://github.com/example/repo.git',
+            setup: ['npm ci'],
+          },
+          saveRepository: true,
+          repositoryName: 'saved',
+        },
+      ],
+    });
+
+    expect(mockCreateRepository).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'saved',
+        setup: ['npm ci'],
       })
     );
   });

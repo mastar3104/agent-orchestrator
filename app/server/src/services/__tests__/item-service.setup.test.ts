@@ -123,14 +123,25 @@ vi.mock('../task-state-service', () => ({
 }));
 
 import { existsSync } from 'fs';
-import { readYamlSafe } from '../../lib/yaml';
+import { readYamlSafe, writeYaml } from '../../lib/yaml';
 import { appendJsonl } from '../../lib/jsonl';
 import { runShellCommands } from '../../lib/command-runner';
 import { startPlanner } from '../planner-service';
-import { setupWorkspace } from '../item-service';
+import {
+  setupWorkspace,
+  updateRepoSetup,
+  rerunRepoSetup,
+  repoWorkspaceExists,
+  validateRepoSetupRunPreConditions,
+  ItemNotFoundError,
+  RepoNotFoundError,
+  UnsupportedRepoTypeError,
+  WorkspaceNotExistsError,
+} from '../item-service';
 
 const mockExistsSync = vi.mocked(existsSync);
 const mockReadYamlSafe = vi.mocked(readYamlSafe);
+const mockWriteYaml = vi.mocked(writeYaml);
 const mockAppendJsonl = vi.mocked(appendJsonl);
 const mockRunShellCommands = vi.mocked(runShellCommands);
 const mockStartPlanner = vi.mocked(startPlanner);
@@ -284,5 +295,278 @@ describe('setupWorkspace repository setup commands', () => {
       'workspace_setup_completed',
     ]);
     expect(mockStartPlanner).toHaveBeenCalledWith('ITEM-1');
+  });
+});
+
+describe('updateRepoSetup', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockWriteYaml.mockResolvedValue(undefined);
+  });
+
+  const baseConfig = {
+    id: 'ITEM-1',
+    name: 'Item',
+    description: 'desc',
+    repositories: [
+      {
+        name: 'repo-a',
+        type: 'remote' as const,
+        url: 'https://github.com/example/repo.git',
+        setup: ['npm install'],
+      },
+      {
+        name: 'repo-b',
+        type: 'local' as const,
+        localPath: '/src/local-repo',
+        linkMode: 'copy' as const,
+      },
+    ],
+    createdAt: '2026-01-01T00:00:00Z',
+    updatedAt: '2026-01-01T00:00:00Z',
+  };
+
+  it('returns null when item not found', async () => {
+    mockReadYamlSafe.mockResolvedValue(null);
+    const result = await updateRepoSetup('ITEM-NONE', 'repo-a', ['npm install']);
+    expect(result).toBeNull();
+    expect(mockWriteYaml).not.toHaveBeenCalled();
+  });
+
+  it('throws RepoNotFoundError when repo not found', async () => {
+    mockReadYamlSafe.mockResolvedValue(baseConfig);
+    await expect(updateRepoSetup('ITEM-1', 'repo-x', ['npm install']))
+      .rejects.toThrow(RepoNotFoundError);
+  });
+
+  it('throws UnsupportedRepoTypeError when repo is local', async () => {
+    mockReadYamlSafe.mockResolvedValue(baseConfig);
+    await expect(updateRepoSetup('ITEM-1', 'repo-b', ['npm install']))
+      .rejects.toThrow(UnsupportedRepoTypeError);
+  });
+
+  it('writes updated config with new setup array and updated timestamp', async () => {
+    mockReadYamlSafe.mockResolvedValue(baseConfig);
+    const result = await updateRepoSetup('ITEM-1', 'repo-a', ['yarn install', 'yarn build']);
+
+    expect(result).not.toBeNull();
+    expect(result!.repositories[0].setup).toEqual(['yarn install', 'yarn build']);
+    // Other repo unchanged
+    expect(result!.repositories[1]).toEqual(baseConfig.repositories[1]);
+    expect(result!.updatedAt).not.toBe(baseConfig.updatedAt);
+    expect(mockWriteYaml).toHaveBeenCalledWith(
+      '/items/ITEM-1/item.yaml',
+      expect.objectContaining({
+        repositories: expect.arrayContaining([
+          expect.objectContaining({ name: 'repo-a', setup: ['yarn install', 'yarn build'] }),
+        ]),
+      })
+    );
+  });
+});
+
+describe('rerunRepoSetup', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('throws when item not found', async () => {
+    mockReadYamlSafe.mockResolvedValue(null);
+    await expect(rerunRepoSetup('ITEM-NONE', 'repo-a'))
+      .rejects.toThrow('Item ITEM-NONE not found');
+  });
+
+  it('throws RepoNotFoundError when repo not found', async () => {
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [{ name: 'repo-a', type: 'remote', url: 'https://github.com/example/repo.git' }],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+    await expect(rerunRepoSetup('ITEM-1', 'repo-x'))
+      .rejects.toThrow(RepoNotFoundError);
+  });
+
+  it('throws UnsupportedRepoTypeError when repo is local', async () => {
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [{ name: 'repo-a', type: 'local', localPath: '/src/local-repo', linkMode: 'copy' }],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+    await expect(rerunRepoSetup('ITEM-1', 'repo-a'))
+      .rejects.toThrow(UnsupportedRepoTypeError);
+  });
+
+  it('calls runRepoSetupCommands with correct repoDir and eventsPath', async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        {
+          name: 'repo-a',
+          type: 'remote',
+          url: 'https://github.com/example/repo.git',
+          setup: ['npm install'],
+        },
+      ],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+    mockRunShellCommands.mockResolvedValue([
+      { command: 'npm install', exitCode: 0, stdout: 'ok', stderr: '', durationMs: 10, timedOut: false },
+    ]);
+
+    await rerunRepoSetup('ITEM-1', 'repo-a');
+
+    expect(mockRunShellCommands).toHaveBeenCalledWith(
+      ['npm install'],
+      '/items/ITEM-1/workspace/repo-a',
+      expect.objectContaining({
+        logDir: '/items/ITEM-1/setup/repo-a',
+        // Re-runs intentionally use attempt 1, replacing previous log files
+        attempt: 1,
+        stopOnError: true,
+      })
+    );
+    expect(mockAppendJsonl).toHaveBeenCalledWith(
+      '/items/ITEM-1/events.jsonl',
+      expect.objectContaining({ type: 'repo_setup_started' })
+    );
+    expect(mockAppendJsonl).toHaveBeenCalledWith(
+      '/items/ITEM-1/events.jsonl',
+      expect.objectContaining({ type: 'repo_setup_completed', repoName: 'repo-a', allPassed: true })
+    );
+  });
+
+  it('does nothing when repo has no setup commands', async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        { name: 'repo-a', type: 'remote', url: 'https://github.com/example/repo.git' },
+      ],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+
+    await rerunRepoSetup('ITEM-1', 'repo-a');
+
+    expect(mockRunShellCommands).not.toHaveBeenCalled();
+    expect(mockAppendJsonl).not.toHaveBeenCalled();
+  });
+
+  it('throws when workspace directory does not exist', async () => {
+    mockExistsSync.mockReturnValue(false);
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        {
+          name: 'repo-a',
+          type: 'remote',
+          url: 'https://github.com/example/repo.git',
+          setup: ['npm install'],
+        },
+      ],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+
+    await expect(rerunRepoSetup('ITEM-1', 'repo-a'))
+      .rejects.toThrow('Workspace directory does not exist for repository "repo-a"');
+  });
+});
+
+describe('repoWorkspaceExists', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns true when workspace directory exists', () => {
+    mockExistsSync.mockReturnValue(true);
+    expect(repoWorkspaceExists('ITEM-1', 'repo-a')).toBe(true);
+    expect(mockExistsSync).toHaveBeenCalledWith('/items/ITEM-1/workspace/repo-a');
+  });
+
+  it('returns false when workspace directory does not exist', () => {
+    mockExistsSync.mockReturnValue(false);
+    expect(repoWorkspaceExists('ITEM-1', 'repo-a')).toBe(false);
+    expect(mockExistsSync).toHaveBeenCalledWith('/items/ITEM-1/workspace/repo-a');
+  });
+});
+
+describe('validateRepoSetupRunPreConditions', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('throws ItemNotFoundError when item not found', async () => {
+    mockReadYamlSafe.mockResolvedValue(null);
+    await expect(validateRepoSetupRunPreConditions('ITEM-NONE', 'repo-a'))
+      .rejects.toThrow(ItemNotFoundError);
+  });
+
+  it('throws RepoNotFoundError when repo not found', async () => {
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [{ name: 'repo-a', type: 'remote', url: 'https://github.com/example/repo.git' }],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+    await expect(validateRepoSetupRunPreConditions('ITEM-1', 'repo-x'))
+      .rejects.toThrow(RepoNotFoundError);
+  });
+
+  it('throws UnsupportedRepoTypeError when repo is local', async () => {
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [{ name: 'repo-a', type: 'local', localPath: '/src/local-repo', linkMode: 'copy' }],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+    await expect(validateRepoSetupRunPreConditions('ITEM-1', 'repo-a'))
+      .rejects.toThrow(UnsupportedRepoTypeError);
+  });
+
+  it('throws WorkspaceNotExistsError when workspace does not exist', async () => {
+    mockExistsSync.mockReturnValue(false);
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [{ name: 'repo-a', type: 'remote', url: 'https://github.com/example/repo.git' }],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+    await expect(validateRepoSetupRunPreConditions('ITEM-1', 'repo-a'))
+      .rejects.toThrow(WorkspaceNotExistsError);
+  });
+
+  it('resolves when all pre-conditions pass', async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [{ name: 'repo-a', type: 'remote', url: 'https://github.com/example/repo.git' }],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+    await expect(validateRepoSetupRunPreConditions('ITEM-1', 'repo-a'))
+      .resolves.toBeUndefined();
   });
 });
