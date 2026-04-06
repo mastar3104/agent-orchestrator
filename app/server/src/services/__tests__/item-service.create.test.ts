@@ -183,6 +183,39 @@ describe('createItem hooksMaxAttempts propagation', () => {
     );
   });
 
+  it('copies setup commands from an inline repository config into item.yaml runtime config', async () => {
+    const item = await createItem({
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        {
+          name: 'repo-a',
+          repository: {
+            type: 'remote',
+            url: 'https://github.com/example/repo.git',
+            setup: ['npm ci', 'npm run build'],
+          },
+        },
+      ],
+    });
+
+    expect(item.repositories[0]).toMatchObject({
+      name: 'repo-a',
+      setup: ['npm ci', 'npm run build'],
+    });
+    expect(mockWriteYaml).toHaveBeenCalledWith(
+      '/items/ITEM-testitem/item.yaml',
+      expect.objectContaining({
+        repositories: [
+          expect.objectContaining({
+            name: 'repo-a',
+            setup: ['npm ci', 'npm run build'],
+          }),
+        ],
+      })
+    );
+  });
+
   it('copies rolePrompts from a saved repository into item.yaml runtime config', async () => {
     mockGetRepository.mockResolvedValue({
       id: 'REPO-1',

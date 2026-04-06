@@ -30,9 +30,11 @@ vi.mock('../../lib/locks', () => ({
   isItemLocked: vi.fn().mockReturnValue(false),
 }));
 
+import { createItem } from '../../services/item-service';
 import { ensureCompletedReviewPassed } from '../../services/completed-review-service';
 import { createDraftPrsForAllRepos } from '../../services/git-pr-service';
 
+const mockCreateItem = vi.mocked(createItem);
 const mockEnsureCompletedReviewPassed = vi.mocked(ensureCompletedReviewPassed);
 const mockCreateDraftPrsForAllRepos = vi.mocked(createDraftPrsForAllRepos);
 
@@ -61,6 +63,114 @@ describe('item routes', () => {
         },
       ],
     });
+  });
+
+  it('returns 400 when setup is provided for a local repository in POST /items', async () => {
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/items',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'Item',
+        description: 'desc',
+        repositories: [
+          {
+            name: 'repo-a',
+            repository: {
+              type: 'local',
+              localPath: '/tmp/repo-a',
+              setup: ['npm install'],
+            },
+          },
+        ],
+      }),
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe('setup is only supported for remote repositories');
+    expect(mockCreateItem).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when setup contains non-string entries in POST /items', async () => {
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/items',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'Item',
+        description: 'desc',
+        repositories: [
+          {
+            name: 'repo-a',
+            repository: {
+              type: 'remote',
+              url: 'https://github.com/test/repo.git',
+              setup: ['npm install', 123],
+            },
+          },
+        ],
+      }),
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe('Each setup command must be a non-empty string');
+    expect(mockCreateItem).not.toHaveBeenCalled();
+  });
+
+  it('normalizes setup commands and passes them through to createItem', async () => {
+    mockCreateItem.mockResolvedValue({
+      id: 'ITEM-test',
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        {
+          name: 'repo-a',
+          type: 'remote',
+          url: 'https://github.com/test/repo.git',
+          workBranch: 'work/ITEM-test/repo-a',
+          setup: ['npm install', 'npm run build'],
+        },
+      ],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/items',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'Item',
+        description: 'desc',
+        repositories: [
+          {
+            name: 'repo-a',
+            repository: {
+              type: 'remote',
+              url: 'https://github.com/test/repo.git',
+              setup: ['  npm install  ', '   ', 'npm run build'],
+            },
+          },
+        ],
+      }),
+    });
+
+    expect(res.statusCode).toBe(201);
+    // Verify normalized setup was passed to createItem (trimmed, blanks removed)
+    expect(mockCreateItem).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repositories: [
+          expect.objectContaining({
+            repository: expect.objectContaining({
+              setup: ['npm install', 'npm run build'],
+            }),
+          }),
+        ],
+      })
+    );
   });
 
   it('rejects publish before completed review passes', async () => {
