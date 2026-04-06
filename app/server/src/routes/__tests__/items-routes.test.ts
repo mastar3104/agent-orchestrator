@@ -10,11 +10,10 @@ vi.mock('../../services/item-service', async (importOriginal) => {
     setupWorkspace: vi.fn(),
     listItems: vi.fn().mockResolvedValue([]),
     getItemDetail: vi.fn().mockResolvedValue(null),
-    getItemConfig: vi.fn().mockResolvedValue(null),
     updateItem: vi.fn().mockResolvedValue(null),
     updateRepoSetup: vi.fn().mockResolvedValue(null),
     rerunRepoSetup: vi.fn().mockResolvedValue(undefined),
-    repoWorkspaceExists: vi.fn().mockReturnValue(false),
+    validateRepoSetupRunPreConditions: vi.fn().mockResolvedValue(undefined),
     deleteItem: vi.fn().mockResolvedValue(false),
   };
 });
@@ -38,15 +37,24 @@ vi.mock('../../lib/locks', () => ({
   isItemLocked: vi.fn().mockReturnValue(false),
 }));
 
-import { createItem, getItemConfig, updateRepoSetup, rerunRepoSetup, repoWorkspaceExists, RepoNotFoundError, UnsupportedRepoTypeError } from '../../services/item-service';
+import {
+  createItem,
+  updateRepoSetup,
+  rerunRepoSetup,
+  validateRepoSetupRunPreConditions,
+  ItemNotFoundError,
+  RepoNotFoundError,
+  UnsupportedRepoTypeError,
+  WorkspaceNotExistsError,
+} from '../../services/item-service';
 import { ensureCompletedReviewPassed } from '../../services/completed-review-service';
 import { createDraftPrsForAllRepos } from '../../services/git-pr-service';
+import { withItemLock, isItemLocked } from '../../lib/locks';
 
 const mockCreateItem = vi.mocked(createItem);
-const mockGetItemConfig = vi.mocked(getItemConfig);
 const mockUpdateRepoSetup = vi.mocked(updateRepoSetup);
 const mockRerunRepoSetup = vi.mocked(rerunRepoSetup);
-const mockRepoWorkspaceExists = vi.mocked(repoWorkspaceExists);
+const mockValidatePreConditions = vi.mocked(validateRepoSetupRunPreConditions);
 const mockEnsureCompletedReviewPassed = vi.mocked(ensureCompletedReviewPassed);
 const mockCreateDraftPrsForAllRepos = vi.mocked(createDraftPrsForAllRepos);
 
@@ -468,8 +476,22 @@ describe('item routes', () => {
   });
 
   describe('POST /items/:id/repositories/:repoName/setup/run', () => {
+    it('returns 409 when item is locked', async () => {
+      vi.mocked(isItemLocked).mockReturnValue(true);
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/items/item-1/repositories/repo-a/setup/run',
+      });
+
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error).toBe('Operation already in progress for this item');
+      expect(mockRerunRepoSetup).not.toHaveBeenCalled();
+      vi.mocked(isItemLocked).mockReturnValue(false);
+    });
+
     it('returns 404 when item not found', async () => {
-      mockGetItemConfig.mockResolvedValue(null);
+      mockValidatePreConditions.mockRejectedValue(new ItemNotFoundError('item-1'));
       const app = buildApp();
       const res = await app.inject({
         method: 'POST',
@@ -481,13 +503,7 @@ describe('item routes', () => {
     });
 
     it('returns 404 when repo not found', async () => {
-      mockGetItemConfig.mockResolvedValue({
-        id: 'item-1',
-        name: 'test',
-        repositories: [{ name: 'repo-b', type: 'remote' }],
-        createdAt: '2026-01-01T00:00:00Z',
-        updatedAt: '2026-01-01T00:00:00Z',
-      });
+      mockValidatePreConditions.mockRejectedValue(new RepoNotFoundError('repo-a', 'item-1'));
       const app = buildApp();
       const res = await app.inject({
         method: 'POST',
@@ -495,17 +511,11 @@ describe('item routes', () => {
       });
 
       expect(res.statusCode).toBe(404);
-      expect(res.json().error).toBe('Repository "repo-a" not found');
+      expect(res.json().error).toBe('Repository "repo-a" not found in item item-1');
     });
 
     it('returns 400 when repo is local', async () => {
-      mockGetItemConfig.mockResolvedValue({
-        id: 'item-1',
-        name: 'test',
-        repositories: [{ name: 'repo-a', type: 'local', localPath: '/tmp/repo' }],
-        createdAt: '2026-01-01T00:00:00Z',
-        updatedAt: '2026-01-01T00:00:00Z',
-      });
+      mockValidatePreConditions.mockRejectedValue(new UnsupportedRepoTypeError());
       const app = buildApp();
       const res = await app.inject({
         method: 'POST',
@@ -517,14 +527,7 @@ describe('item routes', () => {
     });
 
     it('returns 400 when workspace directory does not exist', async () => {
-      mockGetItemConfig.mockResolvedValue({
-        id: 'item-1',
-        name: 'test',
-        repositories: [{ name: 'repo-a', type: 'remote', url: 'https://github.com/test/repo.git' }],
-        createdAt: '2026-01-01T00:00:00Z',
-        updatedAt: '2026-01-01T00:00:00Z',
-      });
-      mockRepoWorkspaceExists.mockReturnValue(false);
+      mockValidatePreConditions.mockRejectedValue(new WorkspaceNotExistsError('repo-a'));
       const app = buildApp();
       const res = await app.inject({
         method: 'POST',
@@ -536,14 +539,7 @@ describe('item routes', () => {
     });
 
     it('returns 202 and fires setup re-run in background', async () => {
-      mockGetItemConfig.mockResolvedValue({
-        id: 'item-1',
-        name: 'test',
-        repositories: [{ name: 'repo-a', type: 'remote', url: 'https://github.com/test/repo.git', setup: ['npm install'] }],
-        createdAt: '2026-01-01T00:00:00Z',
-        updatedAt: '2026-01-01T00:00:00Z',
-      });
-      mockRepoWorkspaceExists.mockReturnValue(true);
+      mockValidatePreConditions.mockResolvedValue(undefined);
       mockRerunRepoSetup.mockResolvedValue(undefined);
       const app = buildApp();
       const res = await app.inject({
@@ -554,6 +550,7 @@ describe('item routes', () => {
       expect(res.statusCode).toBe(202);
       expect(res.json()).toEqual({ success: true, data: { started: true } });
       expect(mockRerunRepoSetup).toHaveBeenCalledWith('item-1', 'repo-a');
+      expect(vi.mocked(withItemLock)).toHaveBeenCalledWith('item-1', expect.any(Function));
     });
   });
 

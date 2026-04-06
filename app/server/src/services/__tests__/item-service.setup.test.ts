@@ -132,8 +132,11 @@ import {
   updateRepoSetup,
   rerunRepoSetup,
   repoWorkspaceExists,
+  validateRepoSetupRunPreConditions,
+  ItemNotFoundError,
   RepoNotFoundError,
   UnsupportedRepoTypeError,
+  WorkspaceNotExistsError,
 } from '../item-service';
 
 const mockExistsSync = vi.mocked(existsSync);
@@ -427,6 +430,9 @@ describe('rerunRepoSetup', () => {
       '/items/ITEM-1/workspace/repo-a',
       expect.objectContaining({
         logDir: '/items/ITEM-1/setup/repo-a',
+        // Re-runs intentionally use attempt 1, replacing previous log files
+        attempt: 1,
+        stopOnError: true,
       })
     );
     expect(mockAppendJsonl).toHaveBeenCalledWith(
@@ -496,5 +502,71 @@ describe('repoWorkspaceExists', () => {
     mockExistsSync.mockReturnValue(false);
     expect(repoWorkspaceExists('ITEM-1', 'repo-a')).toBe(false);
     expect(mockExistsSync).toHaveBeenCalledWith('/items/ITEM-1/workspace/repo-a');
+  });
+});
+
+describe('validateRepoSetupRunPreConditions', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('throws ItemNotFoundError when item not found', async () => {
+    mockReadYamlSafe.mockResolvedValue(null);
+    await expect(validateRepoSetupRunPreConditions('ITEM-NONE', 'repo-a'))
+      .rejects.toThrow(ItemNotFoundError);
+  });
+
+  it('throws RepoNotFoundError when repo not found', async () => {
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [{ name: 'repo-a', type: 'remote', url: 'https://github.com/example/repo.git' }],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+    await expect(validateRepoSetupRunPreConditions('ITEM-1', 'repo-x'))
+      .rejects.toThrow(RepoNotFoundError);
+  });
+
+  it('throws UnsupportedRepoTypeError when repo is local', async () => {
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [{ name: 'repo-a', type: 'local', localPath: '/src/local-repo', linkMode: 'copy' }],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+    await expect(validateRepoSetupRunPreConditions('ITEM-1', 'repo-a'))
+      .rejects.toThrow(UnsupportedRepoTypeError);
+  });
+
+  it('throws WorkspaceNotExistsError when workspace does not exist', async () => {
+    mockExistsSync.mockReturnValue(false);
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [{ name: 'repo-a', type: 'remote', url: 'https://github.com/example/repo.git' }],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+    await expect(validateRepoSetupRunPreConditions('ITEM-1', 'repo-a'))
+      .rejects.toThrow(WorkspaceNotExistsError);
+  });
+
+  it('resolves when all pre-conditions pass', async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [{ name: 'repo-a', type: 'remote', url: 'https://github.com/example/repo.git' }],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+    await expect(validateRepoSetupRunPreConditions('ITEM-1', 'repo-a'))
+      .resolves.toBeUndefined();
   });
 });

@@ -11,14 +11,15 @@ import {
   setupWorkspace,
   listItems,
   getItemDetail,
-  getItemConfig,
   updateItem,
   updateRepoSetup,
   rerunRepoSetup,
-  repoWorkspaceExists,
+  validateRepoSetupRunPreConditions,
   deleteItem,
+  ItemNotFoundError,
   RepoNotFoundError,
   UnsupportedRepoTypeError,
+  WorkspaceNotExistsError,
 } from '../services/item-service';
 import { createDraftPrsForAllRepos } from '../services/git-pr-service';
 import { ensureCompletedReviewPassed } from '../services/completed-review-service';
@@ -239,31 +240,23 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
         });
       }
 
-      const config = await getItemConfig(request.params.id);
-      if (!config) {
-        return reply.status(404).send({ success: false, error: 'Item not found' });
-      }
-
-      const repo = config.repositories.find(r => r.name === request.params.repoName);
-      if (!repo) {
-        return reply.status(404).send({
-          success: false,
-          error: `Repository "${request.params.repoName}" not found`,
-        });
-      }
-
-      if (repo.type !== 'remote') {
-        return reply.status(400).send({
-          success: false,
-          error: 'setup is only supported for remote repositories',
-        });
-      }
-
-      if (!repoWorkspaceExists(request.params.id, request.params.repoName)) {
-        return reply.status(400).send({
-          success: false,
-          error: `Workspace directory does not exist for repository "${request.params.repoName}"`,
-        });
+      // Validate pre-conditions (synchronous, fast)
+      try {
+        await validateRepoSetupRunPreConditions(request.params.id, request.params.repoName);
+      } catch (error) {
+        if (error instanceof ItemNotFoundError) {
+          return reply.status(404).send({ success: false, error: error.message });
+        }
+        if (error instanceof RepoNotFoundError) {
+          return reply.status(404).send({ success: false, error: error.message });
+        }
+        if (error instanceof UnsupportedRepoTypeError) {
+          return reply.status(400).send({ success: false, error: error.message });
+        }
+        if (error instanceof WorkspaceNotExistsError) {
+          return reply.status(400).send({ success: false, error: error.message });
+        }
+        throw error;
       }
 
       // Fire-and-forget with item lock to prevent concurrent runs

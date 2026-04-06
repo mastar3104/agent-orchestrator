@@ -72,6 +72,13 @@ import {
 import { getLatestCompletedReview } from './completed-review-service';
 import { isCompletedReviewRequired } from '../lib/verification-policy';
 
+export class ItemNotFoundError extends Error {
+  constructor(itemId: string) {
+    super('Item not found');
+    this.name = 'ItemNotFoundError';
+  }
+}
+
 export class RepoNotFoundError extends Error {
   constructor(repoName: string, itemId: string) {
     super(`Repository "${repoName}" not found in item ${itemId}`);
@@ -83,6 +90,13 @@ export class UnsupportedRepoTypeError extends Error {
   constructor(message = 'setup is only supported for remote repositories') {
     super(message);
     this.name = 'UnsupportedRepoTypeError';
+  }
+}
+
+export class WorkspaceNotExistsError extends Error {
+  constructor(repoName: string) {
+    super(`Workspace directory does not exist for repository "${repoName}"`);
+    this.name = 'WorkspaceNotExistsError';
   }
 }
 
@@ -379,6 +393,7 @@ async function runRepoSetupCommands(
   try {
     results = await runShellCommands(commands, repoDir, {
       logDir: getRepoSetupLogDir(itemId, repo.name),
+      // Re-runs intentionally use attempt 1, replacing previous log files
       attempt: 1,
       stopOnError: true,
     });
@@ -1028,6 +1043,29 @@ export async function rerunRepoSetup(
 
 export function repoWorkspaceExists(itemId: string, repoName: string): boolean {
   return existsSync(getRepoWorkspaceDir(itemId, repoName));
+}
+
+export async function validateRepoSetupRunPreConditions(
+  itemId: string,
+  repoName: string
+): Promise<void> {
+  const config = await getItemConfig(itemId);
+  if (!config) {
+    throw new ItemNotFoundError(itemId);
+  }
+
+  const repo = config.repositories.find(r => r.name === repoName);
+  if (!repo) {
+    throw new RepoNotFoundError(repoName, itemId);
+  }
+
+  if (repo.type !== 'remote') {
+    throw new UnsupportedRepoTypeError();
+  }
+
+  if (!repoWorkspaceExists(itemId, repoName)) {
+    throw new WorkspaceNotExistsError(repoName);
+  }
 }
 
 export async function updateItem(
