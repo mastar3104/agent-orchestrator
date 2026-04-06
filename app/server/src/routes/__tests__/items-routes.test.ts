@@ -146,6 +146,69 @@ describe('item routes', () => {
     expect(mockCreateItem).not.toHaveBeenCalled();
   });
 
+  it('returns type-check error before format error for local repo with non-array setup', async () => {
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/items',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'Item',
+        description: 'desc',
+        repositories: [
+          {
+            name: 'repo-a',
+            repository: {
+              type: 'local',
+              localPath: '/tmp/repo-a',
+              setup: 'not-an-array',
+            },
+          },
+        ],
+      }),
+    });
+
+    expect(res.statusCode).toBe(400);
+    // Type check comes first — user learns the feature is unsupported before format errors
+    expect(res.json().error).toBe('setup is only supported for remote repositories');
+    expect(mockCreateItem).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 for second repo with invalid setup when first repo is valid', async () => {
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/items',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'Item',
+        description: 'desc',
+        repositories: [
+          {
+            name: 'repo-a',
+            repository: {
+              type: 'remote',
+              url: 'https://github.com/test/repo-a.git',
+              setup: ['npm install'],
+            },
+          },
+          {
+            name: 'repo-b',
+            repository: {
+              type: 'remote',
+              url: 'https://github.com/test/repo-b.git',
+              setup: 'bad',
+            },
+          },
+        ],
+      }),
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe('setup must be an array');
+    expect(mockCreateItem).not.toHaveBeenCalled();
+  });
+
   it('normalizes setup commands and passes them through to createItem', async () => {
     mockCreateItem.mockResolvedValue({
       id: 'ITEM-test',

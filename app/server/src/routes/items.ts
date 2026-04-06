@@ -35,15 +35,15 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
       // Validate and normalize setup commands for each repository input
       for (const repoInput of request.body.repositories || []) {
         if (repoInput.repository?.setup !== undefined) {
-          const normalizedSetup = normalizeCommandList('setup', repoInput.repository.setup, 'setup command');
-          if (normalizedSetup.error) {
-            return reply.status(400).send({ success: false, error: normalizedSetup.error });
-          }
           if (repoInput.repository.type === 'local') {
             return reply.status(400).send({
               success: false,
               error: 'setup is only supported for remote repositories',
             });
+          }
+          const normalizedSetup = normalizeCommandList('setup', repoInput.repository.setup, 'setup command');
+          if (normalizedSetup.error) {
+            return reply.status(400).send({ success: false, error: normalizedSetup.error });
           }
           repoInput.repository.setup = normalizedSetup.commands;
         }

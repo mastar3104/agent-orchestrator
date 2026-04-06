@@ -102,12 +102,12 @@ export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(400).send({ success: false, error: normalizedHooks.error });
       }
 
+      if (request.body.type === 'local' && request.body.setup !== undefined) {
+        return reply.status(400).send({ success: false, error: 'setup is only supported for remote repositories' });
+      }
       const normalizedSetup = normalizeCommandList('setup', request.body.setup, 'setup command');
       if (normalizedSetup.error) {
         return reply.status(400).send({ success: false, error: normalizedSetup.error });
-      }
-      if (request.body.type === 'local' && request.body.setup !== undefined) {
-        return reply.status(400).send({ success: false, error: 'setup is only supported for remote repositories' });
       }
 
       const repository = await createRepository({
