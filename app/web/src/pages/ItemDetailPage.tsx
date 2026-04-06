@@ -56,6 +56,55 @@ const COMPLETED_REVIEW_STATUS_STYLES: Record<string, string> = {
   error: 'bg-red-500/20 text-red-200',
 };
 
+type SetupCommandStatus = 'no_setup' | 'pending' | 'running' | 'completed' | 'failed';
+
+const SETUP_STATUS_STYLES: Record<SetupCommandStatus, string> = {
+  no_setup: 'bg-gray-700 text-gray-400',
+  pending: 'bg-gray-600 text-gray-300',
+  running: 'bg-amber-500/20 text-amber-200',
+  completed: 'bg-emerald-500/20 text-emerald-200',
+  failed: 'bg-red-500/20 text-red-200',
+};
+
+const SETUP_STATUS_LABELS: Record<SetupCommandStatus, string> = {
+  no_setup: 'No setup commands',
+  pending: 'Setup pending',
+  running: 'Setup running',
+  completed: 'Setup completed',
+  failed: 'Setup failed',
+};
+
+const SETUP_STATUS_ICONS: Record<SetupCommandStatus, string> = {
+  no_setup: '',
+  pending: '',
+  running: '\u27F3',
+  completed: '\u2713',
+  failed: '\u2715',
+};
+
+const POST_SETUP_PHASES = new Set([
+  'engineer', 'hooks', 'review', 'completed_review', 'pr', 'review_receive',
+]);
+
+function getRepoSetupStatus(
+  repoConfig: { type: string; setup?: string[] },
+  repoSummary: { status: string; activePhase?: string } | undefined,
+  eventResult: boolean | undefined
+): SetupCommandStatus {
+  if (repoConfig.type !== 'remote' || !repoConfig.setup || repoConfig.setup.length === 0) {
+    return 'no_setup';
+  }
+  if (eventResult === true) return 'completed';
+  if (eventResult === false) return 'failed';
+  if (!repoSummary) return 'pending';
+  if (repoSummary.activePhase === 'setup') return 'running';
+  if (repoSummary.activePhase === 'clone' || repoSummary.activePhase === 'workspace_setup') return 'pending';
+  if (repoSummary.activePhase && POST_SETUP_PHASES.has(repoSummary.activePhase)) return 'completed';
+  if (['ready', 'completed', 'review_receiving'].includes(repoSummary.status)) return 'completed';
+  if (repoSummary.status === 'error') return 'failed';
+  return 'pending';
+}
+
 function formatVerificationPolicy(policy: VerificationPolicy): string {
   switch (policy) {
     case 'none':
@@ -223,6 +272,11 @@ export function ItemDetailPage() {
   ]);
   const [testPlanFeedbackLocalError, setTestPlanFeedbackLocalError] = useState<string | null>(null);
   const [testPlanUpdatedBanner, setTestPlanUpdatedBanner] = useState(false);
+  const [setupEditingRepo, setSetupEditingRepo] = useState<string | null>(null);
+  const [setupEditContent, setSetupEditContent] = useState('');
+  const [setupSaving, setSetupSaving] = useState(false);
+  const [setupError, setSetupError] = useState<string | null>(null);
+  const [setupResults, setSetupResults] = useState<Map<string, boolean>>(new Map());
 
   const loadPlanContent = useCallback(async () => {
     if (!id) return;
@@ -323,6 +377,21 @@ export function ItemDetailPage() {
         setTestPlanUpdatedBanner(true);
       }
     }
+    // Track setup command results
+    if (event.type === 'repo_setup_started') {
+      setSetupResults((prev) => {
+        const next = new Map(prev);
+        next.delete(event.repoName);
+        return next;
+      });
+    }
+    if (event.type === 'repo_setup_completed') {
+      setSetupResults((prev) => {
+        const next = new Map(prev);
+        next.set(event.repoName, event.allPassed);
+        return next;
+      });
+    }
   }, [refresh]);
 
   const { isConnected } = useWebSocket({
@@ -375,6 +444,36 @@ export function ItemDetailPage() {
       setTestPlanSaving(false);
     }
   }, [id, testPlanContent, refresh]);
+
+  const handleSaveSetup = useCallback(async () => {
+    if (!id || !setupEditingRepo) return;
+    setSetupSaving(true);
+    setSetupError(null);
+    try {
+      const commands = setupEditContent
+        .split('\n')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      await api.updateRepoSetup(id, setupEditingRepo, commands);
+      setSetupEditingRepo(null);
+      await refresh();
+    } catch (err) {
+      setSetupError(err instanceof Error ? err.message : 'Failed to save setup commands');
+    } finally {
+      setSetupSaving(false);
+    }
+  }, [id, setupEditingRepo, setupEditContent, refresh]);
+
+  const handleRunSetup = useCallback(async (repoName: string) => {
+    if (!id) return;
+    setSetupError(null);
+    try {
+      await api.runRepoSetup(id, repoName);
+      await refresh();
+    } catch (err) {
+      setSetupError(err instanceof Error ? err.message : 'Failed to run setup commands');
+    }
+  }, [id, refresh]);
 
   if (loading) {
     return (
@@ -744,6 +843,98 @@ export function ItemDetailPage() {
         <h3 className="text-sm font-medium text-gray-400 mb-2">Description</h3>
         <p className="text-white">{item.description}</p>
       </div>
+
+      {/* Setup Commands */}
+      {item.repositories.some((r) => r.type === 'remote') && (
+        <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
+          <h3 className="text-sm font-medium text-gray-400 mb-3">Setup Commands</h3>
+          <div className="space-y-3">
+            {item.repositories
+              .filter((r) => r.type === 'remote')
+              .map((repoConfig) => {
+                const repoSummary = item.repos.find((r) => r.repoName === repoConfig.name);
+                const setupStatus = getRepoSetupStatus(repoConfig, repoSummary, setupResults.get(repoConfig.name));
+                const isEditing = setupEditingRepo === repoConfig.name;
+                const icon = SETUP_STATUS_ICONS[setupStatus];
+
+                return (
+                  <div key={repoConfig.name} className="border border-gray-700 rounded p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium text-white">{repoConfig.name}</span>
+                        <span className={`px-2 py-0.5 rounded-full text-xs ${SETUP_STATUS_STYLES[setupStatus]}`}>
+                          {icon ? `${icon} ` : ''}{SETUP_STATUS_LABELS[setupStatus]}
+                        </span>
+                      </div>
+                      <div className="flex gap-2">
+                        {(setupStatus === 'pending' || setupStatus === 'failed') && (
+                          <button
+                            onClick={() => handleRunSetup(repoConfig.name)}
+                            className="px-2.5 py-1 bg-amber-600 text-white rounded text-xs hover:bg-amber-500"
+                          >
+                            {setupStatus === 'failed' ? 'Re-run Setup' : 'Run Setup'}
+                          </button>
+                        )}
+                        <button
+                          onClick={() => {
+                            if (isEditing) {
+                              setSetupEditingRepo(null);
+                            } else {
+                              setSetupEditingRepo(repoConfig.name);
+                              setSetupEditContent((repoConfig.setup || []).join('\n'));
+                              setSetupError(null);
+                            }
+                          }}
+                          className="px-2.5 py-1 bg-gray-700 text-gray-200 rounded text-xs hover:bg-gray-600"
+                        >
+                          {isEditing ? 'Cancel' : 'Edit'}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Show current commands */}
+                    {!isEditing && repoConfig.setup && repoConfig.setup.length > 0 && (
+                      <div className="bg-gray-900 rounded p-2 mt-2">
+                        {repoConfig.setup.map((cmd, idx) => (
+                          <div key={idx} className="text-xs text-gray-300 font-mono py-0.5">{cmd}</div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Edit panel */}
+                    {isEditing && (
+                      <div className="mt-2 space-y-2">
+                        <textarea
+                          value={setupEditContent}
+                          onChange={(e) => setSetupEditContent(e.target.value)}
+                          placeholder="One command per line..."
+                          className="w-full min-h-[80px] bg-gray-900 text-gray-100 border border-gray-700 rounded p-2 font-mono text-xs"
+                          spellCheck={false}
+                        />
+                        <div className="flex gap-2">
+                          <button
+                            onClick={handleSaveSetup}
+                            disabled={setupSaving}
+                            className="px-2.5 py-1 bg-green-600 text-white rounded text-xs hover:bg-green-500 disabled:opacity-50"
+                          >
+                            {setupSaving ? 'Saving...' : 'Save'}
+                          </button>
+                          <button
+                            onClick={() => setSetupEditingRepo(null)}
+                            className="px-2.5 py-1 bg-gray-700 text-gray-200 rounded text-xs hover:bg-gray-600"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+          </div>
+          {setupError && <div className="text-xs text-red-400 mt-2">{setupError}</div>}
+        </div>
+      )}
 
       {/* Plan Summary */}
       {item.plan && (
