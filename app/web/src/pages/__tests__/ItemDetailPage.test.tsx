@@ -828,4 +828,72 @@ describe('ItemDetailPage workflow UI', () => {
 
     expect(view.getByText('Save failed')).toBeInTheDocument();
   });
+
+  it('renders multiple remote repos with different setup statuses', () => {
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install'] },
+          { name: 'repo-b', type: 'remote' as const, url: 'https://example.com/repo-b.git', setup: ['pip install -r requirements.txt'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'running' as const,
+            activePhase: 'engineer' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+          {
+            repoName: 'repo-b',
+            status: 'not_started' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    // repo-a should be completed (engineer is post-setup)
+    expect(view.getByText('Setup completed')).toBeInTheDocument();
+    // repo-b should be pending
+    expect(view.getByText('Setup pending')).toBeInTheDocument();
+    // Only repo-b should have Run Setup button
+    expect(view.getByRole('button', { name: 'Run Setup' })).toBeInTheDocument();
+  });
+
+  it('closes edit panel when Cancel button is clicked', () => {
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'not_started' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    // Click Edit to open the editor
+    fireEvent.click(view.getByRole('button', { name: 'Edit' }));
+    expect(view.getByPlaceholderText('One command per line...')).toBeInTheDocument();
+
+    // Click Cancel (the one inside the edit panel, not the toggle button)
+    const cancelButtons = view.getAllByRole('button', { name: 'Cancel' });
+    // The edit panel has two Cancel buttons: the toggle and the one below textarea
+    // Click the last Cancel button (the one in the edit panel actions)
+    fireEvent.click(cancelButtons[cancelButtons.length - 1]);
+
+    // Textarea should be removed
+    expect(view.queryByPlaceholderText('One command per line...')).not.toBeInTheDocument();
+  });
 });

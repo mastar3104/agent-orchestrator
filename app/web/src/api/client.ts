@@ -234,7 +234,7 @@ export async function updateRepoSetup(
   setup: string[]
 ): Promise<{ item: ItemConfig }> {
   return request<{ item: ItemConfig }>(
-    `/items/${itemId}/repositories/${encodeURIComponent(repoName)}/setup`,
+    `/items/${encodeURIComponent(itemId)}/repositories/${encodeURIComponent(repoName)}/setup`,
     {
       method: 'PATCH',
       body: JSON.stringify({ setup }),
@@ -247,7 +247,7 @@ export async function runRepoSetup(
   repoName: string
 ): Promise<StartAsyncResponse> {
   return request<StartAsyncResponse>(
-    `/items/${itemId}/repositories/${encodeURIComponent(repoName)}/setup/run`,
+    `/items/${encodeURIComponent(itemId)}/repositories/${encodeURIComponent(repoName)}/setup/run`,
     {
       method: 'POST',
       body: JSON.stringify({}),
