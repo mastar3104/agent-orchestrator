@@ -45,6 +45,7 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
           if (normalizedSetup.error) {
             return reply.status(400).send({ success: false, error: normalizedSetup.error });
           }
+          // Mutate in-place: createItem reads from this object
           repoInput.repository.setup = normalizedSetup.commands;
         }
       }

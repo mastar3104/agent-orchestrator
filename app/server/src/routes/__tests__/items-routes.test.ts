@@ -209,6 +209,51 @@ describe('item routes', () => {
     expect(mockCreateItem).not.toHaveBeenCalled();
   });
 
+  it('normalizes setup to empty array when all entries are blank', async () => {
+    mockCreateItem.mockResolvedValue({
+      id: 'ITEM-test',
+      name: 'Item',
+      description: 'desc',
+      repositories: [],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/items',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'Item',
+        description: 'desc',
+        repositories: [
+          {
+            name: 'repo-a',
+            repository: {
+              type: 'remote',
+              url: 'https://github.com/test/repo.git',
+              setup: ['  ', ''],
+            },
+          },
+        ],
+      }),
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(mockCreateItem).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repositories: [
+          expect.objectContaining({
+            repository: expect.objectContaining({
+              setup: [],
+            }),
+          }),
+        ],
+      }),
+    );
+  });
+
   it('normalizes setup commands and passes them through to createItem', async () => {
     mockCreateItem.mockResolvedValue({
       id: 'ITEM-test',

@@ -223,6 +223,50 @@ describe('repository routes validation', () => {
     expect(res.json().error).toContain('not a supported role');
   });
 
+  describe('PATCH /repositories/:id setup validation', () => {
+    it('returns 400 when setup is patched on a local repository', async () => {
+      mockReadYamlSafe.mockResolvedValue([{
+        id: 'REPO-1', name: 'repo-a', type: 'local', localPath: '/tmp/repo-a',
+        createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z',
+      }]);
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'PATCH', url: '/api/repositories/REPO-1',
+        headers: { 'content-type': 'application/json' },
+        payload: JSON.stringify({ setup: ['npm install'] }),
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe('setup is only supported for remote repositories');
+    });
+
+    it('returns 404 when setup is patched on a non-existent repository', async () => {
+      mockReadYamlSafe.mockResolvedValue([]);
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'PATCH', url: '/api/repositories/REPO-MISSING',
+        headers: { 'content-type': 'application/json' },
+        payload: JSON.stringify({ setup: ['npm install'] }),
+      });
+      expect(res.statusCode).toBe(404);
+    });
+
+    it('returns 400 when setup patch contains malformed values', async () => {
+      mockReadYamlSafe.mockResolvedValue([{
+        id: 'REPO-1', name: 'repo-a', type: 'remote',
+        url: 'https://github.com/test/repo.git',
+        createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z',
+      }]);
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'PATCH', url: '/api/repositories/REPO-1',
+        headers: { 'content-type': 'application/json' },
+        payload: JSON.stringify({ setup: 'not-an-array' }),
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe('setup must be an array');
+    });
+  });
+
   it('returns 400 when setup is provided for a local repository', async () => {
     mockReadYamlSafe.mockResolvedValue([]);
 
