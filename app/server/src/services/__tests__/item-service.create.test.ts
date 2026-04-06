@@ -99,7 +99,7 @@ const mockWriteYaml = vi.mocked(writeYaml);
 const mockGetRepository = vi.mocked(getRepository);
 const mockCreateRepository = vi.mocked(createRepository);
 
-describe('createItem hooksMaxAttempts propagation', () => {
+describe('createItem repository config propagation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
