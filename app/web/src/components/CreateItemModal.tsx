@@ -28,6 +28,7 @@ interface RepoEntry {
   saveRepository: boolean;
   repositoryName: string;
   allowedTools: string;
+  setupCommands: string;
 }
 
 let nextKey = 0;
@@ -47,6 +48,7 @@ function createEmptyRepoEntry(): RepoEntry {
     saveRepository: false,
     repositoryName: '',
     allowedTools: '',
+    setupCommands: '',
   };
 }
 
@@ -114,6 +116,11 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
           if (repo.branch) input.branch = repo.branch;
           if (repo.workBranch) input.workBranch = repo.workBranch;
         } else {
+          const parsedSetupCommands = repo.setupCommands
+            .split('\n')
+            .map(c => c.trim())
+            .filter(c => c.length > 0);
+
           input.repository =
             repo.repoType === 'remote'
               ? {
@@ -122,6 +129,7 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                   branch: repo.branch || undefined,
                   workBranch: repo.workBranch || undefined,
                   submodules: repo.submodules,
+                  setup: parsedSetupCommands.length > 0 ? parsedSetupCommands : undefined,
                 }
               : {
                   type: 'local',
@@ -438,6 +446,19 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
                             />
                             Include submodules
                           </label>
+                          <div>
+                            <label className="block text-xs font-medium text-gray-400 mb-1">Setup Commands</label>
+                            <textarea
+                              value={repo.setupCommands}
+                              onChange={(e) => updateRepo(repo.key, { setupCommands: e.target.value })}
+                              rows={3}
+                              className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm font-mono focus:outline-none focus:border-blue-500"
+                              placeholder={"npm install\nnpm run build"}
+                            />
+                            <p className="text-xs text-gray-500 mt-0.5">
+                              Commands to run after clone (one per line). Runs before planner starts.
+                            </p>
+                          </div>
                         </>
                       ) : (
                         <>
