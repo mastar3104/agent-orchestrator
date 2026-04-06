@@ -11,6 +11,10 @@ const ROLE_LABELS: Record<GlobalRoleToolKey, string> = {
   completedReviewer: 'Completed Reviewer',
   engineer: 'Engineer',
   reviewer: 'Reviewer',
+  architectureReviewer: 'Architecture Reviewer',
+  securityReviewer: 'Security Reviewer',
+  testingReviewer: 'Testing Reviewer',
+  requirementsReviewer: 'Requirements Reviewer',
   reviewReceiver: 'Review Receiver',
 };
 

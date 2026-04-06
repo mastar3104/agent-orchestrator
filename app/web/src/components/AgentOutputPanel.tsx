@@ -8,7 +8,7 @@ interface AgentOutputPanelProps {
   onClose: () => void;
 }
 
-type Tab = 'result' | 'raw' | 'stderr' | 'prompt';
+type Tab = 'result' | 'raw' | 'stderr' | 'prompt' | 'system-prompt';
 
 export function AgentOutputPanel({ itemId, agentId, onClose }: AgentOutputPanelProps) {
   const [output, setOutput] = useState<AgentExecutionOutput | null>(null);
@@ -43,6 +43,7 @@ export function AgentOutputPanel({ itemId, agentId, onClose }: AgentOutputPanelP
     { key: 'raw', label: 'Raw Output' },
     { key: 'stderr', label: 'Stderr' },
     { key: 'prompt', label: 'Prompt' },
+    { key: 'system-prompt', label: 'System Prompt' },
   ];
 
   return (
@@ -132,6 +133,11 @@ export function AgentOutputPanel({ itemId, agentId, onClose }: AgentOutputPanelP
             {activeTab === 'prompt' && (
               <pre className="text-sm text-gray-200 whitespace-pre-wrap font-mono">
                 {output.prompt}
+              </pre>
+            )}
+            {activeTab === 'system-prompt' && (
+              <pre className="text-sm text-gray-200 whitespace-pre-wrap font-mono">
+                {output.systemPrompt || '(not captured)'}
               </pre>
             )}
           </div>

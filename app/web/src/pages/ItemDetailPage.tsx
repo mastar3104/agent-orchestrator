@@ -3,9 +3,11 @@ import { useParams, Link } from 'react-router-dom';
 import type {
   ItemEvent,
   ItemDetail,
+  ReviewFinding,
   ItemWorkflowJob,
   ItemWorkflowSummary,
   ReviewFindingsExtractedEvent,
+  ReviewPerspective,
   TaskProgressPhase,
   VerificationPolicy,
   WorkflowStageId,
@@ -62,6 +64,27 @@ const COMPLETED_REVIEW_STATUS_STYLES: Record<string, string> = {
   error: 'bg-red-500/20 text-red-200',
 };
 
+const REVIEW_PERSPECTIVE_ORDER: ReviewPerspective[] = [
+  'architecture',
+  'security',
+  'testing',
+  'requirements',
+];
+
+const REVIEW_PERSPECTIVE_LABELS: Record<ReviewPerspective, string> = {
+  architecture: 'Architecture',
+  security: 'Security',
+  testing: 'Testing',
+  requirements: 'Requirements',
+};
+
+const REVIEW_PERSPECTIVE_STATUS_STYLES: Record<string, string> = {
+  approve: 'bg-emerald-500/20 text-emerald-200',
+  request_changes: 'bg-red-500/20 text-red-200',
+  error: 'bg-red-500/20 text-red-200',
+  schema_fallback: 'bg-yellow-500/20 text-yellow-200',
+};
+
 function formatVerificationPolicy(policy: VerificationPolicy): string {
   switch (policy) {
     case 'none':
@@ -106,6 +129,35 @@ function resolveVerificationView(item: ItemDetail): {
 function formatPhase(phase?: TaskProgressPhase): string {
   if (!phase) return '';
   return phase.charAt(0).toUpperCase() + phase.slice(1);
+}
+
+function getReviewFindingSeverityStyles(severity: ReviewFinding['severity']): string {
+  switch (severity) {
+    case 'critical':
+      return 'bg-red-500/20 text-red-400';
+    case 'major':
+      return 'bg-orange-500/20 text-orange-300';
+    case 'minor':
+      return 'bg-yellow-500/20 text-yellow-200';
+  }
+}
+
+function groupFindingsByPerspective(
+  reviewEvent: ReviewFindingsExtractedEvent
+): Map<ReviewPerspective, ReviewFinding[]> {
+  const grouped = new Map<ReviewPerspective, ReviewFinding[]>();
+  for (const perspective of REVIEW_PERSPECTIVE_ORDER) {
+    grouped.set(perspective, []);
+  }
+
+  for (const finding of reviewEvent.findings) {
+    if (!finding.perspective) {
+      continue;
+    }
+    grouped.get(finding.perspective)?.push(finding);
+  }
+
+  return grouped;
 }
 
 function formatStageLabel(stage: WorkflowStageId): string {
@@ -1367,7 +1419,7 @@ export function ItemDetailPage() {
         )
         .slice(-1)
         .map((reviewEvent) => (
-          reviewEvent.findings.length > 0 && (
+          (reviewEvent.findings.length > 0 || (reviewEvent.perspectives?.length || 0) > 0) && (
             <div
               key={reviewEvent.id}
               className="bg-gray-800 rounded-lg border border-yellow-500/50 p-4"
@@ -1402,38 +1454,112 @@ export function ItemDetailPage() {
 
               <p className="text-gray-300 mb-3">{reviewEvent.summary}</p>
 
-              <div className="space-y-2">
-                {reviewEvent.findings
-                  .filter(f => f.severity === 'critical' || f.severity === 'major')
-                  .map((finding, idx) => (
-                    <div
-                      key={idx}
-                      className="bg-gray-900 rounded p-3 border border-gray-700"
-                    >
-                      <div className="flex items-start justify-between mb-2">
-                        <span className={`text-xs font-semibold px-2 py-0.5 rounded ${
-                          finding.severity === 'critical'
-                            ? 'bg-red-500/20 text-red-400'
-                            : 'bg-orange-500/20 text-orange-400'
-                        }`}>
-                          {finding.severity.toUpperCase()}
-                        </span>
-                        <span className="text-xs text-gray-500">
-                          {finding.targetAgent}
-                        </span>
+              {reviewEvent.perspectives && reviewEvent.perspectives.length > 0 ? (
+                <div className="space-y-4">
+                  {(() => {
+                    const groupedFindings = groupFindingsByPerspective(reviewEvent);
+                    return REVIEW_PERSPECTIVE_ORDER.map((perspective) => {
+                      const summary = reviewEvent.perspectives?.find(
+                        (entry) => entry.perspective === perspective
+                      );
+                      if (!summary) {
+                        return null;
+                      }
+
+                      const findings = groupedFindings.get(perspective) || [];
+
+                      return (
+                        <div
+                          key={perspective}
+                          className="bg-gray-900 rounded-lg border border-gray-700 p-4"
+                        >
+                          <div className="flex items-center justify-between gap-3 mb-3">
+                            <div className="flex items-center gap-2">
+                              <h4 className="text-sm font-semibold text-white">
+                                {REVIEW_PERSPECTIVE_LABELS[perspective]}
+                              </h4>
+                              <span className={`text-xs font-medium px-2 py-0.5 rounded ${REVIEW_PERSPECTIVE_STATUS_STYLES[summary.status] || 'bg-gray-700 text-gray-300'}`}>
+                                {summary.status.replace('_', ' ')}
+                              </span>
+                            </div>
+                            <div className="flex gap-3 text-xs text-gray-400">
+                              <span>Critical: {summary.criticalCount}</span>
+                              <span>Major: {summary.majorCount}</span>
+                              <span>Minor: {summary.minorCount}</span>
+                            </div>
+                          </div>
+
+                          <p className="text-sm text-gray-300 mb-3">{summary.summary}</p>
+
+                          {findings.length > 0 && (
+                            <div className="space-y-2">
+                              {findings.map((finding, idx) => (
+                                <div
+                                  key={`${perspective}-${idx}`}
+                                  className="bg-gray-950 rounded p-3 border border-gray-800"
+                                >
+                                  <div className="flex items-start justify-between mb-2">
+                                    <span className={`text-xs font-semibold px-2 py-0.5 rounded ${getReviewFindingSeverityStyles(finding.severity)}`}>
+                                      {finding.severity.toUpperCase()}
+                                    </span>
+                                    <span className="text-xs text-gray-500">
+                                      {finding.targetAgent}
+                                    </span>
+                                  </div>
+                                  <p className="text-sm text-gray-400 mb-1">
+                                    {finding.file}{finding.line ? `:${finding.line}` : ''}
+                                  </p>
+                                  <p className="text-sm text-white mb-2">
+                                    {finding.description}
+                                  </p>
+                                  {finding.suggestedFix && (
+                                    <p className="text-xs text-gray-500">
+                                      Fix: {finding.suggestedFix}
+                                    </p>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {reviewEvent.findings
+                    .filter(f => f.severity === 'critical' || f.severity === 'major')
+                    .map((finding, idx) => (
+                      <div
+                        key={idx}
+                        className="bg-gray-900 rounded p-3 border border-gray-700"
+                      >
+                        <div className="flex items-start justify-between mb-2">
+                          <span className={`text-xs font-semibold px-2 py-0.5 rounded ${
+                            finding.severity === 'critical'
+                              ? 'bg-red-500/20 text-red-400'
+                              : 'bg-orange-500/20 text-orange-400'
+                          }`}>
+                            {finding.severity.toUpperCase()}
+                          </span>
+                          <span className="text-xs text-gray-500">
+                            {finding.targetAgent}
+                          </span>
+                        </div>
+                        <p className="text-sm text-gray-400 mb-1">
+                          {finding.file}:{finding.line}
+                        </p>
+                        <p className="text-sm text-white mb-2">
+                          {finding.description}
+                        </p>
+                        <p className="text-xs text-gray-500">
+                          Fix: {finding.suggestedFix}
+                        </p>
                       </div>
-                      <p className="text-sm text-gray-400 mb-1">
-                        {finding.file}:{finding.line}
-                      </p>
-                      <p className="text-sm text-white mb-2">
-                        {finding.description}
-                      </p>
-                      <p className="text-xs text-gray-500">
-                        Fix: {finding.suggestedFix}
-                      </p>
-                    </div>
-                  ))}
-              </div>
+                    ))}
+                </div>
+              )}
             </div>
           )
         ))
