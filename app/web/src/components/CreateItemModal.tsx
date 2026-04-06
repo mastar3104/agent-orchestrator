@@ -116,26 +116,27 @@ export function CreateItemModal({ isOpen, onClose, onCreate }: CreateItemModalPr
           if (repo.branch) input.branch = repo.branch;
           if (repo.workBranch) input.workBranch = repo.workBranch;
         } else {
-          const parsedSetupCommands = repo.setupCommands
-            .split('\n')
-            .map(c => c.trim())
-            .filter(c => c.length > 0);
+          if (repo.repoType === 'remote') {
+            const parsedSetupCommands = repo.setupCommands
+              .split('\n')
+              .map(c => c.trim())
+              .filter(c => c.length > 0);
 
-          input.repository =
-            repo.repoType === 'remote'
-              ? {
-                  type: 'remote',
-                  url: repo.repoUrl,
-                  branch: repo.branch || undefined,
-                  workBranch: repo.workBranch || undefined,
-                  submodules: repo.submodules,
-                  setup: parsedSetupCommands.length > 0 ? parsedSetupCommands : undefined,
-                }
-              : {
-                  type: 'local',
-                  localPath: repo.localPath,
-                  linkMode: repo.linkMode,
-                };
+            input.repository = {
+              type: 'remote',
+              url: repo.repoUrl,
+              branch: repo.branch || undefined,
+              workBranch: repo.workBranch || undefined,
+              submodules: repo.submodules,
+              setup: parsedSetupCommands.length > 0 ? parsedSetupCommands : undefined,
+            };
+          } else {
+            input.repository = {
+              type: 'local',
+              localPath: repo.localPath,
+              linkMode: repo.linkMode,
+            };
+          }
 
           if (repo.saveRepository && repo.repositoryName) {
             input.saveRepository = true;
