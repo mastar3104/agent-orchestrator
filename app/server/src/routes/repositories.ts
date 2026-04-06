@@ -17,32 +17,7 @@ import {
   deleteRepository,
 } from '../services/repository-service';
 import { AllowedToolsFormatError, RolePromptsFormatError } from '../lib/role-loader';
-
-function normalizeCommandList(
-  fieldName: string,
-  value: unknown,
-  itemLabel: string
-): { commands?: string[]; error?: string } {
-  if (value === undefined) {
-    return {};
-  }
-  if (!Array.isArray(value)) {
-    return { error: `${fieldName} must be an array` };
-  }
-
-  const commands: string[] = [];
-  for (const entry of value) {
-    if (typeof entry !== 'string') {
-      return { error: `Each ${itemLabel} must be a non-empty string` };
-    }
-    const trimmed = entry.trim();
-    if (trimmed.length > 0) {
-      commands.push(trimmed);
-    }
-  }
-
-  return { commands };
-}
+import { normalizeCommandList } from '../lib/validation';
 
 export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
   // List all repositories

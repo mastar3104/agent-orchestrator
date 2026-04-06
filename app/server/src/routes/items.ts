@@ -23,32 +23,7 @@ import {
 } from '../services/review-receive-service';
 import { withItemLock, isItemLocked } from '../lib/locks';
 import { AllowedToolsFormatError, RolePromptsFormatError } from '../lib/role-loader';
-
-function normalizeCommandList(
-  fieldName: string,
-  value: unknown,
-  itemLabel: string
-): { commands?: string[]; error?: string } {
-  if (value === undefined) {
-    return {};
-  }
-  if (!Array.isArray(value)) {
-    return { error: `${fieldName} must be an array` };
-  }
-
-  const commands: string[] = [];
-  for (const entry of value) {
-    if (typeof entry !== 'string') {
-      return { error: `Each ${itemLabel} must be a non-empty string` };
-    }
-    const trimmed = entry.trim();
-    if (trimmed.length > 0) {
-      commands.push(trimmed);
-    }
-  }
-
-  return { commands };
-}
+import { normalizeCommandList } from '../lib/validation';
 
 export const itemRoutes: FastifyPluginAsync = async (fastify) => {
   // Create a new item
@@ -57,18 +32,18 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
     Reply: ApiResponse<CreateItemResponse>;
   }>('/items', async (request, reply) => {
     try {
-      // Validate setup commands for each repository input
+      // Validate and normalize setup commands for each repository input
       for (const repoInput of request.body.repositories || []) {
         if (repoInput.repository?.setup !== undefined) {
+          const normalizedSetup = normalizeCommandList('setup', repoInput.repository.setup, 'setup command');
+          if (normalizedSetup.error) {
+            return reply.status(400).send({ success: false, error: normalizedSetup.error });
+          }
           if (repoInput.repository.type === 'local') {
             return reply.status(400).send({
               success: false,
               error: 'setup is only supported for remote repositories',
             });
-          }
-          const normalizedSetup = normalizeCommandList('setup', repoInput.repository.setup, 'setup command');
-          if (normalizedSetup.error) {
-            return reply.status(400).send({ success: false, error: normalizedSetup.error });
           }
           repoInput.repository.setup = normalizedSetup.commands;
         }

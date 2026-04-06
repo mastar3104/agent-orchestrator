@@ -92,6 +92,33 @@ describe('item routes', () => {
     expect(mockCreateItem).not.toHaveBeenCalled();
   });
 
+  it('returns 400 when setup is a string instead of an array in POST /items', async () => {
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/items',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'Item',
+        description: 'desc',
+        repositories: [
+          {
+            name: 'repo-a',
+            repository: {
+              type: 'remote',
+              url: 'https://github.com/test/repo.git',
+              setup: 'npm install',
+            },
+          },
+        ],
+      }),
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe('setup must be an array');
+    expect(mockCreateItem).not.toHaveBeenCalled();
+  });
+
   it('returns 400 when setup contains non-string entries in POST /items', async () => {
     const app = buildApp();
     const res = await app.inject({
