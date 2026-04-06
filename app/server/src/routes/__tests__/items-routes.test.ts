@@ -2,18 +2,22 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import Fastify from 'fastify';
 import { itemRoutes } from '../items';
 
-vi.mock('../../services/item-service', () => ({
-  createItem: vi.fn(),
-  setupWorkspace: vi.fn(),
-  listItems: vi.fn().mockResolvedValue([]),
-  getItemDetail: vi.fn().mockResolvedValue(null),
-  getItemConfig: vi.fn().mockResolvedValue(null),
-  updateItem: vi.fn().mockResolvedValue(null),
-  updateRepoSetup: vi.fn().mockResolvedValue(null),
-  rerunRepoSetup: vi.fn().mockResolvedValue(undefined),
-  repoWorkspaceExists: vi.fn().mockReturnValue(false),
-  deleteItem: vi.fn().mockResolvedValue(false),
-}));
+vi.mock('../../services/item-service', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../services/item-service')>();
+  return {
+    ...actual,
+    createItem: vi.fn(),
+    setupWorkspace: vi.fn(),
+    listItems: vi.fn().mockResolvedValue([]),
+    getItemDetail: vi.fn().mockResolvedValue(null),
+    getItemConfig: vi.fn().mockResolvedValue(null),
+    updateItem: vi.fn().mockResolvedValue(null),
+    updateRepoSetup: vi.fn().mockResolvedValue(null),
+    rerunRepoSetup: vi.fn().mockResolvedValue(undefined),
+    repoWorkspaceExists: vi.fn().mockReturnValue(false),
+    deleteItem: vi.fn().mockResolvedValue(false),
+  };
+});
 
 vi.mock('../../services/git-pr-service', () => ({
   createDraftPrsForAllRepos: vi.fn(),
