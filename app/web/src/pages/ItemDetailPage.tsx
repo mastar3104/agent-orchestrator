@@ -17,6 +17,12 @@ import { useWebSocket } from '../hooks/useWebSocket';
 import { AgentCard } from '../components/AgentCard';
 import { AgentOutputPanel } from '../components/AgentOutputPanel';
 import * as api from '../api/client';
+import {
+  getRepoSetupStatus,
+  SETUP_STATUS_STYLES,
+  SETUP_STATUS_LABELS,
+  SETUP_STATUS_ICONS,
+} from '../utils/setup-status';
 
 const STAGE_STATUS_STYLES: Record<WorkflowStageStatus, string> = {
   pending: 'border-gray-700 bg-gray-800 text-gray-400',
@@ -55,55 +61,6 @@ const COMPLETED_REVIEW_STATUS_STYLES: Record<string, string> = {
   skipped: 'bg-sky-500/20 text-sky-200',
   error: 'bg-red-500/20 text-red-200',
 };
-
-type SetupCommandStatus = 'no_setup' | 'pending' | 'running' | 'completed' | 'failed';
-
-const SETUP_STATUS_STYLES: Record<SetupCommandStatus, string> = {
-  no_setup: 'bg-gray-700 text-gray-400',
-  pending: 'bg-gray-600 text-gray-300',
-  running: 'bg-amber-500/20 text-amber-200',
-  completed: 'bg-emerald-500/20 text-emerald-200',
-  failed: 'bg-red-500/20 text-red-200',
-};
-
-const SETUP_STATUS_LABELS: Record<SetupCommandStatus, string> = {
-  no_setup: 'No setup commands',
-  pending: 'Setup pending',
-  running: 'Setup running',
-  completed: 'Setup completed',
-  failed: 'Setup failed',
-};
-
-const SETUP_STATUS_ICONS: Record<SetupCommandStatus, string> = {
-  no_setup: '',
-  pending: '',
-  running: '\u27F3',
-  completed: '\u2713',
-  failed: '\u2715',
-};
-
-const POST_SETUP_PHASES = new Set([
-  'engineer', 'hooks', 'review', 'completed_review', 'pr', 'review_receive',
-]);
-
-function getRepoSetupStatus(
-  repoConfig: { type: string; setup?: string[] },
-  repoSummary: { status: string; activePhase?: string } | undefined,
-  eventResult: boolean | undefined
-): SetupCommandStatus {
-  if (repoConfig.type !== 'remote' || !repoConfig.setup || repoConfig.setup.length === 0) {
-    return 'no_setup';
-  }
-  if (eventResult === true) return 'completed';
-  if (eventResult === false) return 'failed';
-  if (!repoSummary) return 'pending';
-  if (repoSummary.activePhase === 'setup') return 'running';
-  if (repoSummary.activePhase === 'clone' || repoSummary.activePhase === 'workspace_setup') return 'pending';
-  if (repoSummary.activePhase && POST_SETUP_PHASES.has(repoSummary.activePhase)) return 'completed';
-  if (['ready', 'completed', 'review_receiving'].includes(repoSummary.status)) return 'completed';
-  if (repoSummary.status === 'error') return 'failed';
-  return 'pending';
-}
 
 function formatVerificationPolicy(policy: VerificationPolicy): string {
   switch (policy) {
@@ -277,6 +234,7 @@ export function ItemDetailPage() {
   const [setupSaving, setSetupSaving] = useState(false);
   const [setupError, setSetupError] = useState<string | null>(null);
   const [setupResults, setSetupResults] = useState<Map<string, boolean>>(new Map());
+  const [setupRunningRepo, setSetupRunningRepo] = useState<string | null>(null);
 
   const loadPlanContent = useCallback(async () => {
     if (!id) return;
@@ -467,11 +425,14 @@ export function ItemDetailPage() {
   const handleRunSetup = useCallback(async (repoName: string) => {
     if (!id) return;
     setSetupError(null);
+    setSetupRunningRepo(repoName);
     try {
       await api.runRepoSetup(id, repoName);
       await refresh();
     } catch (err) {
       setSetupError(err instanceof Error ? err.message : 'Failed to run setup commands');
+    } finally {
+      setSetupRunningRepo(null);
     }
   }, [id, refresh]);
 
@@ -863,14 +824,15 @@ export function ItemDetailPage() {
                       <div className="flex items-center gap-2">
                         <span className="text-sm font-medium text-white">{repoConfig.name}</span>
                         <span className={`px-2 py-0.5 rounded-full text-xs ${SETUP_STATUS_STYLES[setupStatus]}`}>
-                          {icon ? `${icon} ` : ''}{SETUP_STATUS_LABELS[setupStatus]}
+                          {icon ? <><span className={setupStatus === 'running' ? 'inline-block animate-spin' : ''}>{icon}</span>{' '}</> : ''}{SETUP_STATUS_LABELS[setupStatus]}
                         </span>
                       </div>
                       <div className="flex gap-2">
                         {(setupStatus === 'pending' || setupStatus === 'failed') && (
                           <button
                             onClick={() => handleRunSetup(repoConfig.name)}
-                            className="px-2.5 py-1 bg-amber-600 text-white rounded text-xs hover:bg-amber-500"
+                            disabled={setupRunningRepo === repoConfig.name}
+                            className="px-2.5 py-1 bg-amber-600 text-white rounded text-xs hover:bg-amber-500 disabled:opacity-50"
                           >
                             {setupStatus === 'failed' ? 'Re-run Setup' : 'Run Setup'}
                           </button>

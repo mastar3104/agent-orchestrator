@@ -12,8 +12,18 @@ vi.mock('../../hooks/useWebSocket', () => ({
   useWebSocket: vi.fn(),
 }));
 
+vi.mock('../../api/client', () => ({
+  updateRepoSetup: vi.fn(),
+  runRepoSetup: vi.fn(),
+  getPlanContent: vi.fn(),
+  updatePlan: vi.fn(),
+  getTestPlanContent: vi.fn(),
+  updateTestPlan: vi.fn(),
+}));
+
 import { useItem } from '../../hooks/useItems';
 import { useWebSocket } from '../../hooks/useWebSocket';
+import * as api from '../../api/client';
 
 const mockUseItem = vi.mocked(useItem);
 const mockUseWebSocket = vi.mocked(useWebSocket);
@@ -454,5 +464,244 @@ describe('ItemDetailPage workflow UI', () => {
 
     expect(view.queryByText('review exhausted')).not.toBeInTheDocument();
     expect(view.queryByText('hooks exhausted')).not.toBeInTheDocument();
+  });
+
+  // Setup Commands UI tests
+
+  it('hides Setup Commands section when all repos are local', () => {
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'local-repo', type: 'local' as const, localPath: '/tmp/repo' },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    expect(view.queryByText('Setup Commands')).not.toBeInTheDocument();
+  });
+
+  it('renders Setup pending badge and Run Setup button for remote repo with setup commands', () => {
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'not_started' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    expect(view.getByText('Setup Commands')).toBeInTheDocument();
+    expect(view.getByText('Setup pending')).toBeInTheDocument();
+    expect(view.getByRole('button', { name: 'Run Setup' })).toBeInTheDocument();
+  });
+
+  it('renders No setup commands badge for remote repo without setup', () => {
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git' },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    expect(view.getByText('Setup Commands')).toBeInTheDocument();
+    expect(view.getByText('No setup commands')).toBeInTheDocument();
+    expect(view.queryByRole('button', { name: 'Run Setup' })).not.toBeInTheDocument();
+  });
+
+  it('renders Setup completed badge without run button when repo is in a post-setup phase', () => {
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'running' as const,
+            activePhase: 'engineer' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    expect(view.getByText('Setup completed')).toBeInTheDocument();
+    expect(view.queryByRole('button', { name: 'Run Setup' })).not.toBeInTheDocument();
+    expect(view.queryByRole('button', { name: 'Re-run Setup' })).not.toBeInTheDocument();
+  });
+
+  it('renders Setup failed badge with Re-run Setup button when status is error', () => {
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'error' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    expect(view.getByText('Setup failed')).toBeInTheDocument();
+    expect(view.getByRole('button', { name: 'Re-run Setup' })).toBeInTheDocument();
+  });
+
+  it('calls runRepoSetup when Run Setup is clicked', async () => {
+    vi.mocked(api.runRepoSetup).mockResolvedValue({ started: true });
+    refresh.mockResolvedValue(undefined);
+
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'not_started' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+    await act(async () => {
+      view.getByRole('button', { name: 'Run Setup' }).click();
+    });
+
+    expect(api.runRepoSetup).toHaveBeenCalledWith('ITEM-1', 'repo-a');
+  });
+
+  it('transitions to Setup running on repo_setup_started event', () => {
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'running' as const,
+            activePhase: 'setup' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    const wsOptions = mockUseWebSocket.mock.calls[0][0];
+    act(() => {
+      wsOptions.onEvent?.({
+        id: 'evt-setup-1',
+        type: 'repo_setup_started',
+        timestamp: '2026-01-01T00:00:00Z',
+        itemId: 'ITEM-1',
+        repoName: 'repo-a',
+      } as any);
+    });
+
+    // After repo_setup_started, setupResults map has no entry for repo-a,
+    // so status falls through to activePhase='setup' → 'running'
+    expect(view.getByText('Setup running')).toBeInTheDocument();
+  });
+
+  it('shows Setup completed on repo_setup_completed with allPassed=true', () => {
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'running' as const,
+            activePhase: 'setup' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    const wsOptions = mockUseWebSocket.mock.calls[0][0];
+    act(() => {
+      wsOptions.onEvent?.({
+        id: 'evt-setup-2',
+        type: 'repo_setup_completed',
+        timestamp: '2026-01-01T00:00:00Z',
+        itemId: 'ITEM-1',
+        repoName: 'repo-a',
+        allPassed: true,
+      } as any);
+    });
+
+    expect(view.getByText('Setup completed')).toBeInTheDocument();
+  });
+
+  it('shows Setup failed and Re-run Setup on repo_setup_completed with allPassed=false', () => {
+    mockUseItem.mockReturnValue(makeUseItemResult({
+      item: makeItem({
+        repositories: [
+          { name: 'repo-a', type: 'remote' as const, url: 'https://example.com/repo-a.git', setup: ['npm install'] },
+        ],
+        repos: [
+          {
+            repoName: 'repo-a',
+            status: 'running' as const,
+            activePhase: 'setup' as const,
+            noChanges: false,
+            inCurrentPlan: true,
+          },
+        ],
+      }),
+    }));
+
+    const view = renderPage();
+
+    const wsOptions = mockUseWebSocket.mock.calls[0][0];
+    act(() => {
+      wsOptions.onEvent?.({
+        id: 'evt-setup-3',
+        type: 'repo_setup_completed',
+        timestamp: '2026-01-01T00:00:00Z',
+        itemId: 'ITEM-1',
+        repoName: 'repo-a',
+        allPassed: false,
+      } as any);
+    });
+
+    expect(view.getByText('Setup failed')).toBeInTheDocument();
+    expect(view.getByRole('button', { name: 'Re-run Setup' })).toBeInTheDocument();
   });
 });
