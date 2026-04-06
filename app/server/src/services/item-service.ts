@@ -954,6 +954,61 @@ export async function getItemDetail(itemId: string): Promise<ItemDetail | null> 
   };
 }
 
+export async function updateRepoSetup(
+  itemId: string,
+  repoName: string,
+  setup: string[]
+): Promise<ItemConfig | null> {
+  const config = await getItemConfig(itemId);
+  if (!config) {
+    return null;
+  }
+
+  const repoIndex = config.repositories.findIndex(r => r.name === repoName);
+  if (repoIndex === -1) {
+    throw new Error(`Repository "${repoName}" not found in item ${itemId}`);
+  }
+
+  const repo = config.repositories[repoIndex];
+  if (repo.type !== 'remote') {
+    throw new Error('setup is only supported for remote repositories');
+  }
+
+  const updated: ItemConfig = {
+    ...config,
+    repositories: config.repositories.map((r, i) =>
+      i === repoIndex ? { ...r, setup } : r
+    ),
+    updatedAt: new Date().toISOString(),
+  };
+
+  await writeYaml(getItemConfigPath(itemId), updated);
+  return updated;
+}
+
+export async function rerunRepoSetup(
+  itemId: string,
+  repoName: string
+): Promise<void> {
+  const config = await getItemConfig(itemId);
+  if (!config) {
+    throw new Error(`Item ${itemId} not found`);
+  }
+
+  const repo = config.repositories.find(r => r.name === repoName);
+  if (!repo) {
+    throw new Error(`Repository "${repoName}" not found in item ${itemId}`);
+  }
+
+  const repoDir = getRepoWorkspaceDir(itemId, repoName);
+  const eventsPath = getItemEventsPath(itemId);
+  await runRepoSetupCommands(itemId, repo, repoDir, eventsPath);
+}
+
+export function repoWorkspaceExists(itemId: string, repoName: string): boolean {
+  return existsSync(getRepoWorkspaceDir(itemId, repoName));
+}
+
 export async function updateItem(
   itemId: string,
   updates: Partial<Pick<ItemConfig, 'name' | 'description' | 'designDoc'>>

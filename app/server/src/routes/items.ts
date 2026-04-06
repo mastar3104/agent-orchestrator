@@ -11,7 +11,11 @@ import {
   setupWorkspace,
   listItems,
   getItemDetail,
+  getItemConfig,
   updateItem,
+  updateRepoSetup,
+  rerunRepoSetup,
+  repoWorkspaceExists,
   deleteItem,
 } from '../services/item-service';
 import { createDraftPrsForAllRepos } from '../services/git-pr-service';
@@ -180,6 +184,94 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
         success: false,
         error: message,
       });
+    }
+  });
+
+  // Update setup commands for a repository
+  fastify.patch<{
+    Params: { id: string; repoName: string };
+    Body: { setup: unknown };
+    Reply: ApiResponse<{ item: import('@agent-orch/shared').ItemConfig }>;
+  }>('/items/:id/repositories/:repoName/setup', async (request, reply) => {
+    try {
+      const normalizedSetup = normalizeCommandList('setup', request.body.setup, 'setup command');
+      if (normalizedSetup.error) {
+        return reply.status(400).send({ success: false, error: normalizedSetup.error });
+      }
+      if (!normalizedSetup.commands) {
+        return reply.status(400).send({ success: false, error: 'setup is required' });
+      }
+
+      const item = await updateRepoSetup(
+        request.params.id,
+        request.params.repoName,
+        normalizedSetup.commands
+      );
+      if (!item) {
+        return reply.status(404).send({ success: false, error: 'Item not found' });
+      }
+
+      return reply.send({ success: true, data: { item } });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      if (message.includes('not found in item')) {
+        return reply.status(404).send({ success: false, error: message });
+      }
+      if (message.includes('only supported for remote')) {
+        return reply.status(400).send({ success: false, error: message });
+      }
+      return reply.status(500).send({ success: false, error: message });
+    }
+  });
+
+  // Re-run setup commands for a repository
+  fastify.post<{
+    Params: { id: string; repoName: string };
+    Reply: ApiResponse<{ started: boolean }>;
+  }>('/items/:id/repositories/:repoName/setup/run', async (request, reply) => {
+    try {
+      const config = await getItemConfig(request.params.id);
+      if (!config) {
+        return reply.status(404).send({ success: false, error: 'Item not found' });
+      }
+
+      const repo = config.repositories.find(r => r.name === request.params.repoName);
+      if (!repo) {
+        return reply.status(404).send({
+          success: false,
+          error: `Repository "${request.params.repoName}" not found`,
+        });
+      }
+
+      if (repo.type !== 'remote') {
+        return reply.status(400).send({
+          success: false,
+          error: 'setup is only supported for remote repositories',
+        });
+      }
+
+      if (!repoWorkspaceExists(request.params.id, request.params.repoName)) {
+        return reply.status(400).send({
+          success: false,
+          error: `Workspace directory does not exist for repository "${request.params.repoName}"`,
+        });
+      }
+
+      // Fire-and-forget
+      rerunRepoSetup(request.params.id, request.params.repoName).catch((error) => {
+        fastify.log.error(
+          { itemId: request.params.id, repoName: request.params.repoName, error },
+          'Setup command re-run failed'
+        );
+      });
+
+      return reply.status(202).send({
+        success: true,
+        data: { started: true },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return reply.status(500).send({ success: false, error: message });
     }
   });
 

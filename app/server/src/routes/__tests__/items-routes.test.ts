@@ -7,7 +7,11 @@ vi.mock('../../services/item-service', () => ({
   setupWorkspace: vi.fn(),
   listItems: vi.fn().mockResolvedValue([]),
   getItemDetail: vi.fn().mockResolvedValue(null),
+  getItemConfig: vi.fn().mockResolvedValue(null),
   updateItem: vi.fn().mockResolvedValue(null),
+  updateRepoSetup: vi.fn().mockResolvedValue(null),
+  rerunRepoSetup: vi.fn().mockResolvedValue(undefined),
+  repoWorkspaceExists: vi.fn().mockReturnValue(false),
   deleteItem: vi.fn().mockResolvedValue(false),
 }));
 
@@ -30,11 +34,15 @@ vi.mock('../../lib/locks', () => ({
   isItemLocked: vi.fn().mockReturnValue(false),
 }));
 
-import { createItem } from '../../services/item-service';
+import { createItem, getItemConfig, updateRepoSetup, rerunRepoSetup, repoWorkspaceExists } from '../../services/item-service';
 import { ensureCompletedReviewPassed } from '../../services/completed-review-service';
 import { createDraftPrsForAllRepos } from '../../services/git-pr-service';
 
 const mockCreateItem = vi.mocked(createItem);
+const mockGetItemConfig = vi.mocked(getItemConfig);
+const mockUpdateRepoSetup = vi.mocked(updateRepoSetup);
+const mockRerunRepoSetup = vi.mocked(rerunRepoSetup);
+const mockRepoWorkspaceExists = vi.mocked(repoWorkspaceExists);
 const mockEnsureCompletedReviewPassed = vi.mocked(ensureCompletedReviewPassed);
 const mockCreateDraftPrsForAllRepos = vi.mocked(createDraftPrsForAllRepos);
 
@@ -348,6 +356,201 @@ describe('item routes', () => {
         ],
       })
     );
+  });
+
+  describe('PATCH /items/:id/repositories/:repoName/setup', () => {
+    it('returns 400 when setup is not provided', async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/api/items/item-1/repositories/repo-a/setup',
+        headers: { 'content-type': 'application/json' },
+        payload: JSON.stringify({}),
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe('setup is required');
+    });
+
+    it('returns 400 when setup is not an array', async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/api/items/item-1/repositories/repo-a/setup',
+        headers: { 'content-type': 'application/json' },
+        payload: JSON.stringify({ setup: 'bad' }),
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe('setup must be an array');
+    });
+
+    it('returns 400 when setup contains non-string entries', async () => {
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/api/items/item-1/repositories/repo-a/setup',
+        headers: { 'content-type': 'application/json' },
+        payload: JSON.stringify({ setup: ['npm install', 123] }),
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe('Each setup command must be a non-empty string');
+    });
+
+    it('returns 404 when item not found', async () => {
+      mockUpdateRepoSetup.mockResolvedValue(null);
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/api/items/item-1/repositories/repo-a/setup',
+        headers: { 'content-type': 'application/json' },
+        payload: JSON.stringify({ setup: ['npm install'] }),
+      });
+
+      expect(res.statusCode).toBe(404);
+      expect(res.json().error).toBe('Item not found');
+    });
+
+    it('returns 404 when repo not found', async () => {
+      mockUpdateRepoSetup.mockRejectedValue(new Error('Repository "repo-x" not found in item item-1'));
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/api/items/item-1/repositories/repo-x/setup',
+        headers: { 'content-type': 'application/json' },
+        payload: JSON.stringify({ setup: ['npm install'] }),
+      });
+
+      expect(res.statusCode).toBe(404);
+      expect(res.json().error).toBe('Repository "repo-x" not found in item item-1');
+    });
+
+    it('returns 400 when repo is local', async () => {
+      mockUpdateRepoSetup.mockRejectedValue(new Error('setup is only supported for remote repositories'));
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/api/items/item-1/repositories/repo-a/setup',
+        headers: { 'content-type': 'application/json' },
+        payload: JSON.stringify({ setup: ['npm install'] }),
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe('setup is only supported for remote repositories');
+    });
+
+    it('updates setup commands and returns updated item', async () => {
+      const updatedItem = {
+        id: 'item-1',
+        name: 'test',
+        repositories: [{ name: 'repo-a', type: 'remote' as const, setup: ['npm install', 'npm run build'] }],
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:01Z',
+      };
+      mockUpdateRepoSetup.mockResolvedValue(updatedItem);
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/api/items/item-1/repositories/repo-a/setup',
+        headers: { 'content-type': 'application/json' },
+        payload: JSON.stringify({ setup: ['  npm install  ', '  ', 'npm run build'] }),
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toEqual({ success: true, data: { item: updatedItem } });
+      expect(mockUpdateRepoSetup).toHaveBeenCalledWith('item-1', 'repo-a', ['npm install', 'npm run build']);
+    });
+  });
+
+  describe('POST /items/:id/repositories/:repoName/setup/run', () => {
+    it('returns 404 when item not found', async () => {
+      mockGetItemConfig.mockResolvedValue(null);
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/items/item-1/repositories/repo-a/setup/run',
+      });
+
+      expect(res.statusCode).toBe(404);
+      expect(res.json().error).toBe('Item not found');
+    });
+
+    it('returns 404 when repo not found', async () => {
+      mockGetItemConfig.mockResolvedValue({
+        id: 'item-1',
+        name: 'test',
+        repositories: [{ name: 'repo-b', type: 'remote' }],
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+      });
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/items/item-1/repositories/repo-a/setup/run',
+      });
+
+      expect(res.statusCode).toBe(404);
+      expect(res.json().error).toBe('Repository "repo-a" not found');
+    });
+
+    it('returns 400 when repo is local', async () => {
+      mockGetItemConfig.mockResolvedValue({
+        id: 'item-1',
+        name: 'test',
+        repositories: [{ name: 'repo-a', type: 'local', localPath: '/tmp/repo' }],
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+      });
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/items/item-1/repositories/repo-a/setup/run',
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe('setup is only supported for remote repositories');
+    });
+
+    it('returns 400 when workspace directory does not exist', async () => {
+      mockGetItemConfig.mockResolvedValue({
+        id: 'item-1',
+        name: 'test',
+        repositories: [{ name: 'repo-a', type: 'remote', url: 'https://github.com/test/repo.git' }],
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+      });
+      mockRepoWorkspaceExists.mockReturnValue(false);
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/items/item-1/repositories/repo-a/setup/run',
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe('Workspace directory does not exist for repository "repo-a"');
+    });
+
+    it('returns 202 and fires setup re-run in background', async () => {
+      mockGetItemConfig.mockResolvedValue({
+        id: 'item-1',
+        name: 'test',
+        repositories: [{ name: 'repo-a', type: 'remote', url: 'https://github.com/test/repo.git', setup: ['npm install'] }],
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+      });
+      mockRepoWorkspaceExists.mockReturnValue(true);
+      mockRerunRepoSetup.mockResolvedValue(undefined);
+      const app = buildApp();
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/items/item-1/repositories/repo-a/setup/run',
+      });
+
+      expect(res.statusCode).toBe(202);
+      expect(res.json()).toEqual({ success: true, data: { started: true } });
+      expect(mockRerunRepoSetup).toHaveBeenCalledWith('item-1', 'repo-a');
+    });
   });
 
   it('rejects publish before completed review passes', async () => {
