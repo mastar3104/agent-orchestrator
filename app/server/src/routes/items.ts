@@ -32,7 +32,8 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
     Reply: ApiResponse<CreateItemResponse>;
   }>('/items', async (request, reply) => {
     try {
-      // Validate and normalize setup commands for each repository input
+      // Validate and normalize setup commands, building a clean copy of repositories
+      const normalizedRepositories = [];
       for (const repoInput of request.body.repositories || []) {
         if (repoInput.repository?.setup !== undefined) {
           if (repoInput.repository.type === 'local') {
@@ -45,14 +46,16 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
           if (normalizedSetup.error) {
             return reply.status(400).send({ success: false, error: normalizedSetup.error });
           }
-          // Mutate in-place — spread-override is awkward here because the
-          // setup field is nested inside repoInput.repository, not at the top level
-          // like in the repositories.ts POST handler.
-          repoInput.repository.setup = normalizedSetup.commands;
+          normalizedRepositories.push({
+            ...repoInput,
+            repository: { ...repoInput.repository, setup: normalizedSetup.commands },
+          });
+        } else {
+          normalizedRepositories.push(repoInput);
         }
       }
 
-      const item = await createItem(request.body);
+      const item = await createItem({ ...request.body, repositories: normalizedRepositories });
 
       // Start workspace setup in background (clone or link)
       setupWorkspace(item.id).catch((error) => {
