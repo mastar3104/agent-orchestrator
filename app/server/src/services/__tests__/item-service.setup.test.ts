@@ -400,6 +400,7 @@ describe('rerunRepoSetup', () => {
   });
 
   it('calls runRepoSetupCommands with correct repoDir and eventsPath', async () => {
+    mockExistsSync.mockReturnValue(true);
     mockReadYamlSafe.mockResolvedValue({
       id: 'ITEM-1',
       name: 'Item',
@@ -432,6 +433,51 @@ describe('rerunRepoSetup', () => {
       '/items/ITEM-1/events.jsonl',
       expect.objectContaining({ type: 'repo_setup_started' })
     );
+    expect(mockAppendJsonl).toHaveBeenCalledWith(
+      '/items/ITEM-1/events.jsonl',
+      expect.objectContaining({ type: 'repo_setup_completed', repoName: 'repo-a', allPassed: true })
+    );
+  });
+
+  it('does nothing when repo has no setup commands', async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        { name: 'repo-a', type: 'remote', url: 'https://github.com/example/repo.git' },
+      ],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+
+    await rerunRepoSetup('ITEM-1', 'repo-a');
+
+    expect(mockRunShellCommands).not.toHaveBeenCalled();
+    expect(mockAppendJsonl).not.toHaveBeenCalled();
+  });
+
+  it('throws when workspace directory does not exist', async () => {
+    mockExistsSync.mockReturnValue(false);
+    mockReadYamlSafe.mockResolvedValue({
+      id: 'ITEM-1',
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        {
+          name: 'repo-a',
+          type: 'remote',
+          url: 'https://github.com/example/repo.git',
+          setup: ['npm install'],
+        },
+      ],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+
+    await expect(rerunRepoSetup('ITEM-1', 'repo-a'))
+      .rejects.toThrow('Workspace directory does not exist for repository "repo-a"');
   });
 });
 

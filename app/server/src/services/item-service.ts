@@ -1019,6 +1019,9 @@ export async function rerunRepoSetup(
   }
 
   const repoDir = getRepoWorkspaceDir(itemId, repoName);
+  if (!existsSync(repoDir)) {
+    throw new Error(`Workspace directory does not exist for repository "${repoName}" in item ${itemId}`);
+  }
   const eventsPath = getItemEventsPath(itemId);
   await runRepoSetupCommands(itemId, repo, repoDir, eventsPath);
 }

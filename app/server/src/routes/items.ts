@@ -232,6 +232,13 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
     Reply: ApiResponse<{ started: boolean }>;
   }>('/items/:id/repositories/:repoName/setup/run', async (request, reply) => {
     try {
+      if (isItemLocked(request.params.id)) {
+        return reply.status(409).send({
+          success: false,
+          error: 'Operation already in progress for this item',
+        });
+      }
+
       const config = await getItemConfig(request.params.id);
       if (!config) {
         return reply.status(404).send({ success: false, error: 'Item not found' });
