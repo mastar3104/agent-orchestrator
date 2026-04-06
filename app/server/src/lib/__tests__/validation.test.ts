@@ -9,6 +9,12 @@ describe('normalizeCommandList', () => {
     expect(result).not.toHaveProperty('error');
   });
 
+  it('returns error when value is null', () => {
+    expect(normalizeCommandList('setup', null, 'setup command')).toEqual({
+      error: 'setup must be an array',
+    });
+  });
+
   it('returns error when value is not an array', () => {
     expect(normalizeCommandList('setup', 'npm install', 'setup command')).toEqual({
       error: 'setup must be an array',

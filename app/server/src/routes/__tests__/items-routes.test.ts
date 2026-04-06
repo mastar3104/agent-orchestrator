@@ -254,6 +254,48 @@ describe('item routes', () => {
     );
   });
 
+  it('creates item with remote repo when setup is omitted', async () => {
+    mockCreateItem.mockResolvedValue({
+      id: 'ITEM-test',
+      name: 'Item',
+      description: 'desc',
+      repositories: [
+        {
+          name: 'repo-a',
+          type: 'remote',
+          url: 'https://github.com/test/repo.git',
+          workBranch: 'work/ITEM-test/repo-a',
+        },
+      ],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+
+    const app = buildApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/items',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'Item',
+        description: 'desc',
+        repositories: [
+          {
+            name: 'repo-a',
+            repository: {
+              type: 'remote',
+              url: 'https://github.com/test/repo.git',
+            },
+          },
+        ],
+      }),
+    });
+
+    expect(res.statusCode).toBe(201);
+    const callArg = mockCreateItem.mock.calls[0][0];
+    expect(callArg.repositories[0].repository).not.toHaveProperty('setup');
+  });
+
   it('normalizes setup commands and passes them through to createItem', async () => {
     mockCreateItem.mockResolvedValue({
       id: 'ITEM-test',

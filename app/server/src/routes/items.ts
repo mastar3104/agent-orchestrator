@@ -45,7 +45,9 @@ export const itemRoutes: FastifyPluginAsync = async (fastify) => {
           if (normalizedSetup.error) {
             return reply.status(400).send({ success: false, error: normalizedSetup.error });
           }
-          // Mutate in-place: createItem reads from this object
+          // Mutate in-place — spread-override is awkward here because the
+          // setup field is nested inside repoInput.repository, not at the top level
+          // like in the repositories.ts POST handler.
           repoInput.repository.setup = normalizedSetup.commands;
         }
       }

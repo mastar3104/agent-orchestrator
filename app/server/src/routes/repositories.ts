@@ -143,14 +143,16 @@ export const repositoryRoutes: FastifyPluginAsync = async (fastify) => {
         return reply.status(400).send({ success: false, error: normalizedHooks.error });
       }
 
-      const existing = request.body.setup !== undefined ? await getRepository(request.params.id) : null;
-      if (request.body.setup !== undefined && !existing) {
+      // Fetch existing repo unconditionally — PATCH should verify existence up front
+      const existing = await getRepository(request.params.id);
+      if (!existing) {
         return reply.status(404).send({
           success: false,
           error: 'Repository not found',
         });
       }
-      if (existing?.type === 'local') {
+
+      if (request.body.setup !== undefined && existing.type === 'local') {
         return reply.status(400).send({ success: false, error: 'setup is only supported for remote repositories' });
       }
 
