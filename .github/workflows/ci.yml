@@ -13,12 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: yarn
-
-      - run: yarn install --frozen-lockfile
+      - uses: ./.github/actions/setup-node
 
       - name: Build shared package
         run: yarn workspace @agent-orch/shared build
@@ -38,12 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: yarn
-
-      - run: yarn install --frozen-lockfile
+      - uses: ./.github/actions/setup-node
 
       - name: Build shared package
         run: yarn workspace @agent-orch/shared build
@@ -57,12 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: yarn
-
-      - run: yarn install --frozen-lockfile
+      - uses: ./.github/actions/setup-node
 
       - name: Build all packages
         run: yarn build
