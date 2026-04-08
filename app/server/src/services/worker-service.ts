@@ -346,7 +346,7 @@ export function isCompatibleReviewerRole(role: ReturnType<typeof getRole>): bool
 type ReviewResultFileOutcome =
   | { kind: 'no_file' }
   | { kind: 'parsed'; response: ReviewerResponse }
-  | { kind: 'unparseable'; rawContent: string };
+  | { kind: 'unparseable' };
 
 async function readReviewResultFile(filePath: string): Promise<ReviewResultFileOutcome> {
   let fileContent: string;
@@ -368,7 +368,7 @@ async function readReviewResultFile(filePath: string): Promise<ReviewResultFileO
     // JSON parse failed
   }
 
-  return { kind: 'unparseable', rawContent: fileContent };
+  return { kind: 'unparseable' };
 }
 
 function supportsMultiPerspectiveReviews(): boolean {
@@ -451,6 +451,12 @@ async function runReviewPerspective(
   }
 
   if (!agentSucceeded) {
+    // Known limitation: when the agent crashes, no reviewResultFilePath is set.
+    // The synthetic error findings describe the crash but won't be communicated to
+    // the review-fix engineer via file path. If this is the only non-approve perspective,
+    // buildFeedbackPrompt receives an empty reviewResultFilePaths array, producing
+    // 'No review result files available'. This is functionally acceptable since the
+    // synthetic 'manual confirmation required' finding isn't actionable by an automated agent.
     const findings = [
       createSyntheticReviewFinding(
         perspective,
@@ -607,7 +613,8 @@ async function runLegacyReviewCycle(
   }
 
   if (fileOutcome.kind === 'parsed') {
-    const findings = fileOutcome.response.comments.map((comment) => ({
+    const comments = fileOutcome.response.comments ?? [];
+    const findings = comments.map((comment) => ({
       severity: (comment.severity || 'minor') as ReviewFinding['severity'],
       file: comment.file,
       line: comment.line,
@@ -619,15 +626,22 @@ async function runLegacyReviewCycle(
     return {
       findings,
       overallAssessment: 'needs_fixes',
-      summary: `${fileOutcome.response.comments.length} issues found for ${task.id}`,
-      feedbackFiles: fileOutcome.response.comments.map((comment) => comment.file).filter(Boolean),
+      summary: `${comments.length} issues found for ${task.id}`,
+      feedbackFiles: comments.map((comment) => comment.file).filter(Boolean),
       reviewResultFilePaths: [reviewResultFilePath],
     };
   }
 
-  // File exists but not parseable
+  // File exists but not parseable — create synthetic finding for consistency with
+  // runReviewPerspective and to improve event traceability
   return {
-    findings: [],
+    findings: [{
+      severity: 'major' as ReviewFinding['severity'],
+      file: '',
+      description: 'Review result file exists but could not be parsed as structured output. Manual confirmation is required.',
+      suggestedFix: `Inspect ${reviewResultFilePath}`,
+      targetAgent: repo.name,
+    }],
     overallAssessment: 'needs_fixes',
     summary: `Review result file exists but could not be parsed for ${task.id}`,
     feedbackFiles: [],
