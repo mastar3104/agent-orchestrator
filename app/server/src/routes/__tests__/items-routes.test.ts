@@ -7,7 +7,7 @@ vi.mock('../../services/item-service', async (importOriginal) => {
   return {
     ...actual,
     createItem: vi.fn(),
-    setupWorkspace: vi.fn(),
+    setupWorkspace: vi.fn().mockResolvedValue(undefined),
     listItems: vi.fn().mockResolvedValue([]),
     getItemDetail: vi.fn().mockResolvedValue(null),
     updateItem: vi.fn().mockResolvedValue(null),
@@ -456,6 +456,7 @@ describe('item routes', () => {
       const updatedItem = {
         id: 'item-1',
         name: 'test',
+        description: '',
         repositories: [{ name: 'repo-a', type: 'remote' as const, setup: ['npm install', 'npm run build'] }],
         createdAt: '2026-01-01T00:00:00Z',
         updatedAt: '2026-01-01T00:00:01Z',
