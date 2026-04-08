@@ -114,6 +114,7 @@ describe('role-loader', () => {
         'Read',
         'Glob',
         'Grep',
+        'Write',
       ]);
       expect(getRole('completedReviewer').allowedTools).toEqual([
         'Read',
