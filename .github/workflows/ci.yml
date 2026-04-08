@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build shared package
+        run: npm run build -w @agent-orch/shared
+
+      - name: Typecheck shared
+        run: npx tsc --noEmit -p packages/shared/tsconfig.json
+
+      - name: Typecheck server
+        run: npx tsc --noEmit -p app/server/tsconfig.json
+
+      - name: Typecheck web
+        run: npx tsc --noEmit -p app/web/tsconfig.json
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build shared package
+        run: npm run build -w @agent-orch/shared
+
+      - name: Run tests
+        run: npm test
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build all packages
+        run: npm run build
