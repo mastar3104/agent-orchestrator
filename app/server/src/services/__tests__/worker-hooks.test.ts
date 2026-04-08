@@ -138,6 +138,14 @@ vi.mock('../../lib/paths', () => ({
   getItemEventsPath: vi.fn().mockReturnValue('/events.jsonl'),
   getItemPlanPath: vi.fn().mockReturnValue('/plan.yaml'),
   getHookLogDir: vi.fn((_itemId: string, repoName: string) => `/hooks/${repoName}`),
+  getTaskReviewArtifactsDir: vi.fn(
+    (_itemId: string, repoName: string, taskId: string, reviewRound: number) =>
+      `/items/ITEM-test/reviews/${repoName}/${taskId}/review-round-${reviewRound}`
+  ),
+  getTaskReviewArtifactIndexPath: vi.fn(
+    (_itemId: string, repoName: string, taskId: string, reviewRound: number) =>
+      `/items/ITEM-test/reviews/${repoName}/${taskId}/review-round-${reviewRound}/index.md`
+  ),
 }));
 
 vi.mock('../event-bus', () => ({

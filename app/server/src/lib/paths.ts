@@ -62,6 +62,28 @@ export function getHookLogDir(itemId: string, repoName: string): string {
   return join(getItemDir(itemId), 'hooks', repoName);
 }
 
+export function getReviewArtifactsDir(itemId: string, repoName: string): string {
+  return join(getItemDir(itemId), 'reviews', repoName);
+}
+
+export function getTaskReviewArtifactsDir(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  reviewRound: number
+): string {
+  return join(getReviewArtifactsDir(itemId, repoName), taskId, `review-round-${reviewRound}`);
+}
+
+export function getTaskReviewArtifactIndexPath(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  reviewRound: number
+): string {
+  return join(getTaskReviewArtifactsDir(itemId, repoName, taskId, reviewRound), 'index.md');
+}
+
 export function getRepoSetupLogDir(itemId: string, repoName: string): string {
   return join(getItemDir(itemId), 'setup', repoName);
 }

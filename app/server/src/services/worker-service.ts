@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import { resolve, join } from 'path';
+import { mkdir, writeFile } from 'fs/promises';
 import type {
   Plan,
   PlanTask,
@@ -19,7 +20,14 @@ import { getItemConfig } from './item-service';
 import {
   startGitSnapshot,
 } from './git-snapshot-service';
-import { getWorkspaceRoot, getRepoWorkspaceDir, getItemEventsPath, getHookLogDir } from '../lib/paths';
+import {
+  getWorkspaceRoot,
+  getRepoWorkspaceDir,
+  getItemEventsPath,
+  getHookLogDir,
+  getTaskReviewArtifactsDir,
+  getTaskReviewArtifactIndexPath,
+} from '../lib/paths';
 import { stringifyYaml } from '../lib/yaml';
 import { eventBus } from './event-bus';
 import { appendJsonl } from '../lib/jsonl';
@@ -59,6 +67,8 @@ const AGENT_MAX_RETRIES = 2;
 const HOOK_TIMEOUT_MS = COMMAND_TIMEOUT_MS;
 const ENGINEER_SCHEMA_FALLBACK_MODE = 'result_or_empty' as const;
 const REVIEWER_SCHEMA_FALLBACK_MODE = 'result_or_empty' as const;
+const MAX_REVIEW_ARTIFACT_DIFF_LINES = 5000;
+const MAX_REVIEW_ARTIFACT_DIFF_CHARS = 200000;
 const REVIEW_PERSPECTIVE_RUN_ORDER: ReviewPerspective[] = [
   'architecture',
   'security',
@@ -94,6 +104,11 @@ interface ReviewPerspectiveExecutionResult {
   agentId: string;
   hasStructuredSignal: boolean;
   detail?: string;
+}
+
+interface ReviewContextBuildResult {
+  prompt: string;
+  artifactDir?: string;
 }
 
 interface ReviewCycleResult {
@@ -323,14 +338,14 @@ async function runReviewPerspective(
   repo: ItemRepositoryConfig,
   task: PlanTask,
   agentWorkdir: string,
-  reviewContext: string,
+  reviewContext: ReviewContextBuildResult,
   reviewCycle: number,
   perspective: ReviewPerspective
 ): Promise<ReviewPerspectiveExecutionResult> {
   const config = getReviewPerspectiveConfig(perspective);
   const role = resolveReviewPerspectiveRole(config.roleName);
   const prompt = composeRepositoryRolePrompt(
-    reviewContext,
+    reviewContext.prompt,
     repo.rolePrompts,
     config.promptKey,
     'reviewer'
@@ -359,6 +374,7 @@ async function runReviewPerspective(
         currentTask: `${task.id}: review:${perspective}`,
         prompt,
         appendSystemPrompt: role.systemPrompt,
+        addDirs: reviewContext.artifactDir ? [reviewContext.artifactDir] : undefined,
         workingDir: agentWorkdir,
         allowedTools: role.allowedTools,
         jsonSchema: role.jsonSchema,
@@ -462,11 +478,11 @@ async function runLegacyReviewCycle(
   repo: ItemRepositoryConfig,
   task: PlanTask,
   agentWorkdir: string,
-  reviewContext: string
+  reviewContext: ReviewContextBuildResult
 ): Promise<ReviewCycleResult> {
   const reviewerRole = getRole('reviewer');
   const reviewerPrompt = composeRepositoryRolePrompt(
-    reviewContext,
+    reviewContext.prompt,
     repo.rolePrompts,
     'reviewer'
   );
@@ -483,6 +499,7 @@ async function runLegacyReviewCycle(
         currentTask: `${task.id}: review`,
         prompt: reviewerPrompt,
         appendSystemPrompt: reviewerRole.systemPrompt,
+        addDirs: reviewContext.artifactDir ? [reviewContext.artifactDir] : undefined,
         workingDir: agentWorkdir,
         allowedTools: reviewerRole.allowedTools,
         jsonSchema: reviewerRole.jsonSchema,
@@ -1535,12 +1552,14 @@ async function runTaskReviewPhase(
     const currentHead = await getGitHead(agentWorkdir);
 
     const reviewContext = await buildReviewContext(
+      itemId,
       repo.name,
       agentWorkdir,
       phaseBase,
       currentHead,
       task,
       plan,
+      reviewCycle,
       hookPhase.exhausted ? summarizeHookFailures(hookPhase.hookResults) : undefined
     );
     const reviewCycleResult: ReviewCycleResult = supportsMultiPerspectiveReviews()
@@ -2024,11 +2043,6 @@ ${filesStr}
 ${depsStr}`;
 }
 
-const MAX_FILE_LINES = 500;
-const MAX_FILE_CHARS = 50000;
-const MAX_TOTAL_LINES = 20000;
-const MAX_TOTAL_CHARS = 500000;
-
 interface ChangedFileInfo {
   status: string; // A, M, D, R, C, T, etc.
   path: string;
@@ -2049,62 +2063,167 @@ async function getChangedFiles(cwd: string, base: string, head: string): Promise
   });
 }
 
-async function getBinaryFiles(cwd: string, base: string, head: string): Promise<Set<string>> {
-  const output = await execGit(['diff', '--numstat', base, head], cwd);
-  const binaries = new Set<string>();
-  if (!output.trim()) return binaries;
-
-  for (const line of output.trim().split('\n')) {
-    if (line.startsWith('-\t-\t')) {
-      const filePath = line.split('\t')[2];
-      if (filePath) binaries.add(filePath);
-    }
-  }
-  return binaries;
+function sanitizeReviewArtifactName(filePath: string): string {
+  return filePath
+    .replace(/[\\/]/g, '__')
+    .replace(/[^a-zA-Z0-9._-]/g, '_');
 }
 
-async function readFileAtCommit(
-  cwd: string, commitHash: string, filePath: string
-): Promise<{ content: string; lines: number; truncated: boolean }> {
-  try {
-    const raw = await execGit(['show', `${commitHash}:${filePath}`], cwd);
-    const lines = raw.split('\n');
-    let content = raw;
-    let truncated = false;
+function truncateReviewArtifactDiff(diff: string): { content: string; truncated: boolean; note?: string } {
+  const lines = diff.split('\n');
+  let content = diff;
+  const notes: string[] = [];
 
-    if (lines.length > MAX_FILE_LINES) {
-      content = lines.slice(0, MAX_FILE_LINES).join('\n');
-      truncated = true;
-    }
-    if (content.length > MAX_FILE_CHARS) {
-      content = content.slice(0, MAX_FILE_CHARS);
-      truncated = true;
-    }
+  if (lines.length > MAX_REVIEW_ARTIFACT_DIFF_LINES) {
+    content = lines.slice(0, MAX_REVIEW_ARTIFACT_DIFF_LINES).join('\n');
+    notes.push(`truncated at ${MAX_REVIEW_ARTIFACT_DIFF_LINES} lines (total ${lines.length})`);
+  }
 
-    return { content, lines: Math.min(lines.length, MAX_FILE_LINES), truncated };
-  } catch {
-    return { content: '<unable to read file>', lines: 1, truncated: false };
+  if (content.length > MAX_REVIEW_ARTIFACT_DIFF_CHARS) {
+    content = content.slice(0, MAX_REVIEW_ARTIFACT_DIFF_CHARS);
+    notes.push(`truncated at ${MAX_REVIEW_ARTIFACT_DIFF_CHARS} chars`);
+  }
+
+  if (notes.length === 0) {
+    return { content, truncated: false };
+  }
+
+  return {
+    content: `${content}\n\n<artifact ${notes.join(', ')}>\n`,
+    truncated: true,
+    note: notes.join(', '),
+  };
+}
+
+function describeChangedFile(file: ChangedFileInfo): string {
+  switch (file.status) {
+    case 'A':
+      return `[ADDED] ${file.path}`;
+    case 'D':
+      return `[DELETED] ${file.path}`;
+    case 'R':
+      return `[RENAMED] ${file.oldPath} -> ${file.path}`;
+    case 'C':
+      return `[COPIED] ${file.oldPath} -> ${file.path}`;
+    case 'M':
+      return `[MODIFIED] ${file.path}`;
+    default:
+      return `[${file.status}] ${file.path}`;
   }
 }
 
-async function getFileSizeAtCommit(cwd: string, commitHash: string, filePath: string): Promise<number> {
-  try {
-    const output = await execGit(['cat-file', '-s', `${commitHash}:${filePath}`], cwd);
-    return parseInt(output, 10) || 0;
-  } catch {
-    return 0;
-  }
+interface ReviewArtifactEntry {
+  file: ChangedFileInfo;
+  relativePath: string;
+  absolutePath: string;
+  truncated: boolean;
+  note?: string;
 }
 
-async function buildReviewContext(
+export async function generateTaskReviewArtifacts(
+  itemId: string,
   repoName: string,
   agentWorkdir: string,
   phaseBase: string,
   currentHead: string,
   reviewTask: PlanTask,
   plan: Plan,
+  reviewRound: number,
   hookWarningSummary?: string
-): Promise<string> {
+): Promise<{
+  artifactDir: string;
+  indexPath: string;
+  changedFiles: ChangedFileInfo[];
+  entries: ReviewArtifactEntry[];
+}> {
+  const artifactDir = getTaskReviewArtifactsDir(itemId, repoName, reviewTask.id, reviewRound);
+  const indexPath = getTaskReviewArtifactIndexPath(itemId, repoName, reviewTask.id, reviewRound);
+  await mkdir(artifactDir, { recursive: true });
+
+  const changedFiles = await getChangedFiles(agentWorkdir, phaseBase, currentHead);
+  const entries: ReviewArtifactEntry[] = [];
+
+  for (const [index, file] of changedFiles.entries()) {
+    const relativePath = `${String(index + 1).padStart(3, '0')}-${sanitizeReviewArtifactName(file.path)}.diff`;
+    const absolutePath = join(artifactDir, relativePath);
+    let diffContent: string;
+    try {
+      diffContent = await getGitDiff(agentWorkdir, phaseBase, currentHead, [file.path]);
+    } catch {
+      diffContent = '<unable to generate diff>';
+    }
+
+    const { content, truncated, note } = truncateReviewArtifactDiff(diffContent);
+    await writeFile(absolutePath, content, 'utf-8');
+    entries.push({
+      file,
+      relativePath,
+      absolutePath,
+      truncated,
+      note,
+    });
+  }
+
+  const relevantPlan = {
+    summary: plan.summary,
+    tasks: plan.tasks.filter((task) => task.id === reviewTask.id),
+  };
+  const planContent = stringifyYaml(relevantPlan);
+  const changedFileLines = changedFiles.length === 0
+    ? ['- No file changes detected between phase base and current HEAD.']
+    : entries.map((entry) => {
+        const suffix = entry.note ? ` (${entry.note})` : '';
+        return `- ${describeChangedFile(entry.file)} -> \`${entry.relativePath}\`${suffix}`;
+      });
+
+  const indexContent = [
+    `# Review Artifacts for ${repoName}/${reviewTask.id}`,
+    '',
+    `- Repository: ${repoName}`,
+    `- Task: ${reviewTask.id} - ${reviewTask.title}`,
+    `- Review Round: ${reviewRound}`,
+    `- Phase Base: ${phaseBase}`,
+    `- Current HEAD: ${currentHead}`,
+    '',
+    hookWarningSummary
+      ? `## Hook Status Warning\n${hookWarningSummary}\n`
+      : null,
+    '## Plan',
+    '```yaml',
+    planContent,
+    '```',
+    '',
+    '## Implemented Task',
+    reviewTask.description,
+    '',
+    '## Changed Files',
+    ...changedFileLines,
+    '',
+    'Read the diff files above for the exact task-scoped patch content.',
+    '',
+  ].filter((line): line is string => line !== null);
+
+  await writeFile(indexPath, indexContent.join('\n'), 'utf-8');
+
+  return {
+    artifactDir,
+    indexPath,
+    changedFiles,
+    entries,
+  };
+}
+
+async function buildReviewContext(
+  itemId: string,
+  repoName: string,
+  agentWorkdir: string,
+  phaseBase: string,
+  currentHead: string,
+  reviewTask: PlanTask,
+  plan: Plan,
+  reviewRound: number,
+  hookWarningSummary?: string
+): Promise<ReviewContextBuildResult> {
   const taskDescriptions = `### Task: ${reviewTask.id} - ${reviewTask.title}
 ${reviewTask.description}`;
 
@@ -2115,15 +2234,50 @@ ${reviewTask.description}`;
   };
   const planContent = stringifyYaml(relevantPlan);
 
-  // Get changed files info
-  let changedFiles: ChangedFileInfo[] = [];
-  let binaryFiles = new Set<string>();
   try {
-    changedFiles = await getChangedFiles(agentWorkdir, phaseBase, currentHead);
-    binaryFiles = await getBinaryFiles(agentWorkdir, phaseBase, currentHead);
+    const artifacts = await generateTaskReviewArtifacts(
+      itemId,
+      repoName,
+      agentWorkdir,
+      phaseBase,
+      currentHead,
+      reviewTask,
+      plan,
+      reviewRound,
+      hookWarningSummary
+    );
+    const changedFilesSection = artifacts.changedFiles.length === 0
+      ? 'No file changes detected between phase start and current HEAD.'
+      : [
+          'Read the review artifact index first, then open only the diff files you need.',
+          `Artifact index: ${artifacts.indexPath}`,
+          ...artifacts.entries.map((entry) => `- ${describeChangedFile(entry.file)} (${entry.relativePath})`),
+        ].join('\n');
+
+    return {
+      prompt: `## Repository: ${repoName}
+
+${hookWarningSummary ? `## Hook Status Warning
+Hooks exhausted their allowed attempts before this review. Review the current code with that context.
+
+${hookWarningSummary}
+
+` : ''}## Plan
+\`\`\`yaml
+${planContent}
+\`\`\`
+
+## Changed Files
+${changedFilesSection}
+
+## Implemented Tasks
+
+${taskDescriptions}`,
+      artifactDir: artifacts.artifactDir,
+    };
   } catch {
-    // Fallback: return minimal context
-    return `## Repository: ${repoName}
+    return {
+      prompt: `## Repository: ${repoName}
 
 ${hookWarningSummary ? `## Hook Status Warning
 Hooks exhausted their allowed attempts before this review. Review the current code with that context.
@@ -2138,81 +2292,13 @@ ${planContent}
 ## Changed Files
 <unable to determine changed files>
 
-## Implemented Tasks
-
-${taskDescriptions}`;
-  }
-
-  // Build file contents section
-  const fileSections: string[] = [];
-  let totalLines = 0;
-  let totalChars = 0;
-  const skippedFiles: string[] = [];
-
-  for (const file of changedFiles) {
-    if (totalLines >= MAX_TOTAL_LINES || totalChars >= MAX_TOTAL_CHARS) {
-      skippedFiles.push(file.path);
-      continue;
-    }
-
-    const isBinary = binaryFiles.has(file.path);
-
-    if (file.status === 'D') {
-      fileSections.push(`### [DELETED] ${file.path}`);
-      totalLines += 1;
-      continue;
-    }
-
-    if (isBinary) {
-      const size = await getFileSizeAtCommit(agentWorkdir, currentHead, file.path);
-      const sizeStr = size > 1024 ? `${(size / 1024).toFixed(1)} KB` : `${size} B`;
-      fileSections.push(`### [BINARY] ${file.path} (${sizeStr})`);
-      totalLines += 1;
-      continue;
-    }
-
-    // A, M, R, C, T and other statuses: read the file content from the commit
-    const statusLabel = file.status === 'A' ? 'ADDED' : file.status === 'M' ? 'MODIFIED' : file.status === 'R' ? `RENAMED from ${file.oldPath}` : 'CHANGED';
-    const { content, lines, truncated } = await readFileAtCommit(agentWorkdir, currentHead, file.path);
-
-    if (totalLines + lines > MAX_TOTAL_LINES || totalChars + content.length > MAX_TOTAL_CHARS) {
-      skippedFiles.push(file.path);
-      continue;
-    }
-
-    const truncNote = truncated ? ' (truncated)' : '';
-    fileSections.push(`### [${statusLabel}] ${file.path}${truncNote}
-\`\`\`
-${content}
-\`\`\``);
-    totalLines += lines;
-    totalChars += content.length;
-  }
-
-  const skippedSection = skippedFiles.length > 0
-    ? `\n### Remaining files (content omitted due to size limits)\n${skippedFiles.map(f => `- ${f}`).join('\n')}`
-    : '';
-
-  return `## Repository: ${repoName}
-
-${hookWarningSummary ? `## Hook Status Warning
-Hooks exhausted their allowed attempts before this review. Review the current code with that context.
-
-${hookWarningSummary}
-
-` : ''}## Plan
-\`\`\`yaml
-${planContent}
-\`\`\`
-
-## Changed Files
-
-${fileSections.join('\n\n')}
-${skippedSection}
+If review artifacts become available, read the artifact index first and then inspect only the necessary diff files.
 
 ## Implemented Tasks
 
-${taskDescriptions}`;
+${taskDescriptions}`,
+    };
+  }
 }
 
 export function buildFeedbackPrompt(

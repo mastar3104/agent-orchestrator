@@ -7,6 +7,9 @@ const gitMockState = vi.hoisted(() => ({
   committedPaths: ['file.ts'] as string[],
   statusPorcelain: '',
   diffRanges: {} as Record<string, string[]>,
+  diffNameStatus: {} as Record<string, string>,
+  diffNumstat: {} as Record<string, string>,
+  diffByFile: {} as Record<string, string>,
 }));
 const mockSpawn = vi.hoisted(() => vi.fn());
 
@@ -136,10 +139,20 @@ vi.mock('../../lib/paths', () => ({
   getRepoWorkspaceDir: vi.fn((_itemId: string, repoName: string) => `/workspace/${repoName}`),
   getItemEventsPath: vi.fn().mockReturnValue('/events.jsonl'),
   getItemPlanPath: vi.fn().mockReturnValue('/plan.yaml'),
+  getTaskReviewArtifactsDir: vi.fn(
+    (_itemId: string, repoName: string, taskId: string, reviewRound: number) =>
+      `/items/ITEM-test/reviews/${repoName}/${taskId}/review-round-${reviewRound}`
+  ),
+  getTaskReviewArtifactIndexPath: vi.fn(
+    (_itemId: string, repoName: string, taskId: string, reviewRound: number) =>
+      `/items/ITEM-test/reviews/${repoName}/${taskId}/review-round-${reviewRound}/index.md`
+  ),
 }));
 
 vi.mock('fs/promises', () => ({
   readFile: vi.fn().mockResolvedValue('version: "1"\nitemId: ITEM-test\nsummary: test\ntasks:\n  - id: T1'),
+  mkdir: vi.fn().mockResolvedValue(undefined),
+  writeFile: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../event-bus', () => ({
@@ -216,14 +229,15 @@ vi.mock('child_process', () => {
         } else if (args[0] === 'diff') {
           const rangeKey = args[2] && args[3] ? `${args[2]}..${args[3]}` : '';
           const changedPaths = gitMockState.diffRanges[rangeKey] || gitMockState.committedPaths;
+          const requestedFile = args.includes('--') ? args[args.indexOf('--') + 1] : undefined;
           if (args.includes('--name-only')) {
             proc.stdout.emit('data', changedPaths.join('\n'));
           } else if (args.includes('--name-status')) {
-            proc.stdout.emit('data', changedPaths.map((path) => `M\t${path}`).join('\n'));
+            proc.stdout.emit('data', gitMockState.diffNameStatus[rangeKey] || changedPaths.map((path) => `M\t${path}`).join('\n'));
           } else if (args.includes('--numstat')) {
-            proc.stdout.emit('data', changedPaths.map((path) => `10\t5\t${path}`).join('\n'));
+            proc.stdout.emit('data', gitMockState.diffNumstat[rangeKey] || changedPaths.map((path) => `10\t5\t${path}`).join('\n'));
           } else {
-            proc.stdout.emit('data', 'diff content');
+            proc.stdout.emit('data', requestedFile ? (gitMockState.diffByFile[requestedFile] || `diff content for ${requestedFile}`) : 'diff content');
           }
         } else if (args[0] === 'show') {
           proc.stdout.emit('data', '// file content');
@@ -251,10 +265,12 @@ import { getItemConfig } from '../item-service';
 import { getPlan } from '../planner-service';
 import { eventBus } from '../event-bus';
 import {
+  generateTaskReviewArtifacts,
   startWorkers,
   validateWorkerStartPreconditions,
   WorkerStartValidationError,
 } from '../worker-service';
+import { writeFile } from 'fs/promises';
 
 const mockExecuteAgent = vi.mocked(executeAgent);
 const mockCreateDraftPrsForAllRepos = vi.mocked(createDraftPrsForAllRepos);
@@ -262,6 +278,7 @@ const mockMaybeStartCompletedReviewAfterTasks = vi.mocked(maybeStartCompletedRev
 const mockGetItemConfig = vi.mocked(getItemConfig);
 const mockGetPlan = vi.mocked(getPlan);
 const mockEventBus = vi.mocked(eventBus);
+const mockWriteFile = vi.mocked(writeFile);
 
 const ITEM_ID = 'ITEM-test';
 
@@ -412,6 +429,9 @@ describe('Worker task-state execution', () => {
     gitMockState.committedPaths = ['file.ts'];
     gitMockState.statusPorcelain = '';
     gitMockState.diffRanges = {};
+    gitMockState.diffNameStatus = {};
+    gitMockState.diffNumstat = {};
+    gitMockState.diffByFile = {};
     mockMaybeStartCompletedReviewAfterTasks.mockResolvedValue(undefined);
     mockGetPlan.mockResolvedValue(
       makePlan([{ id: 'T1', title: 'Task 1', repository: 'repo-a' }]) as any
@@ -1522,12 +1542,14 @@ describe('Worker task-state execution', () => {
 
   it('includes plan and changed files sections in reviewer prompts', async () => {
     let reviewerPrompt = '';
+    let reviewerAddDirs: string[] | undefined;
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer') {
         return engineerSuccess();
       }
       if (params.role === 'review') {
         reviewerPrompt = params.prompt;
+        reviewerAddDirs = params.addDirs;
         return reviewApprove();
       }
       throw new Error(`Unexpected role: ${params.role}`);
@@ -1538,5 +1560,57 @@ describe('Worker task-state execution', () => {
     expect(reviewerPrompt).toContain('## Plan');
     expect(reviewerPrompt).toContain('## Changed Files');
     expect(reviewerPrompt).toContain('## Implemented Tasks');
+    expect(reviewerPrompt).toContain('Read the review artifact index first');
+    expect(reviewerPrompt).toContain('/items/ITEM-test/reviews/repo-a/T1/review-round-1/index.md');
+    expect(reviewerAddDirs).toEqual(['/items/ITEM-test/reviews/repo-a/T1/review-round-1']);
+  });
+
+  it('writes task-scoped review artifacts per changed file', async () => {
+    gitMockState.diffRanges['base-1..head-2'] = ['src/new.ts', 'src/old.ts', 'assets/logo.png'];
+    gitMockState.diffNameStatus['base-1..head-2'] = [
+      'A\tsrc/new.ts',
+      'R100\tsrc/legacy.ts\tsrc/old.ts',
+      'D\tassets/logo.png',
+    ].join('\n');
+    gitMockState.diffByFile['src/new.ts'] = 'diff --git a/src/new.ts b/src/new.ts\n+const created = true;';
+    gitMockState.diffByFile['src/old.ts'] = 'diff --git a/src/legacy.ts b/src/old.ts\nrename from src/legacy.ts\nrename to src/old.ts';
+    gitMockState.diffByFile['assets/logo.png'] = 'Binary files a/assets/logo.png and /dev/null differ';
+
+    const artifacts = await generateTaskReviewArtifacts(
+      ITEM_ID,
+      'repo-a',
+      '/workspace/repo-a',
+      'base-1',
+      'head-2',
+      {
+        id: 'T1',
+        title: 'Task 1',
+        description: 'Implement reviewer artifact flow.',
+        repository: 'repo-a',
+        files: [],
+        dependencies: [],
+      } as any,
+      makePlan([{ id: 'T1', title: 'Task 1', repository: 'repo-a' }]) as any,
+      2
+    );
+
+    expect(artifacts.artifactDir).toBe('/items/ITEM-test/reviews/repo-a/T1/review-round-2');
+    expect(artifacts.indexPath).toBe('/items/ITEM-test/reviews/repo-a/T1/review-round-2/index.md');
+    expect(artifacts.entries).toHaveLength(3);
+    expect(mockWriteFile).toHaveBeenCalledWith(
+      '/items/ITEM-test/reviews/repo-a/T1/review-round-2/001-src__new.ts.diff',
+      expect.stringContaining('diff --git a/src/new.ts b/src/new.ts'),
+      'utf-8'
+    );
+    expect(mockWriteFile).toHaveBeenCalledWith(
+      '/items/ITEM-test/reviews/repo-a/T1/review-round-2/003-assets__logo.png.diff',
+      expect.stringContaining('Binary files a/assets/logo.png'),
+      'utf-8'
+    );
+    expect(mockWriteFile).toHaveBeenCalledWith(
+      '/items/ITEM-test/reviews/repo-a/T1/review-round-2/index.md',
+      expect.stringContaining('[RENAMED] src/legacy.ts -> src/old.ts -> `002-src__old.ts.diff`'),
+      'utf-8'
+    );
   });
 });
