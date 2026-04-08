@@ -147,6 +147,10 @@ vi.mock('../../lib/paths', () => ({
     (_itemId: string, repoName: string, taskId: string, reviewRound: number) =>
       `/items/ITEM-test/reviews/${repoName}/${taskId}/review-round-${reviewRound}/index.md`
   ),
+  getReviewResultFilePath: vi.fn(
+    (_itemId: string, repoName: string, taskId: string, reviewRound: number, perspective?: string) =>
+      `/items/ITEM-test/reviews/${repoName}/${taskId}/review-round-${reviewRound}/${perspective ? `result-${perspective}.json` : 'result.json'}`
+  ),
 }));
 
 vi.mock('fs/promises', () => ({
