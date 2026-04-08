@@ -318,8 +318,10 @@ function resolveReviewPerspectiveRole(
 
 // Best-effort guard only: this avoids obviously write-capable reviewer roles,
 // but it is not a security boundary because tool patterns may still permit writes.
+// Note: Write is allowed for reviewers (review result file output), but Edit is
+// still blocked because it would allow direct code modification.
 function isCompatibleReviewerRole(role: ReturnType<typeof getRole>): boolean {
-  return !role.allowedTools.includes('Write') && !role.allowedTools.includes('Edit');
+  return !role.allowedTools.includes('Edit');
 }
 
 function supportsMultiPerspectiveReviews(): boolean {

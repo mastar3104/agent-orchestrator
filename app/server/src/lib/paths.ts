@@ -84,6 +84,17 @@ export function getTaskReviewArtifactIndexPath(
   return join(getTaskReviewArtifactsDir(itemId, repoName, taskId, reviewRound), 'index.md');
 }
 
+export function getReviewResultFilePath(
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  reviewRound: number,
+  perspective?: string
+): string {
+  const fileName = perspective ? `result-${perspective}.json` : 'result.json';
+  return join(getTaskReviewArtifactsDir(itemId, repoName, taskId, reviewRound), fileName);
+}
+
 export function getRepoSetupLogDir(itemId: string, repoName: string): string {
   return join(getItemDir(itemId), 'setup', repoName);
 }

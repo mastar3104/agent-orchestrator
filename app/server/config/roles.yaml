@@ -216,15 +216,20 @@ roles:
 
       ## Output Format
 
-      Return a JSON response:
-      - If the code is acceptable: {"review_status": "approve", "comments": []}
-      - If changes are needed: {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      If changes are needed, write a JSON file to the following path:
+      {{reviewResultFilePath}}
+
+      The JSON format is:
+      {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+
+      If the code is acceptable (approve), do NOT create the file. Simply return {"review_status": "approve", "comments": []}.
 
       Focus on critical and major issues first. Be specific about file paths and line numbers.
     allowedTools:
       - Read
       - Glob
       - Grep
+      - Write
     schemaRef: reviewer
 
   architectureReviewer:
@@ -247,15 +252,20 @@ roles:
 
       ## Output Format
 
-      Return a JSON response:
-      - If the code is acceptable: {"review_status": "approve", "comments": []}
-      - If changes are needed: {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      If changes are needed, write a JSON file to the following path:
+      {{reviewResultFilePath}}
+
+      The JSON format is:
+      {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+
+      If the code is acceptable (approve), do NOT create the file. Simply return {"review_status": "approve", "comments": []}.
 
       Focus on critical and major issues first. Be specific about file paths and line numbers.
     allowedTools:
       - Read
       - Glob
       - Grep
+      - Write
     schemaRef: reviewer
 
   securityReviewer:
@@ -278,15 +288,20 @@ roles:
 
       ## Output Format
 
-      Return a JSON response:
-      - If the code is acceptable: {"review_status": "approve", "comments": []}
-      - If changes are needed: {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      If changes are needed, write a JSON file to the following path:
+      {{reviewResultFilePath}}
+
+      The JSON format is:
+      {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+
+      If the code is acceptable (approve), do NOT create the file. Simply return {"review_status": "approve", "comments": []}.
 
       Focus on critical and major issues first. Be specific about file paths and line numbers.
     allowedTools:
       - Read
       - Glob
       - Grep
+      - Write
     schemaRef: reviewer
 
   testingReviewer:
@@ -309,15 +324,20 @@ roles:
 
       ## Output Format
 
-      Return a JSON response:
-      - If the code is acceptable: {"review_status": "approve", "comments": []}
-      - If changes are needed: {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      If changes are needed, write a JSON file to the following path:
+      {{reviewResultFilePath}}
+
+      The JSON format is:
+      {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+
+      If the code is acceptable (approve), do NOT create the file. Simply return {"review_status": "approve", "comments": []}.
 
       Focus on critical and major issues first. Be specific about file paths and line numbers.
     allowedTools:
       - Read
       - Glob
       - Grep
+      - Write
     schemaRef: reviewer
 
   requirementsReviewer:
@@ -340,15 +360,20 @@ roles:
 
       ## Output Format
 
-      Return a JSON response:
-      - If the code is acceptable: {"review_status": "approve", "comments": []}
-      - If changes are needed: {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      If changes are needed, write a JSON file to the following path:
+      {{reviewResultFilePath}}
+
+      The JSON format is:
+      {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+
+      If the code is acceptable (approve), do NOT create the file. Simply return {"review_status": "approve", "comments": []}.
 
       Focus on critical and major issues first. Be specific about file paths and line numbers.
     allowedTools:
       - Read
       - Glob
       - Grep
+      - Write
     schemaRef: reviewer
 
   reviewReceiver:
