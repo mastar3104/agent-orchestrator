@@ -98,7 +98,7 @@ export async function executeAgent<T>(options: {
   addDirs?: string[];
   workingDir: string;
   allowedTools: string[];
-  jsonSchema: object;
+  jsonSchema?: object;
   schemaFallbackMode?: ClaudeSchemaFallbackMode;
   agentId?: string;
   resumeSessionId?: string;

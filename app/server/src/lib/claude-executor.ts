@@ -10,7 +10,7 @@ export interface ClaudeExecutionOptions {
   appendSystemPrompt?: string;
   addDirs?: string[];
   allowedTools: string[];
-  jsonSchema: object;
+  jsonSchema?: object;
   schemaFallbackMode?: ClaudeSchemaFallbackMode;
   cwd: string;
   resumeSessionId?: string;
@@ -243,10 +243,11 @@ export async function runClaude<T>(options: ClaudeExecutionOptions): Promise<Cla
     args.push('-r', options.resumeSessionId);
   }
 
-  args.push(
-    '--output-format', 'json',
-    '--json-schema', JSON.stringify(options.jsonSchema),
-  );
+  args.push('--output-format', 'json');
+
+  if (options.jsonSchema) {
+    args.push('--json-schema', JSON.stringify(options.jsonSchema));
+  }
 
   if (options.appendSystemPrompt) {
     args.push('--append-system-prompt', options.appendSystemPrompt);
@@ -383,34 +384,36 @@ export async function runClaude<T>(options: ClaudeExecutionOptions): Promise<Cla
       }
 
       // Validate parsed output against jsonSchema before resolving
-      const schemaErrors = validateAgainstSchema(
-        parsedOutput,
-        options.jsonSchema as Record<string, unknown>,
-      );
-      if (schemaErrors.length > 0) {
-        if (options.schemaFallbackMode === 'result_or_empty') {
-          resolve({
-            output: ((hasResult ? rawResult : '') ?? '') as T,
-            rawStdout: stdout,
-            usedSchemaFallback: true,
-            schemaValidationErrors: schemaErrors,
-            sessionId,
-            exitCode,
+      if (options.jsonSchema) {
+        const schemaErrors = validateAgainstSchema(
+          parsedOutput,
+          options.jsonSchema as Record<string, unknown>,
+        );
+        if (schemaErrors.length > 0) {
+          if (options.schemaFallbackMode === 'result_or_empty') {
+            resolve({
+              output: ((hasResult ? rawResult : '') ?? '') as T,
+              rawStdout: stdout,
+              usedSchemaFallback: true,
+              schemaValidationErrors: schemaErrors,
+              sessionId,
+              exitCode,
+              stderr,
+              durationMs,
+            });
+            return;
+          }
+
+          reject(new ClaudeSchemaValidationError(
+            `Claude output does not match expected schema: ${schemaErrors.join('; ')}`,
+            stdout,
+            schemaErrors,
             stderr,
+            exitCode,
             durationMs,
-          });
+          ));
           return;
         }
-
-        reject(new ClaudeSchemaValidationError(
-          `Claude output does not match expected schema: ${schemaErrors.join('; ')}`,
-          stdout,
-          schemaErrors,
-          stderr,
-          exitCode,
-          durationMs,
-        ));
-        return;
       }
 
       resolve({

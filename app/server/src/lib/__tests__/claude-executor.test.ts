@@ -369,6 +369,49 @@ describe('runClaude JSON parsing', () => {
     await expect(promise).rejects.toThrow('not in enum');
   });
 
+  it('should not include --json-schema arg when jsonSchema is undefined', async () => {
+    const proc = createMockProc();
+    mockSpawn.mockReturnValue(proc);
+
+    const promise = runClaude<string>(baseOptions({ jsonSchema: undefined }));
+
+    const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+    expect(spawnArgs).toContain('--output-format');
+    expect(spawnArgs).toContain('json');
+    expect(spawnArgs).not.toContain('--json-schema');
+
+    const output = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: 'plain text response',
+    });
+    proc.stdout!.emit('data', Buffer.from(output));
+    proc.emit('close', 0);
+
+    const result = await promise;
+    expect(result.output).toBe('plain text response');
+  });
+
+  it('should skip schema validation when jsonSchema is undefined', async () => {
+    const proc = createMockProc();
+    mockSpawn.mockReturnValue(proc);
+
+    // Without jsonSchema, even a non-object result should pass without validation error
+    const promise = runClaude<string>(baseOptions({ jsonSchema: undefined }));
+
+    const output = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: 'plain text that would fail object schema',
+    });
+    proc.stdout!.emit('data', Buffer.from(output));
+    proc.emit('close', 0);
+
+    const result = await promise;
+    expect(result.output).toBe('plain text that would fail object schema');
+    expect(result.usedSchemaFallback).toBeUndefined();
+  });
+
   it('should throw when nested array item is missing required fields', async () => {
     const proc = createMockProc();
     mockSpawn.mockReturnValue(proc);
