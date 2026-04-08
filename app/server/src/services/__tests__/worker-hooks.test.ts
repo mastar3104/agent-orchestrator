@@ -1744,4 +1744,60 @@ describe('Worker hooks', () => {
     );
     expect(feedbackCycleDirs.length).toBeGreaterThan(0);
   });
+
+  it('should reset worktree after reviewer completes before running review-fix engineer', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    setupSpawnMock([
+      { exitCode: 0, stdout: 'tests pass' }, // Post-engineer hook
+      { exitCode: 0, stdout: 'tests pass' }, // Post-feedback hook
+    ]);
+
+    // Cycle 1: request_changes, Cycle 2: approve (no file)
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any) // initial engineer
+      .mockResolvedValueOnce({ result: { output: {} } } as any) // reviewer cycle 1
+      .mockResolvedValueOnce(successResult() as any) // feedback engineer
+      .mockResolvedValueOnce({ result: { output: {} } } as any); // reviewer cycle 2 (approve)
+
+    await startWorkers(ITEM_ID);
+
+    // Extract all git spawn calls in order
+    const gitCalls = mockSpawn.mock.calls
+      .filter((call) => call[0] === 'git')
+      .map((call) => call[1] as string[]);
+
+    // Find the indices of the reset --hard HEAD and clean -fd calls
+    const resetIndex = gitCalls.findIndex(
+      (args) => args[0] === 'reset' && args[1] === '--hard' && args[2] === 'HEAD'
+    );
+    const cleanIndex = gitCalls.findIndex(
+      (args) => args[0] === 'clean' && args[1] === '-fd'
+    );
+
+    expect(resetIndex).toBeGreaterThan(-1);
+    expect(cleanIndex).toBeGreaterThan(-1);
+
+    // Verify the reset happens: there should be a rev-parse (getGitHead) after the reset
+    const postResetRevParse = gitCalls.findIndex(
+      (args, i) => i > resetIndex && args[0] === 'rev-parse'
+    );
+    expect(postResetRevParse).toBeGreaterThan(resetIndex);
+
+    // Verify the feedback engineer uses currentHeadAfterReset for the diff
+    const reviewFixCall = mockExecuteAgent.mock.calls.find(
+      (call) => call[0].currentTask === 'T1: review-fix'
+    );
+    expect(reviewFixCall).toBeDefined();
+    // The diff call after reset should use the head returned after reset
+    const diffCallsAfterReset = gitCalls.filter(
+      (args, i) => i > resetIndex && args[0] === 'diff'
+    );
+    expect(diffCallsAfterReset.length).toBeGreaterThan(0);
+  });
 });

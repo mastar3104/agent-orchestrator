@@ -343,6 +343,34 @@ export function isCompatibleReviewerRole(role: ReturnType<typeof getRole>): bool
   return !role.allowedTools.includes('Edit');
 }
 
+type ReviewResultFileOutcome =
+  | { kind: 'no_file' }
+  | { kind: 'parsed'; response: ReviewerResponse }
+  | { kind: 'unparseable'; rawContent: string };
+
+async function readReviewResultFile(filePath: string): Promise<ReviewResultFileOutcome> {
+  let fileContent: string;
+  try {
+    fileContent = await readFile(filePath, 'utf-8');
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { kind: 'no_file' };
+    }
+    throw err; // Unexpected I/O error — do not auto-approve
+  }
+
+  try {
+    const parsed = JSON.parse(fileContent);
+    if (isReviewerResponse(parsed)) {
+      return { kind: 'parsed', response: parsed };
+    }
+  } catch {
+    // JSON parse failed
+  }
+
+  return { kind: 'unparseable', rawContent: fileContent };
+}
+
 function supportsMultiPerspectiveReviews(): boolean {
   try {
     return REVIEW_PERSPECTIVE_CONFIGS.every((config) => {
@@ -442,14 +470,9 @@ async function runReviewPerspective(
   }
 
   // File-based review result detection
-  let fileContent: string | null = null;
-  try {
-    fileContent = await readFile(reviewResultFilePath, 'utf-8');
-  } catch {
-    // File doesn't exist → approve
-  }
+  const fileOutcome = await readReviewResultFile(reviewResultFilePath);
 
-  if (!fileContent) {
+  if (fileOutcome.kind === 'no_file') {
     return {
       perspective,
       status: 'approve',
@@ -460,22 +483,11 @@ async function runReviewPerspective(
     };
   }
 
-  // File exists → request_changes
-  let parsedResponse: ReviewerResponse | null = null;
-  try {
-    const parsed = JSON.parse(fileContent);
-    if (isReviewerResponse(parsed)) {
-      parsedResponse = parsed;
-    }
-  } catch {
-    // JSON parse failed — still request_changes with synthetic finding
-  }
-
-  if (parsedResponse) {
+  if (fileOutcome.kind === 'parsed') {
     const findings = mapReviewCommentsToFindings(
       repo.name,
       perspective,
-      parsedResponse.comments ?? []
+      fileOutcome.response.comments ?? []
     );
     if (findings.length === 0) {
       findings.push(
@@ -512,7 +524,7 @@ async function runReviewPerspective(
     findings,
     summary: buildPerspectiveSummary(perspective, 'request_changes', findings),
     agentId: lastAgentId,
-    hasStructuredSignal: true,
+    hasStructuredSignal: false,
     reviewResultFilePath,
   };
 }
@@ -582,14 +594,9 @@ async function runLegacyReviewCycle(
   }
 
   // File-based review result detection
-  let fileContent: string | null = null;
-  try {
-    fileContent = await readFile(reviewResultFilePath, 'utf-8');
-  } catch {
-    // File doesn't exist → approve
-  }
+  const fileOutcome = await readReviewResultFile(reviewResultFilePath);
 
-  if (!fileContent) {
+  if (fileOutcome.kind === 'no_file') {
     return {
       findings: [],
       overallAssessment: 'pass',
@@ -599,19 +606,8 @@ async function runLegacyReviewCycle(
     };
   }
 
-  // File exists → request_changes
-  let parsedResponse: ReviewerResponse | null = null;
-  try {
-    const parsed = JSON.parse(fileContent);
-    if (isReviewerResponse(parsed)) {
-      parsedResponse = parsed;
-    }
-  } catch {
-    // JSON parse failed
-  }
-
-  if (parsedResponse) {
-    const findings = parsedResponse.comments.map((comment) => ({
+  if (fileOutcome.kind === 'parsed') {
+    const findings = fileOutcome.response.comments.map((comment) => ({
       severity: (comment.severity || 'minor') as ReviewFinding['severity'],
       file: comment.file,
       line: comment.line,
@@ -623,8 +619,8 @@ async function runLegacyReviewCycle(
     return {
       findings,
       overallAssessment: 'needs_fixes',
-      summary: `${parsedResponse.comments.length} issues found for ${task.id}`,
-      feedbackFiles: parsedResponse.comments.map((comment) => comment.file).filter(Boolean),
+      summary: `${fileOutcome.response.comments.length} issues found for ${task.id}`,
+      feedbackFiles: fileOutcome.response.comments.map((comment) => comment.file).filter(Boolean),
       reviewResultFilePaths: [reviewResultFilePath],
     };
   }

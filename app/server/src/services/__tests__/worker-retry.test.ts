@@ -1588,6 +1588,36 @@ describe('Worker task-state execution', () => {
     });
   });
 
+  it('treats valid JSON that is not a valid ReviewerResponse as request_changes with synthetic finding', async () => {
+    // Valid JSON but missing required fields (review_status, comments array)
+    const basePath = '/items/ITEM-test/reviews/repo-a/T1';
+    reviewFileStore.set(`${basePath}/review-round-1/result.json`, JSON.stringify({ status: 'done' }));
+    // Cycle 2: no file → approve
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer' && params.currentTask === 'T1: Task 1') {
+        return engineerSuccess();
+      }
+      if (params.role === 'review') {
+        return reviewAgentResult();
+      }
+      if (params.role === 'engineer' && params.currentTask === 'T1: review-fix') {
+        return engineerSuccess();
+      }
+      throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    const reviewFixCalls = mockExecuteAgent.mock.calls.filter((call) => call[0].currentTask === 'T1: review-fix');
+    expect(reviewFixCalls).toHaveLength(1);
+    // The feedback prompt should reference the review result file
+    expect(reviewFixCalls[0][0].prompt).toContain('result.json');
+    expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+    });
+  });
+
   it('includes plan and changed files sections in reviewer prompts', async () => {
     let reviewerPrompt = '';
     let reviewerAddDirs: string[] | undefined;
