@@ -106,7 +106,7 @@ describe('RepositoriesPage', () => {
     await user.clear(allowedToolsInput);
     await user.type(allowedToolsInput, ',   ,');
 
-    const hooksInput = view.getByPlaceholderText('npm run lint\nnpm test');
+    const hooksInput = view.getByPlaceholderText('npm run lint\nnpm test', { collapseWhitespace: false });
     await user.clear(hooksInput);
     await user.type(hooksInput, '  \n   ');
 
