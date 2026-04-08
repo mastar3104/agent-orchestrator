@@ -1726,15 +1726,14 @@ describe('Worker hooks', () => {
       { exitCode: 0, stdout: 'tests pass' }, // Post-feedback hook
     ]);
 
+    // Cycle 1: request_changes via file, Cycle 2: no file → approve
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+
     mockExecuteAgent
       .mockResolvedValueOnce(successResult() as any) // initial engineer
-      .mockResolvedValueOnce({                       // reviewer: request_changes
-        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
-      } as any)
+      .mockResolvedValueOnce({ result: { output: {} } } as any) // reviewer cycle 1 (file-based)
       .mockResolvedValueOnce(successResult() as any) // feedback engineer
-      .mockResolvedValueOnce({                       // reviewer: approve
-        result: { output: { review_status: 'approve', comments: [] } },
-      } as any);
+      .mockResolvedValueOnce({ result: { output: {} } } as any); // reviewer cycle 2 (file-based)
 
     await startWorkers(ITEM_ID);
 
