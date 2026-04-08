@@ -452,7 +452,7 @@ describe('Worker hooks', () => {
       allowedTools: ['Read', 'Write', 'Edit', 'Bash(git add:*)', 'Bash(git commit -m:*)', 'Bash(git status:*)'],
       jsonSchema: {},
     }));
-    mockCreateDraftPrsForAllRepos.mockResolvedValue(undefined);
+    mockCreateDraftPrsForAllRepos.mockResolvedValue({ results: [] });
     mockMaybeStartCompletedReviewAfterTasks.mockResolvedValue(undefined);
   });
 
