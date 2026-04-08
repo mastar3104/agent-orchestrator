@@ -40,49 +40,22 @@ describe('worker-service helpers', () => {
     ]);
   });
 
-  it('builds perspective-grouped feedback sections in the configured order', () => {
+  it('lists review result file paths in the feedback prompt', () => {
     const prompt = buildFeedbackPrompt(
       {} as any,
       { name: 'repo-a' } as any,
       [
-        makeFinding({
-          perspective: 'architecture',
-          file: 'arch.ts',
-          description: 'Split orchestration concerns.',
-          severity: 'minor',
-        }),
-        makeFinding({
-          perspective: 'testing',
-          file: 'worker.test.ts',
-          description: 'Add a regression test.',
-          severity: 'major',
-        }),
-        makeFinding({
-          perspective: 'security',
-          file: 'auth.ts',
-          description: 'Enforce authorization.',
-          severity: 'critical',
-        }),
-        makeFinding({
-          perspective: 'requirements',
-          file: 'requirements.ts',
-          description: 'Preserve acceptance criteria.',
-          severity: 'major',
-        }),
+        '/reviews/repo-a/T1/review-round-1/result-security.json',
+        '/reviews/repo-a/T1/review-round-1/result-architecture.json',
       ],
       'diff --git a/file.ts b/file.ts',
       [{ id: 'T1', title: 'Task', description: '', repository: 'repo-a', files: [], dependencies: [] }]
     );
 
-    const securityIndex = prompt.indexOf('### Security');
-    const requirementsIndex = prompt.indexOf('### Requirements');
-    const architectureIndex = prompt.indexOf('### Architecture');
-    const testingIndex = prompt.indexOf('### Testing');
-
-    expect(securityIndex).toBeGreaterThan(-1);
-    expect(requirementsIndex).toBeGreaterThan(securityIndex);
-    expect(architectureIndex).toBeGreaterThan(requirementsIndex);
-    expect(testingIndex).toBeGreaterThan(architectureIndex);
+    expect(prompt).toContain('/reviews/repo-a/T1/review-round-1/result-security.json');
+    expect(prompt).toContain('/reviews/repo-a/T1/review-round-1/result-architecture.json');
+    expect(prompt).toContain('Review result files');
+    expect(prompt).toContain('Read the review result files');
   });
 
   it('treats a reviewer role with Write but not Edit as compatible', () => {
@@ -102,21 +75,18 @@ describe('worker-service helpers', () => {
     expect(isCompatibleReviewerRole(fakeRole as any)).toBe(true);
   });
 
-  it('keeps legacy feedback flat when findings do not include perspectives', () => {
+  it('shows fallback message when no review result file paths are provided', () => {
     const prompt = buildFeedbackPrompt(
       {} as any,
       { name: 'repo-a' } as any,
-      [
-        makeFinding({ file: 'b.ts', line: 3, description: 'Second issue', severity: 'minor' }),
-        makeFinding({ file: 'a.ts', line: 1, description: 'First issue', severity: 'critical' }),
-      ],
+      [],
       'diff --git a/file.ts b/file.ts',
       [{ id: 'T1', title: 'Task', description: '', repository: 'repo-a', files: [], dependencies: [] }]
     );
 
-    expect(prompt).not.toContain('### Security');
-    expect(prompt).toContain('- [CRITICAL] a.ts:1: First issue');
-    expect(prompt).toContain('- [MINOR] b.ts:3: Second issue');
+    expect(prompt).toContain('No review result files available');
+    expect(prompt).toContain('git add -A -- <paths>');
+    expect(prompt).toContain('Return {"status": "success"}');
   });
 });
 

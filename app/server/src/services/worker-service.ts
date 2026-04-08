@@ -1,6 +1,6 @@
 import { spawn } from 'child_process';
 import { resolve, join } from 'path';
-import { mkdir, writeFile } from 'fs/promises';
+import { mkdir, readFile, writeFile } from 'fs/promises';
 import type {
   Plan,
   PlanTask,
@@ -67,7 +67,6 @@ const ENGINEER_TIMEOUT_MS = 50 * 60 * 1000; // 50 minutes
 const AGENT_MAX_RETRIES = 2;
 const HOOK_TIMEOUT_MS = COMMAND_TIMEOUT_MS;
 const ENGINEER_SCHEMA_FALLBACK_MODE = 'result_or_empty' as const;
-const REVIEWER_SCHEMA_FALLBACK_MODE = 'result_or_empty' as const;
 const MAX_REVIEW_ARTIFACT_DIFF_LINES = 5000;
 const MAX_REVIEW_ARTIFACT_DIFF_CHARS = 200000;
 const REVIEW_PERSPECTIVE_RUN_ORDER: ReviewPerspective[] = [
@@ -105,6 +104,7 @@ interface ReviewPerspectiveExecutionResult {
   agentId: string;
   hasStructuredSignal: boolean;
   detail?: string;
+  reviewResultFilePath?: string;
 }
 
 interface ReviewContextBuildResult {
@@ -118,8 +118,8 @@ interface ReviewCycleResult {
   summary: string;
   perspectives?: ReviewPerspectiveSummary[];
   feedbackFiles: string[];
+  reviewResultFilePaths: string[];
   hardFailureMessage?: string;
-  skipFeedbackFix?: boolean;
 }
 
 const REVIEW_PERSPECTIVE_CONFIGS: ReviewPerspectiveConfig[] = [
@@ -380,11 +380,10 @@ async function runReviewPerspective(
     'reviewer'
   );
 
-  let reviewResponse: ReviewerResponse | null = null;
-  let reviewUsedSchemaFallback = false;
-  let reviewSchemaValidationErrors: string[] | undefined;
+  const reviewResultFilePath = getReviewResultFilePath(itemId, repo.name, task.id, reviewCycle, perspective);
   let reviewError = 'Reviewer failed';
   let lastAgentId = '';
+  let agentSucceeded = false;
 
   for (let attempt = 0; attempt <= AGENT_MAX_RETRIES; attempt++) {
     lastAgentId = buildSyntheticReviewAgentId(
@@ -395,7 +394,7 @@ async function runReviewPerspective(
       attempt + 1
     );
     try {
-      const { agent, result } = await executeAgent<unknown>({
+      const { agent } = await executeAgent<unknown>({
         itemId,
         agentId: lastAgentId,
         role: 'review',
@@ -406,22 +405,11 @@ async function runReviewPerspective(
         addDirs: reviewContext.artifactDir ? [reviewContext.artifactDir] : undefined,
         workingDir: agentWorkdir,
         allowedTools: role.allowedTools,
-        jsonSchema: role.jsonSchema,
-        schemaFallbackMode: REVIEWER_SCHEMA_FALLBACK_MODE,
         emitErrorEvent: false,
         timeoutMs: REVIEW_TIMEOUT_MS,
       });
       lastAgentId = agent.id;
-      reviewUsedSchemaFallback = !!result.usedSchemaFallback;
-      reviewSchemaValidationErrors = result.schemaValidationErrors;
-      if (result.usedSchemaFallback) {
-        console.warn(
-          `[${itemId}/${repo.name}] ${perspective} reviewer output failed schema validation; continuing if structured review is unavailable.`
-        );
-      }
-      if (isReviewerResponse(result.output)) {
-        reviewResponse = result.output;
-      }
+      agentSucceeded = true;
       break;
     } catch (error) {
       reviewError = error instanceof Error ? error.message : String(error);
@@ -434,13 +422,62 @@ async function runReviewPerspective(
     }
   }
 
-  if (reviewResponse) {
+  if (!agentSucceeded) {
+    const findings = [
+      createSyntheticReviewFinding(
+        perspective,
+        `The ${config.label.toLowerCase()} reviewer failed to complete, so manual confirmation is required before considering this review complete.`,
+        `Re-run the ${config.label.toLowerCase()} review and verify the code manually. Last error: ${reviewError}`
+      ),
+    ];
+    return {
+      perspective,
+      status: 'error',
+      findings,
+      summary: buildPerspectiveSummary(perspective, 'error', findings, reviewError),
+      agentId: lastAgentId,
+      hasStructuredSignal: false,
+      detail: reviewError,
+    };
+  }
+
+  // File-based review result detection
+  let fileContent: string | null = null;
+  try {
+    fileContent = await readFile(reviewResultFilePath, 'utf-8');
+  } catch {
+    // File doesn't exist → approve
+  }
+
+  if (!fileContent) {
+    return {
+      perspective,
+      status: 'approve',
+      findings: [],
+      summary: buildPerspectiveSummary(perspective, 'approve', []),
+      agentId: lastAgentId,
+      hasStructuredSignal: true,
+    };
+  }
+
+  // File exists → request_changes
+  let parsedResponse: ReviewerResponse | null = null;
+  try {
+    const parsed = JSON.parse(fileContent);
+    if (isReviewerResponse(parsed)) {
+      parsedResponse = parsed;
+    }
+  } catch {
+    // JSON parse failed — still request_changes with synthetic finding
+  }
+
+  if (parsedResponse) {
     const findings = mapReviewCommentsToFindings(
       repo.name,
       perspective,
-      reviewResponse.comments ?? []
+      parsedResponse.comments ?? []
     );
-    if (reviewResponse.review_status === 'request_changes' && findings.length === 0) {
+    if (findings.length === 0) {
       findings.push(
         createSyntheticReviewFinding(
           perspective,
@@ -452,53 +489,31 @@ async function runReviewPerspective(
 
     return {
       perspective,
-      status: reviewResponse.review_status,
+      status: 'request_changes',
       findings,
-      summary: buildPerspectiveSummary(
-        perspective,
-        reviewResponse.review_status,
-        findings
-      ),
+      summary: buildPerspectiveSummary(perspective, 'request_changes', findings),
       agentId: lastAgentId,
       hasStructuredSignal: true,
+      reviewResultFilePath,
     };
   }
 
-  if (reviewUsedSchemaFallback) {
-    const detail = (reviewSchemaValidationErrors || []).join('; ') || 'Unknown schema mismatch.';
-    const findings = [
-      createSyntheticReviewFinding(
-        perspective,
-        `The ${config.label.toLowerCase()} reviewer did not return structured output, so manual confirmation is required before considering this review complete.`,
-        `Re-run the ${config.label.toLowerCase()} review and verify the code manually. Schema errors: ${detail}`
-      ),
-    ];
-    return {
-      perspective,
-      status: 'schema_fallback',
-      findings,
-      summary: buildPerspectiveSummary(perspective, 'schema_fallback', findings, detail),
-      agentId: lastAgentId,
-      hasStructuredSignal: false,
-      detail,
-    };
-  }
-
+  // File exists but not parseable as ReviewerResponse
   const findings = [
     createSyntheticReviewFinding(
       perspective,
-      `The ${config.label.toLowerCase()} reviewer failed to complete, so manual confirmation is required before considering this review complete.`,
-      `Re-run the ${config.label.toLowerCase()} review and verify the code manually. Last error: ${reviewError}`
+      `The ${config.label.toLowerCase()} reviewer wrote a result file but it could not be parsed as structured output. Manual confirmation is required.`,
+      `Re-run the ${config.label.toLowerCase()} review or manually inspect the review result file at: ${reviewResultFilePath}`
     ),
   ];
   return {
     perspective,
-    status: 'error',
+    status: 'request_changes',
     findings,
-    summary: buildPerspectiveSummary(perspective, 'error', findings, reviewError),
+    summary: buildPerspectiveSummary(perspective, 'request_changes', findings),
     agentId: lastAgentId,
-    hasStructuredSignal: false,
-    detail: reviewError,
+    hasStructuredSignal: true,
+    reviewResultFilePath,
   };
 }
 
@@ -523,13 +538,14 @@ async function runLegacyReviewCycle(
     repo.rolePrompts,
     'reviewer'
   );
-  let reviewResponse: ReviewerResponse | null = null;
-  let reviewUsedSchemaFallback = false;
-  let reviewSchemaValidationErrors: string[] | undefined;
+
+  const reviewResultFilePath = getReviewResultFilePath(itemId, repo.name, task.id, reviewCycle);
   let reviewError = 'Reviewer failed';
+  let agentSucceeded = false;
+
   for (let attempt = 0; attempt <= AGENT_MAX_RETRIES; attempt++) {
     try {
-      const { result: reviewResult } = await executeAgent<unknown>({
+      await executeAgent<unknown>({
         itemId,
         role: 'review',
         repoName: repo.name,
@@ -539,20 +555,9 @@ async function runLegacyReviewCycle(
         addDirs: reviewContext.artifactDir ? [reviewContext.artifactDir] : undefined,
         workingDir: agentWorkdir,
         allowedTools: reviewerRole.allowedTools,
-        jsonSchema: reviewerRole.jsonSchema,
-        schemaFallbackMode: REVIEWER_SCHEMA_FALLBACK_MODE,
         timeoutMs: REVIEW_TIMEOUT_MS,
       });
-      reviewUsedSchemaFallback = !!reviewResult.usedSchemaFallback;
-      reviewSchemaValidationErrors = reviewResult.schemaValidationErrors;
-      if (reviewResult.usedSchemaFallback) {
-        console.warn(
-          `[${itemId}/${repo.name}] Reviewer output failed schema validation; advancing review loop if structured review is unavailable.`
-        );
-      }
-      if (isReviewerResponse(reviewResult.output)) {
-        reviewResponse = reviewResult.output;
-      }
+      agentSucceeded = true;
       break;
     } catch (error) {
       reviewError = error instanceof Error ? error.message : String(error);
@@ -565,43 +570,72 @@ async function runLegacyReviewCycle(
     }
   }
 
-  if (!reviewResponse && !reviewUsedSchemaFallback) {
+  if (!agentSucceeded) {
     return {
       findings: [],
       overallAssessment: 'needs_fixes',
       summary: '',
       feedbackFiles: [],
+      reviewResultFilePaths: [],
       hardFailureMessage: `Review failed for ${repo.name} during task ${task.id}: ${reviewError}`,
     };
   }
 
-  if (!reviewResponse) {
-    const fallbackErrors = (reviewSchemaValidationErrors || []).join('; ') || 'unknown schema mismatch';
+  // File-based review result detection
+  let fileContent: string | null = null;
+  try {
+    fileContent = await readFile(reviewResultFilePath, 'utf-8');
+  } catch {
+    // File doesn't exist → approve
+  }
+
+  if (!fileContent) {
     return {
       findings: [],
-      overallAssessment: 'needs_fixes',
-      summary: `Reviewer output did not match schema; advancing without structured findings. ${fallbackErrors}`,
+      overallAssessment: 'pass',
+      summary: `Code review passed for ${task.id}`,
       feedbackFiles: [],
-      skipFeedbackFix: true,
+      reviewResultFilePaths: [],
     };
   }
 
-  const findings = reviewResponse.comments.map((comment) => ({
-    severity: (comment.severity || 'minor') as ReviewFinding['severity'],
-    file: comment.file,
-    line: comment.line,
-    description: comment.comment,
-    suggestedFix: comment.suggestedFix || '',
-    targetAgent: repo.name,
-  }));
+  // File exists → request_changes
+  let parsedResponse: ReviewerResponse | null = null;
+  try {
+    const parsed = JSON.parse(fileContent);
+    if (isReviewerResponse(parsed)) {
+      parsedResponse = parsed;
+    }
+  } catch {
+    // JSON parse failed
+  }
 
+  if (parsedResponse) {
+    const findings = parsedResponse.comments.map((comment) => ({
+      severity: (comment.severity || 'minor') as ReviewFinding['severity'],
+      file: comment.file,
+      line: comment.line,
+      description: comment.comment,
+      suggestedFix: comment.suggestedFix || '',
+      targetAgent: repo.name,
+    }));
+
+    return {
+      findings,
+      overallAssessment: 'needs_fixes',
+      summary: `${parsedResponse.comments.length} issues found for ${task.id}`,
+      feedbackFiles: parsedResponse.comments.map((comment) => comment.file).filter(Boolean),
+      reviewResultFilePaths: [reviewResultFilePath],
+    };
+  }
+
+  // File exists but not parseable
   return {
-    findings,
-    overallAssessment: reviewResponse.review_status === 'approve' ? 'pass' : 'needs_fixes',
-    summary: reviewResponse.review_status === 'approve'
-      ? `Code review passed for ${task.id}`
-      : `${reviewResponse.comments.length} issues found for ${task.id}`,
-    feedbackFiles: reviewResponse.comments.map((comment) => comment.file).filter(Boolean),
+    findings: [],
+    overallAssessment: 'needs_fixes',
+    summary: `Review result file exists but could not be parsed for ${task.id}`,
+    feedbackFiles: [],
+    reviewResultFilePaths: [reviewResultFilePath],
   };
 }
 
@@ -1624,6 +1658,7 @@ async function runTaskReviewPhase(
               overallAssessment: 'needs_fixes',
               summary: '',
               feedbackFiles: [],
+              reviewResultFilePaths: [],
               hardFailureMessage: `All review perspectives failed for ${repo.name} during task ${task.id}: ${detail}`,
             };
           }
@@ -1631,6 +1666,9 @@ async function runTaskReviewPhase(
           const findings = sortReviewFindings(
             reviewResults.flatMap((result) => result.findings)
           );
+          const reviewResultFilePaths = reviewResults
+            .map((result) => result.reviewResultFilePath)
+            .filter((filePath): filePath is string => filePath !== undefined);
           return {
             findings,
             overallAssessment: reviewResults.every((result) => result.status === 'approve')
@@ -1641,6 +1679,7 @@ async function runTaskReviewPhase(
             feedbackFiles: findings
               .map((finding) => finding.file)
               .filter(shouldIncludeFindingFileInDiff),
+            reviewResultFilePaths,
           };
         })()
       : await runLegacyReviewCycle(itemId, repo, task, agentWorkdir, reviewContext, reviewCycle);
@@ -1676,23 +1715,14 @@ async function runTaskReviewPhase(
       return { state: currentState };
     }
 
-    if (reviewCycleResult.skipFeedbackFix) {
-      const fallbackRound = (taskStateAfterHooks.reviewRounds || 0) + 1;
-      currentState = await incrementTaskReviewRounds(itemId, repo.name, task.id);
-      if (fallbackRound >= MAX_FEEDBACK_ROUNDS) {
-        return completeTaskAfterReviewExhaustion(
-          itemId,
-          repo,
-          task,
-          agentWorkdir,
-          fallbackRound
-        );
-      }
-      continue;
-    }
-
     const completedFeedbackRounds = taskStateAfterHooks.reviewRounds || 0;
     const isFinalFeedbackRound = completedFeedbackRounds + 1 >= MAX_FEEDBACK_ROUNDS;
+
+    // Safety: reset worktree to discard any changes reviewers may have made via Write tool.
+    // Review result files are stored outside the git repository ({itemDir}/reviews/) and
+    // are not affected by this reset.
+    await resetRepoForAttempt(agentWorkdir);
+    const currentHeadAfterReset = await getGitHead(agentWorkdir);
 
     let feedbackDiff: string;
     try {
@@ -1700,14 +1730,14 @@ async function runTaskReviewPhase(
       feedbackDiff = await getGitDiff(
         agentWorkdir,
         phaseBase,
-        currentHead,
+        currentHeadAfterReset,
         commentFiles.length > 0 ? commentFiles : undefined
       );
     } catch {
       feedbackDiff = '<unable to generate diff>';
     }
 
-    const feedbackPrompt = buildFeedbackPrompt(plan, repo, findings, feedbackDiff, [task]);
+    const feedbackPrompt = buildFeedbackPrompt(plan, repo, reviewCycleResult.reviewResultFilePaths, feedbackDiff, [task]);
 
     let feedbackError = 'Feedback engineer failed';
     let feedbackSucceeded = false;
@@ -2341,7 +2371,7 @@ ${taskDescriptions}`,
 export function buildFeedbackPrompt(
   _plan: Plan,
   repo: ItemRepositoryConfig,
-  findings: ReviewFinding[],
+  reviewResultFilePaths: string[],
   diff: string,
   originalTasks: PlanTask[]
 ): string {
@@ -2349,39 +2379,9 @@ export function buildFeedbackPrompt(
     .map(t => `- ${t.id}: ${t.title}`)
     .join('\n');
 
-  const groupedFindings = new Map<ReviewPerspective, ReviewFinding[]>();
-  for (const perspective of REVIEW_PERSPECTIVE_FEEDBACK_ORDER) {
-    groupedFindings.set(perspective, []);
-  }
-  for (const finding of sortReviewFindings(findings)) {
-    if (!finding.perspective) {
-      continue;
-    }
-    groupedFindings.get(finding.perspective)?.push(finding);
-  }
-
-  const hasPerspectiveSections = findings.some((finding) => Boolean(finding.perspective));
-  const commentSections = hasPerspectiveSections
-    ? REVIEW_PERSPECTIVE_FEEDBACK_ORDER
-        .map((perspective) => {
-          const perspectiveFindings = groupedFindings.get(perspective) || [];
-          if (perspectiveFindings.length === 0) {
-            return null;
-          }
-
-          const items = perspectiveFindings.map((finding) => (
-            `- [${finding.severity.toUpperCase()}] ${finding.file}${finding.line ? `:${finding.line}` : ''}: ${finding.description}${finding.suggestedFix ? ` (Fix: ${finding.suggestedFix})` : ''}`
-          )).join('\n');
-
-          return `### ${REVIEW_PERSPECTIVE_LABELS[perspective]}\n${items}`;
-        })
-        .filter((section): section is string => section !== null)
-        .join('\n\n')
-    : sortReviewFindings(findings)
-        .map((finding) => (
-          `- [${finding.severity.toUpperCase()}] ${finding.file}${finding.line ? `:${finding.line}` : ''}: ${finding.description}${finding.suggestedFix ? ` (Fix: ${finding.suggestedFix})` : ''}`
-        ))
-        .join('\n');
+  const reviewFilesSection = reviewResultFilePaths.length > 0
+    ? reviewResultFilePaths.map(p => `- ${p}`).join('\n')
+    : '- No review result files available';
 
   const context = `## Working on: ${repo.name}
 
@@ -2389,10 +2389,10 @@ export function buildFeedbackPrompt(
 ${taskList}
 
 ## Review Feedback
-The previous implementation was reviewed and rejected.
+The previous implementation was reviewed and changes were requested.
 
-Review comments:
-${commentSections}
+Review result files (read each file to understand the issues):
+${reviewFilesSection}
 
 ## Current Changes (git diff from phase start)
 \`\`\`diff
@@ -2400,7 +2400,8 @@ ${diff}
 \`\`\`
 
 ## Instructions
-Please address all review comments, commit your intentional changes, and return status.
+Read the review result files above, then address all review findings.
+Please fix all issues, commit your intentional changes, and return status.
 Before returning, stage your intentional fixes with \`git add -A -- <paths>\`, create a commit with \`git commit -m "<message>"\`, and ensure \`git status --porcelain\` is empty.
 Return {"status": "success"} when done.
 If you encounter an error, return {"status": "failure"}.`;
