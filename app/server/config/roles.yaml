@@ -216,19 +216,22 @@ roles:
 
       ## Output Format
 
-      If changes are needed, write a JSON file to the following path:
+      Always write a JSON result file to the following path:
       {{reviewResultFilePath}}
 
-      The JSON format is:
-      {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      The JSON format depends on the outcome:
+      - If changes are needed: {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      - If the code is acceptable: {"review_status": "approve", "comments": []}
 
-      If the code is acceptable (approve), do NOT create the file. Simply return {"review_status": "approve", "comments": []}.
+      Also return the same JSON object as your structured response.
 
       Focus on critical and major issues first. Be specific about file paths and line numbers.
     allowedTools:
       - Read
       - Glob
       - Grep
+      # Write is required for review result file output.
+      # Safety note: unrestricted Write access is mitigated by task-3's worktree reset after review.
       - Write
     schemaRef: reviewer
 
@@ -252,13 +255,14 @@ roles:
 
       ## Output Format
 
-      If changes are needed, write a JSON file to the following path:
+      Always write a JSON result file to the following path:
       {{reviewResultFilePath}}
 
-      The JSON format is:
-      {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      The JSON format depends on the outcome:
+      - If changes are needed: {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      - If the code is acceptable: {"review_status": "approve", "comments": []}
 
-      If the code is acceptable (approve), do NOT create the file. Simply return {"review_status": "approve", "comments": []}.
+      Also return the same JSON object as your structured response.
 
       Focus on critical and major issues first. Be specific about file paths and line numbers.
     allowedTools:
@@ -288,13 +292,14 @@ roles:
 
       ## Output Format
 
-      If changes are needed, write a JSON file to the following path:
+      Always write a JSON result file to the following path:
       {{reviewResultFilePath}}
 
-      The JSON format is:
-      {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      The JSON format depends on the outcome:
+      - If changes are needed: {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      - If the code is acceptable: {"review_status": "approve", "comments": []}
 
-      If the code is acceptable (approve), do NOT create the file. Simply return {"review_status": "approve", "comments": []}.
+      Also return the same JSON object as your structured response.
 
       Focus on critical and major issues first. Be specific about file paths and line numbers.
     allowedTools:
@@ -324,13 +329,14 @@ roles:
 
       ## Output Format
 
-      If changes are needed, write a JSON file to the following path:
+      Always write a JSON result file to the following path:
       {{reviewResultFilePath}}
 
-      The JSON format is:
-      {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      The JSON format depends on the outcome:
+      - If changes are needed: {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      - If the code is acceptable: {"review_status": "approve", "comments": []}
 
-      If the code is acceptable (approve), do NOT create the file. Simply return {"review_status": "approve", "comments": []}.
+      Also return the same JSON object as your structured response.
 
       Focus on critical and major issues first. Be specific about file paths and line numbers.
     allowedTools:
@@ -360,13 +366,14 @@ roles:
 
       ## Output Format
 
-      If changes are needed, write a JSON file to the following path:
+      Always write a JSON result file to the following path:
       {{reviewResultFilePath}}
 
-      The JSON format is:
-      {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      The JSON format depends on the outcome:
+      - If changes are needed: {"review_status": "request_changes", "comments": [{"file": "path/to/file", "comment": "description of issue", "severity": "critical|major|minor", "line": 42, "suggestedFix": "how to fix"}]}
+      - If the code is acceptable: {"review_status": "approve", "comments": []}
 
-      If the code is acceptable (approve), do NOT create the file. Simply return {"review_status": "approve", "comments": []}.
+      Also return the same JSON object as your structured response.
 
       Focus on critical and major issues first. Be specific about file paths and line numbers.
     allowedTools:

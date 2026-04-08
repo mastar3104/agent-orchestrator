@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ReviewFinding } from '@agent-orch/shared';
-import { buildFeedbackPrompt, sortReviewFindings } from '../worker-service';
+import { buildFeedbackPrompt, sortReviewFindings, isCompatibleReviewerRole } from '../worker-service';
+import { getRole } from '../../lib/role-loader';
 
 function makeFinding(overrides: Partial<ReviewFinding> = {}): ReviewFinding {
   return {
@@ -77,6 +78,23 @@ describe('worker-service helpers', () => {
     expect(requirementsIndex).toBeGreaterThan(securityIndex);
     expect(architectureIndex).toBeGreaterThan(requirementsIndex);
     expect(testingIndex).toBeGreaterThan(architectureIndex);
+  });
+
+  it('treats a reviewer role with Write but not Edit as compatible', () => {
+    const reviewerRole = getRole('reviewer');
+    expect(reviewerRole.allowedTools).toContain('Write');
+    expect(reviewerRole.allowedTools).not.toContain('Edit');
+    expect(isCompatibleReviewerRole(reviewerRole)).toBe(true);
+  });
+
+  it('rejects a role that includes Edit', () => {
+    const fakeRole = { allowedTools: ['Read', 'Edit'], systemPrompt: '', jsonSchema: undefined };
+    expect(isCompatibleReviewerRole(fakeRole as any)).toBe(false);
+  });
+
+  it('accepts a role with only read tools', () => {
+    const fakeRole = { allowedTools: ['Read', 'Glob', 'Grep'], systemPrompt: '', jsonSchema: undefined };
+    expect(isCompatibleReviewerRole(fakeRole as any)).toBe(true);
   });
 
   it('keeps legacy feedback flat when findings do not include perspectives', () => {

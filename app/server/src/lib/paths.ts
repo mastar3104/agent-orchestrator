@@ -1,5 +1,6 @@
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import type { ReviewPerspective } from '@agent-orch/shared';
 
 const DATA_DIR = process.env.DATA_DIR || join(process.cwd(), 'data');
 const SERVER_ROOT_DIR = join(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -89,7 +90,7 @@ export function getReviewResultFilePath(
   repoName: string,
   taskId: string,
   reviewRound: number,
-  perspective?: string
+  perspective?: ReviewPerspective
 ): string {
   const fileName = perspective ? `result-${perspective}.json` : 'result.json';
   return join(getTaskReviewArtifactsDir(itemId, repoName, taskId, reviewRound), fileName);

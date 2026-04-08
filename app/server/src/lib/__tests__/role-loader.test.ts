@@ -116,6 +116,15 @@ describe('role-loader', () => {
         'Grep',
         'Write',
       ]);
+      // Verify all specialized reviewer roles also include Write
+      for (const specializedReviewer of [
+        'architectureReviewer',
+        'securityReviewer',
+        'testingReviewer',
+        'requirementsReviewer',
+      ]) {
+        expect(getRole(specializedReviewer).allowedTools).toContain('Write');
+      }
       expect(getRole('completedReviewer').allowedTools).toEqual([
         'Read',
         'Glob',

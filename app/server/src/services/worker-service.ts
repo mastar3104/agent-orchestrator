@@ -27,6 +27,7 @@ import {
   getHookLogDir,
   getTaskReviewArtifactsDir,
   getTaskReviewArtifactIndexPath,
+  getReviewResultFilePath,
 } from '../lib/paths';
 import { stringifyYaml } from '../lib/yaml';
 import { eventBus } from './event-bus';
@@ -316,11 +317,23 @@ function resolveReviewPerspectiveRole(
   }
 }
 
+function resolveReviewerSystemPrompt(
+  systemPrompt: string,
+  itemId: string,
+  repoName: string,
+  taskId: string,
+  reviewRound: number,
+  perspective?: ReviewPerspective
+): string {
+  const filePath = getReviewResultFilePath(itemId, repoName, taskId, reviewRound, perspective);
+  return systemPrompt.replace('{{reviewResultFilePath}}', filePath);
+}
+
 // Best-effort guard only: this avoids obviously write-capable reviewer roles,
 // but it is not a security boundary because tool patterns may still permit writes.
 // Note: Write is allowed for reviewers (review result file output), but Edit is
 // still blocked because it would allow direct code modification.
-function isCompatibleReviewerRole(role: ReturnType<typeof getRole>): boolean {
+export function isCompatibleReviewerRole(role: ReturnType<typeof getRole>): boolean {
   return !role.allowedTools.includes('Edit');
 }
 
@@ -346,6 +359,14 @@ async function runReviewPerspective(
 ): Promise<ReviewPerspectiveExecutionResult> {
   const config = getReviewPerspectiveConfig(perspective);
   const role = resolveReviewPerspectiveRole(config.roleName);
+  const resolvedSystemPrompt = resolveReviewerSystemPrompt(
+    role.systemPrompt,
+    itemId,
+    repo.name,
+    task.id,
+    reviewCycle,
+    perspective
+  );
   const prompt = composeRepositoryRolePrompt(
     reviewContext.prompt,
     repo.rolePrompts,
@@ -375,7 +396,7 @@ async function runReviewPerspective(
         repoName: repo.name,
         currentTask: `${task.id}: review:${perspective}`,
         prompt,
-        appendSystemPrompt: role.systemPrompt,
+        appendSystemPrompt: resolvedSystemPrompt,
         addDirs: reviewContext.artifactDir ? [reviewContext.artifactDir] : undefined,
         workingDir: agentWorkdir,
         allowedTools: role.allowedTools,
@@ -480,9 +501,17 @@ async function runLegacyReviewCycle(
   repo: ItemRepositoryConfig,
   task: PlanTask,
   agentWorkdir: string,
-  reviewContext: ReviewContextBuildResult
+  reviewContext: ReviewContextBuildResult,
+  reviewCycle: number
 ): Promise<ReviewCycleResult> {
   const reviewerRole = getRole('reviewer');
+  const resolvedSystemPrompt = resolveReviewerSystemPrompt(
+    reviewerRole.systemPrompt,
+    itemId,
+    repo.name,
+    task.id,
+    reviewCycle
+  );
   const reviewerPrompt = composeRepositoryRolePrompt(
     reviewContext.prompt,
     repo.rolePrompts,
@@ -500,7 +529,7 @@ async function runLegacyReviewCycle(
         repoName: repo.name,
         currentTask: `${task.id}: review`,
         prompt: reviewerPrompt,
-        appendSystemPrompt: reviewerRole.systemPrompt,
+        appendSystemPrompt: resolvedSystemPrompt,
         addDirs: reviewContext.artifactDir ? [reviewContext.artifactDir] : undefined,
         workingDir: agentWorkdir,
         allowedTools: reviewerRole.allowedTools,
@@ -1608,7 +1637,7 @@ async function runTaskReviewPhase(
               .filter(shouldIncludeFindingFileInDiff),
           };
         })()
-      : await runLegacyReviewCycle(itemId, repo, task, agentWorkdir, reviewContext);
+      : await runLegacyReviewCycle(itemId, repo, task, agentWorkdir, reviewContext, reviewCycle);
 
     if (reviewCycleResult.hardFailureMessage) {
       const failure = await failTaskWithError(
