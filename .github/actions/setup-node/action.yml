@@ -1,0 +1,27 @@
+name: Setup Node.js with Yarn
+description: Set up Node.js with Yarn v4 and caching
+
+inputs:
+  node-version:
+    description: 'Node.js version to use'
+    required: false
+    default: '22.17.1'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Yarn v4
+      shell: bash
+      run: |
+        corepack enable
+        corepack prepare yarn@4 --activate
+
+    - name: Set up Node.js
+      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: yarn
+
+    - name: Install dependencies
+      shell: bash
+      run: yarn install --immutable
