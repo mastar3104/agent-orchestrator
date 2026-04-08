@@ -53,7 +53,7 @@ function baseOptions() {
     workingDir: '/workspace/repo-a',
     allowedTools: ['Read'],
     jsonSchema: {},
-  } as const;
+  };
 }
 
 function parseSavedOutput(): Record<string, unknown> {
