@@ -7,7 +7,7 @@ vi.mock('../../services/item-service', async (importOriginal) => {
   return {
     ...actual,
     createItem: vi.fn(),
-    setupWorkspace: vi.fn(),
+    setupWorkspace: vi.fn().mockResolvedValue(undefined),
     listItems: vi.fn().mockResolvedValue([]),
     getItemDetail: vi.fn().mockResolvedValue(null),
     updateItem: vi.fn().mockResolvedValue(null),

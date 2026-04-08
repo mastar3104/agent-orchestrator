@@ -40,7 +40,7 @@ describe('CreateItemModal', () => {
 
     // No saved repos, so auto-selects manual. Default repoType is remote.
     expect(view.getByText('Setup Commands')).toBeInTheDocument();
-    expect(view.getByPlaceholderText('npm install\nnpm run build')).toBeInTheDocument();
+    expect(view.getByPlaceholderText('npm install\nnpm run build', { collapseWhitespace: false })).toBeInTheDocument();
   });
 
   it('hides setup commands textarea for manual + local repos', async () => {
@@ -52,7 +52,7 @@ describe('CreateItemModal', () => {
     await user.click(localRadio);
 
     expect(view.queryByText('Setup Commands')).not.toBeInTheDocument();
-    expect(view.queryByPlaceholderText('npm install\nnpm run build')).not.toBeInTheDocument();
+    expect(view.queryByPlaceholderText('npm install\nnpm run build', { collapseWhitespace: false })).not.toBeInTheDocument();
   });
 
   it('hides setup commands textarea for saved repos', () => {
@@ -100,7 +100,7 @@ describe('CreateItemModal', () => {
     );
 
     // Enter setup commands with whitespace and empty lines
-    const textarea = view.getByPlaceholderText('npm install\nnpm run build');
+    const textarea = view.getByPlaceholderText('npm install\nnpm run build', { collapseWhitespace: false });
     await user.type(textarea, 'npm install{enter}  {enter}npm run build{enter}  npm test  ');
 
     await user.click(view.getByRole('button', { name: 'Create Item' }));
@@ -171,7 +171,7 @@ describe('CreateItemModal', () => {
       'https://github.com/test/repo.git'
     );
 
-    const textarea = view.getByPlaceholderText('npm install\nnpm run build');
+    const textarea = view.getByPlaceholderText('npm install\nnpm run build', { collapseWhitespace: false });
     await user.type(textarea, '   {enter}  {enter}   ');
 
     await user.click(view.getByRole('button', { name: 'Create Item' }));
