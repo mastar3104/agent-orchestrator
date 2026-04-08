@@ -317,7 +317,7 @@ function resolveReviewPerspectiveRole(
   }
 }
 
-function resolveReviewerSystemPrompt(
+export function resolveReviewerSystemPrompt(
   systemPrompt: string,
   itemId: string,
   repoName: string,
@@ -326,7 +326,13 @@ function resolveReviewerSystemPrompt(
   perspective?: ReviewPerspective
 ): string {
   const filePath = getReviewResultFilePath(itemId, repoName, taskId, reviewRound, perspective);
-  return systemPrompt.replace('{{reviewResultFilePath}}', filePath);
+  const result = systemPrompt.replace('{{reviewResultFilePath}}', filePath);
+  if (result === systemPrompt) {
+    console.warn(
+      `[resolveReviewerSystemPrompt] placeholder {{reviewResultFilePath}} not found in system prompt`
+    );
+  }
+  return result;
 }
 
 // Best-effort guard only: this avoids obviously write-capable reviewer roles,

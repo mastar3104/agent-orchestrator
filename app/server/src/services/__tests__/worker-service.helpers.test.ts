@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { ReviewFinding } from '@agent-orch/shared';
-import { buildFeedbackPrompt, sortReviewFindings, isCompatibleReviewerRole } from '../worker-service';
+import {
+  buildFeedbackPrompt,
+  sortReviewFindings,
+  isCompatibleReviewerRole,
+  resolveReviewerSystemPrompt,
+} from '../worker-service';
 import { getRole } from '../../lib/role-loader';
 
 function makeFinding(overrides: Partial<ReviewFinding> = {}): ReviewFinding {
@@ -112,5 +117,68 @@ describe('worker-service helpers', () => {
     expect(prompt).not.toContain('### Security');
     expect(prompt).toContain('- [CRITICAL] a.ts:1: First issue');
     expect(prompt).toContain('- [MINOR] b.ts:3: Second issue');
+  });
+});
+
+describe('resolveReviewerSystemPrompt', () => {
+  it('resolves {{reviewResultFilePath}} placeholder in reviewer system prompt', () => {
+    const role = getRole('reviewer');
+    expect(role.systemPrompt).toContain('{{reviewResultFilePath}}');
+    const resolved = resolveReviewerSystemPrompt(role.systemPrompt, 'ITEM-1', 'repo', 'task-1', 1);
+    expect(resolved).not.toContain('{{reviewResultFilePath}}');
+    expect(resolved).toContain('result.json');
+  });
+
+  it('resolves placeholder with perspective', () => {
+    const role = getRole('securityReviewer');
+    const resolved = resolveReviewerSystemPrompt(
+      role.systemPrompt,
+      'ITEM-1',
+      'repo',
+      'task-1',
+      1,
+      'security'
+    );
+    expect(resolved).not.toContain('{{reviewResultFilePath}}');
+    expect(resolved).toContain('result-security.json');
+  });
+
+  it('resolves placeholder for all perspective reviewer roles', () => {
+    const perspectives = [
+      { roleName: 'architectureReviewer', perspective: 'architecture' },
+      { roleName: 'securityReviewer', perspective: 'security' },
+      { roleName: 'testingReviewer', perspective: 'testing' },
+      { roleName: 'requirementsReviewer', perspective: 'requirements' },
+    ] as const;
+    for (const { roleName, perspective } of perspectives) {
+      const role = getRole(roleName);
+      expect(role.systemPrompt).toContain('{{reviewResultFilePath}}');
+      const resolved = resolveReviewerSystemPrompt(
+        role.systemPrompt,
+        'ITEM-1',
+        'repo',
+        'task-1',
+        2,
+        perspective
+      );
+      expect(resolved).not.toContain('{{reviewResultFilePath}}');
+      expect(resolved).toContain(`result-${perspective}.json`);
+    }
+  });
+
+  it('warns when placeholder is not found in system prompt', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = resolveReviewerSystemPrompt(
+      'No placeholder here',
+      'ITEM-1',
+      'repo',
+      'task-1',
+      1
+    );
+    expect(result).toBe('No placeholder here');
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('placeholder {{reviewResultFilePath}} not found')
+    );
+    warnSpy.mockRestore();
   });
 });
