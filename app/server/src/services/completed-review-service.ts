@@ -19,6 +19,7 @@ import { appendJsonl, readJsonl } from '../lib/jsonl';
 import {
   getHookLogDir,
   getItemEventsPath,
+  getItemTestPlanPath,
   getRepoWorkspaceDir,
   getWorkspaceRoot,
 } from '../lib/paths';
@@ -43,6 +44,7 @@ import { executeAgent, getAgentsByItem } from './agent-service';
 import { getItemConfig } from './item-service';
 import { getPlan } from './planner-service';
 import {
+  deriveTestPlanApproval,
   ensureApprovedTestPlan,
   getTestPlan,
   resolveVerificationPolicy,
@@ -674,6 +676,28 @@ async function loadCompletedReviewContext(itemId: string): Promise<CompletedRevi
   }
   const testPlan = await getTestPlan(itemId, plan);
   if (!testPlan) {
+    if (existsSync(getItemTestPlanPath(itemId))) {
+      const approval = await deriveTestPlanApproval(itemId, plan, null);
+      if (approval.status === 'approved') {
+        const syntheticTestPlan: TestPlan = {
+          version: '1.0',
+          itemId,
+          planFingerprint: approval.planFingerprint ?? '',
+          summary: 'Test plan was approved as-is despite YAML parse errors. Structured completed-review is skipped.',
+          verificationPolicy: 'none',
+          verificationRationale: 'Approved test plan is unparseable; skipping structured completed-review.',
+          scenarios: [],
+          createdAt: new Date().toISOString(),
+        };
+        return {
+          itemConfig,
+          plan,
+          testPlan: syntheticTestPlan,
+          verificationPolicy: 'none',
+          verificationRationale: syntheticTestPlan.verificationRationale,
+        };
+      }
+    }
     throw new Error(`No test plan found for item ${itemId}`);
   }
   await ensureApprovedTestPlan(itemId);

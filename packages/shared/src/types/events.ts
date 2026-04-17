@@ -27,6 +27,7 @@ export type EventType =
   | 'repo_setup_started'
   | 'repo_setup_completed'
   | 'error'
+  | 'test_plan_parse_warning'
   | 'pr_created'
   | 'repo_no_changes'
   | 'review_findings_extracted'
@@ -236,6 +237,14 @@ export interface ErrorEvent extends BaseEvent {
   phase?: ErrorPhase;
 }
 
+export interface TestPlanParseWarningEvent extends BaseEvent {
+  type: 'test_plan_parse_warning';
+  message: string;
+  sourcePath: string;
+  rawContentSavedTo: string;
+  phase: 'test_planner';
+}
+
 export interface PrCreatedEvent extends BaseEvent {
   type: 'pr_created';
   repoName: string;
@@ -381,6 +390,7 @@ export type ItemEvent =
   | CompletedReviewSkippedEvent
   | StatusChangedEvent
   | ErrorEvent
+  | TestPlanParseWarningEvent
   | PrCreatedEvent
   | RepoNoChangesEvent
   | ReviewFindingsExtractedEvent

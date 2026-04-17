@@ -28,6 +28,7 @@ import { parseYaml, readYamlSafe, stringifyYaml } from '../lib/yaml';
 import {
   createTestPlanApprovedEvent,
   createTestPlanCreatedEvent,
+  createTestPlanParseWarningEvent,
 } from '../lib/events';
 import { getRole } from '../lib/role-loader';
 import { composeWorkspaceRolePrompts } from '../lib/repository-role-prompts';
@@ -83,6 +84,10 @@ export function createTestPlanFingerprint(testPlan: TestPlan): string {
   return createHash('sha256').update(stringifyYaml(normalizeTestPlan(testPlan))).digest('hex');
 }
 
+function createTestPlanRawFingerprint(rawContent: string): string {
+  return createHash('sha256').update(`raw:${rawContent}`).digest('hex');
+}
+
 function getGeneratedTestPlanWorkingDir(itemId: string): string {
   return join(getWorkspaceRoot(itemId), '.test-planner');
 }
@@ -116,6 +121,32 @@ async function emitTestPlanCreated(
   eventBus.emit('event', { itemId, event });
 }
 
+async function emitTestPlanParseWarning(
+  itemId: string,
+  message: string,
+  sourcePath: string,
+  rawContentSavedTo: string
+): Promise<void> {
+  const event = createTestPlanParseWarningEvent(itemId, message, sourcePath, rawContentSavedTo);
+  await appendJsonl(getItemEventsPath(itemId), event);
+  eventBus.emit('event', { itemId, event });
+}
+
+async function persistUnparseableTestPlanContent(
+  itemId: string,
+  sourcePath: string,
+  rawContent: string,
+  parseMessage: string,
+  planFingerprint: string
+): Promise<void> {
+  const testPlanPath = getItemTestPlanPath(itemId);
+  await mkdir(dirname(testPlanPath), { recursive: true });
+  await archiveCurrentTestPlan(itemId);
+  await writeFile(testPlanPath, rawContent, 'utf-8');
+  await emitTestPlanParseWarning(itemId, parseMessage, sourcePath, testPlanPath);
+  await emitTestPlanCreated(itemId, planFingerprint, createTestPlanRawFingerprint(rawContent));
+}
+
 async function emitTestPlanApproved(
   itemId: string,
   planFingerprint: string,
@@ -146,13 +177,27 @@ export async function archiveCurrentTestPlan(
   return [archivePath];
 }
 
-async function loadGeneratedTestPlan(sourcePath: string): Promise<TestPlan> {
+type GeneratedTestPlanResult =
+  | { ok: true; testPlan: TestPlan }
+  | { ok: false; reason: 'missing'; message: string }
+  | { ok: false; reason: 'parse_error'; rawContent: string; message: string };
+
+async function loadGeneratedTestPlan(sourcePath: string): Promise<GeneratedTestPlanResult> {
   if (!existsSync(sourcePath)) {
-    throw new Error(`Test planner completed but test-plan.yaml was not created: ${sourcePath}`);
+    return {
+      ok: false,
+      reason: 'missing',
+      message: `Test planner completed but test-plan.yaml was not created: ${sourcePath}`,
+    };
   }
 
   const content = await readFile(sourcePath, 'utf-8');
-  return normalizeTestPlan(parseYaml<TestPlan>(content));
+  try {
+    return { ok: true, testPlan: normalizeTestPlan(parseYaml<TestPlan>(content)) };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Invalid YAML';
+    return { ok: false, reason: 'parse_error', rawContent: content, message };
+  }
 }
 
 export function resolveVerificationPolicy(
@@ -468,8 +513,22 @@ async function runTestPlannerForCurrentPlan(
     schemaFallbackMode: TEST_PLANNER_SCHEMA_FALLBACK_MODE,
   });
 
-  const generatedTestPlan = await loadGeneratedTestPlan(sourcePath);
-  await persistCurrentTestPlan(itemId, generatedTestPlan, normalizedPlan, itemConfig);
+  const result = await loadGeneratedTestPlan(sourcePath);
+  if (result.ok) {
+    await persistCurrentTestPlan(itemId, result.testPlan, normalizedPlan, itemConfig);
+    return;
+  }
+  if (result.reason === 'parse_error') {
+    await persistUnparseableTestPlanContent(
+      itemId,
+      sourcePath,
+      result.rawContent,
+      result.message,
+      createPlanFingerprint(normalizedPlan)
+    );
+    return;
+  }
+  throw new Error(result.message);
 }
 
 export async function startTestPlanner(itemId: string): Promise<void> {
@@ -509,8 +568,12 @@ export async function synchronizeTestPlan(itemId: string, itemConfig: ItemConfig
 }
 
 export async function getTestPlan(itemId: string, currentPlan?: Plan | null): Promise<TestPlan | null> {
-  const testPlan = await readYamlSafe<TestPlan>(getItemTestPlanPath(itemId));
-  return testPlan ? normalizeTestPlan(testPlan, currentPlan) : null;
+  try {
+    const testPlan = await readYamlSafe<TestPlan>(getItemTestPlanPath(itemId));
+    return testPlan ? normalizeTestPlan(testPlan, currentPlan) : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function getTestPlanContent(itemId: string): Promise<string | null> {
@@ -654,8 +717,22 @@ export async function testPlanFeedback(
     schemaFallbackMode: TEST_PLANNER_SCHEMA_FALLBACK_MODE,
   });
 
-  const generatedTestPlan = await loadGeneratedTestPlan(sourcePath);
-  await persistCurrentTestPlan(itemId, generatedTestPlan, currentPlan, itemConfig);
+  const result = await loadGeneratedTestPlan(sourcePath);
+  if (result.ok) {
+    await persistCurrentTestPlan(itemId, result.testPlan, currentPlan, itemConfig);
+    return;
+  }
+  if (result.reason === 'parse_error') {
+    await persistUnparseableTestPlanContent(
+      itemId,
+      sourcePath,
+      result.rawContent,
+      result.message,
+      createPlanFingerprint(currentPlan)
+    );
+    return;
+  }
+  throw new Error(result.message);
 }
 
 export async function deriveTestPlanApproval(
@@ -671,6 +748,29 @@ export async function deriveTestPlanApproval(
   const planFingerprint = createPlanFingerprint(currentPlan);
   const currentTestPlan = currentTestPlanArg ?? await getTestPlan(itemId, currentPlan);
   if (!currentTestPlan) {
+    const testPlanPath = getItemTestPlanPath(itemId);
+    if (existsSync(testPlanPath)) {
+      const rawContent = await readFile(testPlanPath, 'utf-8');
+      const rawFingerprint = createTestPlanRawFingerprint(rawContent);
+      const events = await readJsonl<ItemEvent>(getItemEventsPath(itemId));
+      const latestApprovedEvent = [...events]
+        .reverse()
+        .find((event): event is Extract<ItemEvent, { type: 'test_plan_approved' }> =>
+          event.type === 'test_plan_approved' &&
+          event.planFingerprint === planFingerprint &&
+          event.testPlanFingerprint === rawFingerprint
+        );
+      if (latestApprovedEvent) {
+        return {
+          status: 'approved',
+          planFingerprint,
+          testPlanFingerprint: rawFingerprint,
+          approvedAt: latestApprovedEvent.timestamp,
+          approvedBy: latestApprovedEvent.approvedBy,
+        };
+      }
+      return { status: 'parse_error', planFingerprint, testPlanFingerprint: rawFingerprint };
+    }
     return { status: 'missing', planFingerprint };
   }
 
@@ -726,10 +826,6 @@ export async function approveTestPlan(itemId: string): Promise<TestPlanApprovalS
   }
 
   const currentTestPlan = await getTestPlan(itemId, currentPlan);
-  if (!currentTestPlan) {
-    throw new Error('No test plan exists yet');
-  }
-
   const approval = await deriveTestPlanApproval(itemId, currentPlan, currentTestPlan);
   if (approval.status === 'missing') {
     throw new Error('No test plan exists yet');

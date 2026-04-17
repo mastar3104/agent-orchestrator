@@ -27,6 +27,7 @@ import type {
   RepoSetupCompletedEvent,
   ErrorEvent,
   ErrorPhase,
+  TestPlanParseWarningEvent,
   PrCreatedEvent,
   RepoNoChangesEvent,
   AgentRole,
@@ -428,6 +429,24 @@ export function createErrorEvent(
     stack: options?.stack,
     repoName: options?.repoName,
     phase: options?.phase,
+  };
+}
+
+export function createTestPlanParseWarningEvent(
+  itemId: string,
+  message: string,
+  sourcePath: string,
+  rawContentSavedTo: string
+): TestPlanParseWarningEvent {
+  return {
+    id: createEventId(),
+    type: 'test_plan_parse_warning',
+    timestamp: timestamp(),
+    itemId,
+    message,
+    sourcePath,
+    rawContentSavedTo,
+    phase: 'test_planner',
   };
 }
 
