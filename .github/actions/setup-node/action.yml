@@ -10,11 +10,11 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Install Yarn v4
+    - name: Install pinned Yarn version
       shell: bash
       run: |
         corepack enable
-        corepack prepare yarn@4 --activate
+        corepack prepare yarn@4.12.0 --activate
 
     - name: Set up Node.js
       uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
