@@ -1,6 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { ReviewFinding } from '@agent-orch/shared';
-import { buildFeedbackPrompt, sortReviewFindings } from '../worker-service';
+import {
+  buildFeedbackPrompt,
+  sortReviewFindings,
+  isCompatibleReviewerRole,
+  resolveReviewerSystemPrompt,
+} from '../worker-service';
+import { getRole } from '../../lib/role-loader';
 
 function makeFinding(overrides: Partial<ReviewFinding> = {}): ReviewFinding {
   return {
@@ -34,65 +40,115 @@ describe('worker-service helpers', () => {
     ]);
   });
 
-  it('builds perspective-grouped feedback sections in the configured order', () => {
+  it('lists review result file paths in the feedback prompt', () => {
     const prompt = buildFeedbackPrompt(
       {} as any,
       { name: 'repo-a' } as any,
       [
-        makeFinding({
-          perspective: 'architecture',
-          file: 'arch.ts',
-          description: 'Split orchestration concerns.',
-          severity: 'minor',
-        }),
-        makeFinding({
-          perspective: 'testing',
-          file: 'worker.test.ts',
-          description: 'Add a regression test.',
-          severity: 'major',
-        }),
-        makeFinding({
-          perspective: 'security',
-          file: 'auth.ts',
-          description: 'Enforce authorization.',
-          severity: 'critical',
-        }),
-        makeFinding({
-          perspective: 'requirements',
-          file: 'requirements.ts',
-          description: 'Preserve acceptance criteria.',
-          severity: 'major',
-        }),
+        '/reviews/repo-a/T1/review-round-1/result-security.json',
+        '/reviews/repo-a/T1/review-round-1/result-architecture.json',
       ],
       'diff --git a/file.ts b/file.ts',
       [{ id: 'T1', title: 'Task', description: '', repository: 'repo-a', files: [], dependencies: [] }]
     );
 
-    const securityIndex = prompt.indexOf('### Security');
-    const requirementsIndex = prompt.indexOf('### Requirements');
-    const architectureIndex = prompt.indexOf('### Architecture');
-    const testingIndex = prompt.indexOf('### Testing');
-
-    expect(securityIndex).toBeGreaterThan(-1);
-    expect(requirementsIndex).toBeGreaterThan(securityIndex);
-    expect(architectureIndex).toBeGreaterThan(requirementsIndex);
-    expect(testingIndex).toBeGreaterThan(architectureIndex);
+    expect(prompt).toContain('/reviews/repo-a/T1/review-round-1/result-security.json');
+    expect(prompt).toContain('/reviews/repo-a/T1/review-round-1/result-architecture.json');
+    expect(prompt).toContain('Review result files');
+    expect(prompt).toContain('Read the review result files');
   });
 
-  it('keeps legacy feedback flat when findings do not include perspectives', () => {
+  it('treats a reviewer role with Write but not Edit as compatible', () => {
+    const reviewerRole = getRole('reviewer');
+    expect(reviewerRole.allowedTools).toContain('Write');
+    expect(reviewerRole.allowedTools).not.toContain('Edit');
+    expect(isCompatibleReviewerRole(reviewerRole)).toBe(true);
+  });
+
+  it('rejects a role that includes Edit', () => {
+    const fakeRole = { allowedTools: ['Read', 'Edit'], systemPrompt: '', jsonSchema: undefined };
+    expect(isCompatibleReviewerRole(fakeRole as any)).toBe(false);
+  });
+
+  it('accepts a role with only read tools', () => {
+    const fakeRole = { allowedTools: ['Read', 'Glob', 'Grep'], systemPrompt: '', jsonSchema: undefined };
+    expect(isCompatibleReviewerRole(fakeRole as any)).toBe(true);
+  });
+
+  it('shows fallback message when no review result file paths are provided', () => {
     const prompt = buildFeedbackPrompt(
       {} as any,
       { name: 'repo-a' } as any,
-      [
-        makeFinding({ file: 'b.ts', line: 3, description: 'Second issue', severity: 'minor' }),
-        makeFinding({ file: 'a.ts', line: 1, description: 'First issue', severity: 'critical' }),
-      ],
+      [],
       'diff --git a/file.ts b/file.ts',
       [{ id: 'T1', title: 'Task', description: '', repository: 'repo-a', files: [], dependencies: [] }]
     );
 
-    expect(prompt).not.toContain('### Security');
-    expect(prompt).toContain('- [CRITICAL] a.ts:1: First issue');
-    expect(prompt).toContain('- [MINOR] b.ts:3: Second issue');
+    expect(prompt).toContain('No review result files available');
+    expect(prompt).toContain('git add -A -- <paths>');
+    expect(prompt).toContain('Return {"status": "success"}');
+  });
+});
+
+describe('resolveReviewerSystemPrompt', () => {
+  it('resolves {{reviewResultFilePath}} placeholder in reviewer system prompt', () => {
+    const role = getRole('reviewer');
+    expect(role.systemPrompt).toContain('{{reviewResultFilePath}}');
+    const resolved = resolveReviewerSystemPrompt(role.systemPrompt, 'ITEM-1', 'repo', 'task-1', 1);
+    expect(resolved).not.toContain('{{reviewResultFilePath}}');
+    expect(resolved).toContain('result.json');
+  });
+
+  it('resolves placeholder with perspective', () => {
+    const role = getRole('securityReviewer');
+    const resolved = resolveReviewerSystemPrompt(
+      role.systemPrompt,
+      'ITEM-1',
+      'repo',
+      'task-1',
+      1,
+      'security'
+    );
+    expect(resolved).not.toContain('{{reviewResultFilePath}}');
+    expect(resolved).toContain('result-security.json');
+  });
+
+  it('resolves placeholder for all perspective reviewer roles', () => {
+    const perspectives = [
+      { roleName: 'architectureReviewer', perspective: 'architecture' },
+      { roleName: 'securityReviewer', perspective: 'security' },
+      { roleName: 'testingReviewer', perspective: 'testing' },
+      { roleName: 'requirementsReviewer', perspective: 'requirements' },
+    ] as const;
+    for (const { roleName, perspective } of perspectives) {
+      const role = getRole(roleName);
+      expect(role.systemPrompt).toContain('{{reviewResultFilePath}}');
+      const resolved = resolveReviewerSystemPrompt(
+        role.systemPrompt,
+        'ITEM-1',
+        'repo',
+        'task-1',
+        2,
+        perspective
+      );
+      expect(resolved).not.toContain('{{reviewResultFilePath}}');
+      expect(resolved).toContain(`result-${perspective}.json`);
+    }
+  });
+
+  it('warns when placeholder is not found in system prompt', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = resolveReviewerSystemPrompt(
+      'No placeholder here',
+      'ITEM-1',
+      'repo',
+      'task-1',
+      1
+    );
+    expect(result).toBe('No placeholder here');
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('placeholder {{reviewResultFilePath}} not found')
+    );
+    warnSpy.mockRestore();
   });
 });

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const taskStateStore = vi.hoisted(() => new Map<string, any>());
+const reviewFileStore = vi.hoisted(() => new Map<string, string>());
 const gitMockState = vi.hoisted(() => ({
   currentHead: 'head-0',
   nextCommitId: 1,
@@ -147,10 +148,31 @@ vi.mock('../../lib/paths', () => ({
     (_itemId: string, repoName: string, taskId: string, reviewRound: number) =>
       `/items/ITEM-test/reviews/${repoName}/${taskId}/review-round-${reviewRound}/index.md`
   ),
+  getReviewResultFilePath: vi.fn(
+    (_itemId: string, repoName: string, taskId: string, reviewRound: number, perspective?: string) =>
+      `/items/ITEM-test/reviews/${repoName}/${taskId}/review-round-${reviewRound}/${perspective ? `result-${perspective}.json` : 'result.json'}`
+  ),
 }));
 
 vi.mock('fs/promises', () => ({
-  readFile: vi.fn().mockResolvedValue('version: "1"\nitemId: ITEM-test\nsummary: test\ntasks:\n  - id: T1'),
+  readFile: vi.fn().mockImplementation(async (path: any) => {
+    const pathStr = typeof path === 'string' ? path : String(path);
+    if (reviewFileStore.has(pathStr)) {
+      const value = reviewFileStore.get(pathStr);
+      if (value === '__EACCES__') {
+        const err = new Error(`EACCES: permission denied, open '${pathStr}'`);
+        (err as any).code = 'EACCES';
+        throw err;
+      }
+      return value;
+    }
+    if (pathStr.includes('/result') && pathStr.endsWith('.json')) {
+      const err = new Error(`ENOENT: no such file or directory, open '${pathStr}'`);
+      (err as any).code = 'ENOENT';
+      throw err;
+    }
+    return 'version: "1"\nitemId: ITEM-test\nsummary: test\ntasks:\n  - id: T1';
+  }),
   mkdir: vi.fn().mockResolvedValue(undefined),
   writeFile: vi.fn().mockResolvedValue(undefined),
 }));
@@ -416,6 +438,25 @@ function reviewRequestChanges(comment: string = 'fix this') {
   };
 }
 
+function setReviewResultFile(
+  repoName: string,
+  taskId: string,
+  reviewRound: number,
+  comments: Array<{ file: string; line?: number; comment: string; severity?: string }>,
+  perspective?: string
+) {
+  const fileName = perspective ? `result-${perspective}.json` : 'result.json';
+  const filePath = `/items/ITEM-test/reviews/${repoName}/${taskId}/review-round-${reviewRound}/${fileName}`;
+  reviewFileStore.set(filePath, JSON.stringify({
+    review_status: 'request_changes',
+    comments,
+  }));
+}
+
+function reviewAgentResult() {
+  return { agent: {} as any, result: { output: {} } };
+}
+
 function getRepoTaskState(repoName: string) {
   return taskStateStore.get(repoName);
 }
@@ -424,6 +465,7 @@ describe('Worker task-state execution', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     taskStateStore.clear();
+    reviewFileStore.clear();
     gitMockState.currentHead = 'head-0';
     gitMockState.nextCommitId = 1;
     gitMockState.committedPaths = ['file.ts'];
@@ -1268,6 +1310,9 @@ describe('Worker task-state execution', () => {
   });
 
   it('retries feedback engineer once and continues the review loop on success', async () => {
+    // Cycle 1: request_changes, Cycle 2: approve (no file)
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+
     let reviewAttempts = 0;
     let feedbackAttempts = 0;
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
@@ -1276,7 +1321,7 @@ describe('Worker task-state execution', () => {
       }
       if (params.role === 'review') {
         reviewAttempts += 1;
-        return reviewAttempts === 1 ? reviewRequestChanges() : reviewApprove();
+        return reviewAgentResult();
       }
       if (params.role === 'engineer' && params.currentTask === 'T1: review-fix') {
         feedbackAttempts += 1;
@@ -1295,15 +1340,15 @@ describe('Worker task-state execution', () => {
   });
 
   it('uses self-commit instructions in the review-fix prompt', async () => {
-    let reviewCalls = 0;
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+
     let reviewFixPrompt = '';
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer' && params.currentTask === 'T1: Task 1') {
         return engineerSuccess();
       }
       if (params.role === 'review') {
-        reviewCalls += 1;
-        return reviewCalls === 1 ? reviewRequestChanges() : reviewApprove();
+        return reviewAgentResult();
       }
       if (params.role === 'engineer' && params.currentTask === 'T1: review-fix') {
         reviewFixPrompt = params.prompt;
@@ -1318,16 +1363,19 @@ describe('Worker task-state execution', () => {
     expect(reviewFixPrompt).toContain('git commit -m');
     expect(reviewFixPrompt).toContain('Return {"status": "success"}');
     expect(reviewFixPrompt).not.toContain('files_modified');
+    expect(reviewFixPrompt).toContain('Review result files');
   });
 
   it('fails the run when feedback engineer exhausts its retries', async () => {
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+
     let feedbackAttempts = 0;
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer' && params.currentTask === 'T1: Task 1') {
         return engineerSuccess();
       }
       if (params.role === 'review') {
-        return reviewRequestChanges();
+        return reviewAgentResult();
       }
       if (params.role === 'engineer' && params.currentTask === 'T1: review-fix') {
         feedbackAttempts += 1;
@@ -1352,6 +1400,12 @@ describe('Worker task-state execution', () => {
       ]) as any
     );
 
+    // All 3 review cycles for T1 find issues (exhaustion)
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix 1', severity: 'major' }]);
+    setReviewResultFile('repo-a', 'T1', 2, [{ file: 'file.ts', line: 1, comment: 'fix 2', severity: 'major' }]);
+    setReviewResultFile('repo-a', 'T1', 3, [{ file: 'file.ts', line: 1, comment: 'fix 3', severity: 'major' }]);
+    // T2 review: no file → approve
+
     const engineerTasks: string[] = [];
     let reviewCalls = 0;
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
@@ -1369,10 +1423,10 @@ describe('Worker task-state execution', () => {
       }
       if (params.role === 'review' && params.currentTask === 'T1: review') {
         reviewCalls += 1;
-        return reviewRequestChanges(`fix ${reviewCalls}`);
+        return reviewAgentResult();
       }
       if (params.role === 'review' && params.currentTask === 'T2: review') {
-        return reviewApprove();
+        return reviewAgentResult();
       }
       throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
     });
@@ -1503,40 +1557,120 @@ describe('Worker task-state execution', () => {
     });
   });
 
-  it('continues reviewer loops when reviewer falls back after schema validation mismatch', async () => {
-    let reviewerCalls = 0;
+  it('treats reviewer that writes unparseable file as request_changes and triggers review-fix', async () => {
+    // Set up unparseable review result files for all 3 cycles
+    const basePath = '/items/ITEM-test/reviews/repo-a/T1';
+    reviewFileStore.set(`${basePath}/review-round-1/result.json`, 'not valid json');
+    reviewFileStore.set(`${basePath}/review-round-2/result.json`, 'still not valid');
+    reviewFileStore.set(`${basePath}/review-round-3/result.json`, 'yet another bad file');
+
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer' && params.currentTask === 'T1: Task 1') {
         return engineerSuccess();
       }
       if (params.role === 'review') {
-        reviewerCalls += 1;
-        return {
-          agent: { id: `reviewer-fallback-${reviewerCalls}` },
-          result: {
-            output: 'Freeform review response.',
-            usedSchemaFallback: true,
-            schemaValidationErrors: ["$: expected type 'object' but got 'string'"],
-          },
-        } as any;
+        return reviewAgentResult();
+      }
+      if (params.role === 'engineer' && params.currentTask === 'T1: review-fix') {
+        return engineerSuccess();
       }
       throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
     });
 
     await startWorkers(ITEM_ID);
 
-    expect(reviewerCalls).toBe(3);
     const reviewCalls = mockExecuteAgent.mock.calls.filter((call) => call[0].role === 'review');
     expect(reviewCalls).toHaveLength(3);
-    expect(reviewCalls.every((call) => call[0].schemaFallbackMode === 'result_or_empty')).toBe(true);
-    expect(
-      mockExecuteAgent.mock.calls.filter((call) => call[0].currentTask === 'T1: review-fix')
-    ).toHaveLength(0);
+    // With file-based detection, no jsonSchema or schemaFallbackMode should be passed
+    expect(reviewCalls.every((call) => call[0].jsonSchema === undefined)).toBe(true);
+    expect(reviewCalls.every((call) => call[0].schemaFallbackMode === undefined)).toBe(true);
+    const reviewFixCalls = mockExecuteAgent.mock.calls.filter((call) => call[0].currentTask === 'T1: review-fix');
+    expect(reviewFixCalls).toHaveLength(3);
     expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
       id: 'T1',
       status: 'completed',
       reviewRounds: 3,
       reviewExhausted: true,
+    });
+  });
+
+  it('treats valid JSON that is not a valid ReviewerResponse as request_changes with synthetic finding', async () => {
+    // Valid JSON but missing required fields (review_status, comments array)
+    const basePath = '/items/ITEM-test/reviews/repo-a/T1';
+    reviewFileStore.set(`${basePath}/review-round-1/result.json`, JSON.stringify({ status: 'done' }));
+    // Cycle 2: no file → approve
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer' && params.currentTask === 'T1: Task 1') {
+        return engineerSuccess();
+      }
+      if (params.role === 'review') {
+        return reviewAgentResult();
+      }
+      if (params.role === 'engineer' && params.currentTask === 'T1: review-fix') {
+        return engineerSuccess();
+      }
+      throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    const reviewFixCalls = mockExecuteAgent.mock.calls.filter((call) => call[0].currentTask === 'T1: review-fix');
+    expect(reviewFixCalls).toHaveLength(1);
+    // The feedback prompt should reference the review result file
+    expect(reviewFixCalls[0][0].prompt).toContain('result.json');
+    expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
+    });
+  });
+
+  it('propagates non-ENOENT I/O errors from review result file reads instead of auto-approving', async () => {
+    // Simulate a permission error (EACCES) when reading the review result file.
+    // This must NOT be treated as 'no_file' (which would auto-approve).
+    const basePath = '/items/ITEM-test/reviews/repo-a/T1';
+    const resultPath = `${basePath}/review-round-1/result.json`;
+    // Use a special sentinel in reviewFileStore to trigger EACCES in the mock
+    reviewFileStore.set(resultPath, '__EACCES__');
+
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer' && params.currentTask === 'T1: Task 1') {
+        return engineerSuccess();
+      }
+      if (params.role === 'review') {
+        return reviewAgentResult();
+      }
+      throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
+    });
+
+    await expect(startWorkers(ITEM_ID)).rejects.toThrow();
+  });
+
+  it('completes successfully when unparseable file in cycle 1 is followed by approve (no file) in cycle 2', async () => {
+    // Cycle 1: unparseable file → request_changes, Cycle 2: no file → approve
+    const basePath = '/items/ITEM-test/reviews/repo-a/T1';
+    reviewFileStore.set(`${basePath}/review-round-1/result.json`, 'not valid json');
+    // Cycle 2: no entry in reviewFileStore → ENOENT → no_file → approve
+
+    mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
+      if (params.role === 'engineer' && params.currentTask === 'T1: Task 1') {
+        return engineerSuccess();
+      }
+      if (params.role === 'review') {
+        return reviewAgentResult();
+      }
+      if (params.role === 'engineer' && params.currentTask === 'T1: review-fix') {
+        return engineerSuccess();
+      }
+      throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
+    });
+
+    await startWorkers(ITEM_ID);
+
+    const reviewFixCalls = mockExecuteAgent.mock.calls.filter((call) => call[0].currentTask === 'T1: review-fix');
+    expect(reviewFixCalls).toHaveLength(1);
+    expect(getRepoTaskState('repo-a').tasks[0]).toMatchObject({
+      id: 'T1',
+      status: 'completed',
     });
   });
 

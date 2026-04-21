@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const taskStateStore = vi.hoisted(() => new Map<string, any>());
+const reviewFileStore = vi.hoisted(() => new Map<string, string>());
 const gitMockState = vi.hoisted(() => ({
   currentHead: 'head-0',
   nextCommitId: 1,
@@ -146,6 +147,10 @@ vi.mock('../../lib/paths', () => ({
     (_itemId: string, repoName: string, taskId: string, reviewRound: number) =>
       `/items/ITEM-test/reviews/${repoName}/${taskId}/review-round-${reviewRound}/index.md`
   ),
+  getReviewResultFilePath: vi.fn(
+    (_itemId: string, repoName: string, taskId: string, reviewRound: number, perspective?: string) =>
+      `/items/ITEM-test/reviews/${repoName}/${taskId}/review-round-${reviewRound}/${perspective ? `result-${perspective}.json` : 'result.json'}`
+  ),
 }));
 
 vi.mock('../event-bus', () => ({
@@ -195,7 +200,18 @@ vi.mock('../../lib/role-loader', () => ({
 }));
 
 vi.mock('fs/promises', () => ({
-  readFile: vi.fn().mockResolvedValue('tasks:\n  - id: T1\n    title: Test Task'),
+  readFile: vi.fn().mockImplementation(async (path: any) => {
+    const pathStr = typeof path === 'string' ? path : String(path);
+    if (reviewFileStore.has(pathStr)) {
+      return reviewFileStore.get(pathStr);
+    }
+    if (pathStr.includes('/result') && pathStr.endsWith('.json')) {
+      const err = new Error(`ENOENT: no such file or directory, open '${pathStr}'`);
+      (err as any).code = 'ENOENT';
+      throw err;
+    }
+    return 'tasks:\n  - id: T1\n    title: Test Task';
+  }),
   mkdir: vi.fn().mockResolvedValue(undefined),
   writeFile: vi.fn().mockResolvedValue(undefined),
 }));
@@ -356,6 +372,21 @@ function reviewResult(
   };
 }
 
+function setReviewResultFile(
+  repoName: string,
+  taskId: string,
+  reviewRound: number,
+  comments: Array<{ file: string; line?: number; comment: string; severity?: string }>,
+  perspective?: string
+) {
+  const fileName = perspective ? `result-${perspective}.json` : 'result.json';
+  const filePath = `/items/ITEM-test/reviews/${repoName}/${taskId}/review-round-${reviewRound}/${fileName}`;
+  reviewFileStore.set(filePath, JSON.stringify({
+    review_status: 'request_changes',
+    comments,
+  }));
+}
+
 function handleGitSpawn(args: string[]) {
   if (args[0] === 'rev-parse') return createGitProc(gitMockState.currentHead);
   if (args[0] === 'merge-base') return createGitProc('base123');
@@ -442,6 +473,7 @@ describe('Worker hooks', () => {
     mockMaybeStartCompletedReviewAfterTasks.mockReset();
     mockSpawn.mockReset();
     taskStateStore.clear();
+    reviewFileStore.clear();
     gitMockState.currentHead = 'head-0';
     gitMockState.nextCommitId = 1;
     gitMockState.committedPaths = ['file.ts'];
@@ -1018,14 +1050,17 @@ describe('Worker hooks', () => {
       { exitCode: 0, stdout: 'tests pass' },   // Post-feedback hook
     ]);
 
+    // Set up review result file for cycle 1 (request_changes)
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+
     mockExecuteAgent
       .mockResolvedValueOnce(successResult() as any) // initial engineer
-      .mockResolvedValueOnce({                       // reviewer cycle 1: request_changes
-        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
+      .mockResolvedValueOnce({                       // reviewer cycle 1
+        result: { output: {} },
       } as any)
       .mockResolvedValueOnce(successResult() as any) // feedback engineer
-      .mockResolvedValueOnce({                       // reviewer cycle 2: approve
-        result: { output: { review_status: 'approve', comments: [] } },
+      .mockResolvedValueOnce({                       // reviewer cycle 2: approve (no file)
+        result: { output: {} },
       } as any);
 
     await startWorkers(ITEM_ID);
@@ -1056,14 +1091,17 @@ describe('Worker hooks', () => {
       { exitCode: 0, stdout: 'tests pass' },
     ]);
 
+    // Set up review result file for cycle 1 (request_changes)
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+
     mockExecuteAgent
       .mockResolvedValueOnce(successResult() as any)
       .mockResolvedValueOnce({
-        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
+        result: { output: {} },
       } as any)
       .mockResolvedValueOnce(successResult() as any)
       .mockResolvedValueOnce({
-        result: { output: { review_status: 'approve', comments: [] } },
+        result: { output: {} },
       } as any);
 
     await startWorkers(ITEM_ID);
@@ -1075,6 +1113,7 @@ describe('Worker hooks', () => {
     expect(reviewFixCall?.[0].prompt).toContain('git commit -m');
     expect(reviewFixCall?.[0].prompt).toContain('Return {"status": "success"}');
     expect(reviewFixCall?.[0].prompt).not.toContain('files_modified');
+    expect(reviewFixCall?.[0].prompt).toContain('Review result files');
   });
 
   it('should clear hooksExhausted after a later review-fix cycle makes hooks pass', async () => {
@@ -1089,6 +1128,9 @@ describe('Worker hooks', () => {
       { exitCode: 0, stdout: 'tests pass' },
     ]);
 
+    // Cycle 1 (hooks exhausted): reviewer finds issues via file
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer' && params.currentTask === 'T1: Task for repo-a') {
         return successResult(['engineer.ts']) as any;
@@ -1101,19 +1143,12 @@ describe('Worker hooks', () => {
       }
       if (params.role === 'review' && params.currentTask === 'T1: review') {
         if (!params.prompt.includes('## Hook Status Warning')) {
-          return {
-            result: { output: { review_status: 'approve', comments: [] } },
-          } as any;
+          // Cycle 2: no file → approve
+          return { result: { output: {} } } as any;
         }
         expect(params.prompt).toContain('npm test');
-        return {
-          result: {
-            output: {
-              review_status: 'request_changes',
-              comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }],
-            },
-          },
-        } as any;
+        // Cycle 1: file already set via setReviewResultFile
+        return { result: { output: {} } } as any;
       }
       throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
     });
@@ -1142,15 +1177,13 @@ describe('Worker hooks', () => {
       { exitCode: 0, stdout: 'tests pass' },
     ]);
 
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+
     mockExecuteAgent
       .mockResolvedValueOnce(successResult(['engineer.ts']) as any)
-      .mockResolvedValueOnce({
-        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
-      } as any)
+      .mockResolvedValueOnce({ result: { output: {} } } as any)
       .mockResolvedValueOnce(successResult(['review-fix.ts'], { skipCommit: true }) as any)
-      .mockResolvedValueOnce({
-        result: { output: { review_status: 'approve', comments: [] } },
-      } as any);
+      .mockResolvedValueOnce({ result: { output: {} } } as any);
 
     await startWorkers(ITEM_ID);
 
@@ -1176,19 +1209,17 @@ describe('Worker hooks', () => {
       { exitCode: 0, stdout: 'tests pass' }, // Post-feedback hook 2
     ]);
 
+    // Set up review result files for cycles 1 and 2 (request_changes), cycle 3 no file (approve)
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+    setReviewResultFile('repo-a', 'T1', 2, [{ file: 'file.ts', line: 1, comment: 'fix this again', severity: 'major' }]);
+
     mockExecuteAgent
       .mockResolvedValueOnce(successResult() as any) // initial engineer
-      .mockResolvedValueOnce({
-        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
-      } as any)
+      .mockResolvedValueOnce({ result: { output: {} } } as any) // reviewer cycle 1
       .mockResolvedValueOnce(successResult() as any) // feedback engineer 1
-      .mockResolvedValueOnce({
-        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this again', severity: 'major' }] } },
-      } as any)
+      .mockResolvedValueOnce({ result: { output: {} } } as any) // reviewer cycle 2
       .mockResolvedValueOnce(successResult() as any) // feedback engineer 2
-      .mockResolvedValueOnce({
-        result: { output: { review_status: 'approve', comments: [] } },
-      } as any);
+      .mockResolvedValueOnce({ result: { output: {} } } as any); // reviewer cycle 3 (approve, no file)
 
     await startWorkers(ITEM_ID);
 
@@ -1217,23 +1248,19 @@ describe('Worker hooks', () => {
       { exitCode: 0, stdout: 'tests pass' }, // Post-feedback hook 3
     ]);
 
+    // All review cycles find issues
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+    setReviewResultFile('repo-a', 'T1', 2, [{ file: 'file.ts', line: 1, comment: 'fix this again', severity: 'major' }]);
+    setReviewResultFile('repo-a', 'T1', 3, [{ file: 'file.ts', line: 1, comment: 'still broken', severity: 'major' }]);
+
     mockExecuteAgent
       .mockResolvedValueOnce(successResult() as any) // initial engineer
-      .mockResolvedValueOnce({
-        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
-      } as any)
+      .mockResolvedValueOnce({ result: { output: {} } } as any) // reviewer cycle 1
       .mockResolvedValueOnce(successResult() as any) // feedback engineer 1
-      .mockResolvedValueOnce({
-        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this again', severity: 'major' }] } },
-      } as any)
+      .mockResolvedValueOnce({ result: { output: {} } } as any) // reviewer cycle 2
       .mockResolvedValueOnce(successResult() as any) // feedback engineer 2
-      .mockResolvedValueOnce({
-        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'still broken', severity: 'major' }] } },
-      } as any)
+      .mockResolvedValueOnce({ result: { output: {} } } as any) // reviewer cycle 3
       .mockResolvedValueOnce(successResult() as any) // feedback engineer 3
-      .mockResolvedValueOnce({
-        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'one more issue', severity: 'major' }] } },
-      } as any);
 
     await expect(startWorkers(ITEM_ID)).resolves.toBeUndefined();
 
@@ -1271,7 +1298,9 @@ describe('Worker hooks', () => {
       { exitCode: 0, stdout: 'hook ok' },      // after review-fix
     ]);
 
-    let reviewRound = 0;
+    // Cycle 1: request_changes, Cycle 2: approve (no file)
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer' && params.currentTask === 'T1: Task for repo-a') {
         return successResult(['engineer.ts']) as any;
@@ -1283,20 +1312,7 @@ describe('Worker hooks', () => {
         return successResult(['review-fix.ts']) as any;
       }
       if (params.role === 'review') {
-        reviewRound += 1;
-        if (reviewRound === 1) {
-          return {
-            result: {
-              output: {
-                review_status: 'request_changes',
-                comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }],
-              },
-            },
-          } as any;
-        }
-        return {
-          result: { output: { review_status: 'approve', comments: [] } },
-        } as any;
+        return { result: { output: {} } } as any;
       }
       throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
     });
@@ -1340,39 +1356,14 @@ describe('Worker hooks', () => {
     });
 
     const reviewFixPrompts: string[] = [];
-    const reviewResponses: Record<string, Array<{
-      review_status: 'approve' | 'request_changes';
-      comments: Array<{ file: string; line?: number; comment: string; severity?: string }>;
-    }>> = {
-      'T1: review:architecture': [
-        {
-          review_status: 'request_changes',
-          comments: [{ file: 'architecture.ts', line: 12, comment: 'Split orchestration concerns more clearly.', severity: 'minor' }],
-        },
-        { review_status: 'approve', comments: [] },
-      ],
-      'T1: review:security': [
-        {
-          review_status: 'request_changes',
-          comments: [{ file: 'auth.ts', line: 8, comment: 'Enforce authorization before executing the task.', severity: 'critical' }],
-        },
-        { review_status: 'approve', comments: [] },
-      ],
-      'T1: review:testing': [
-        {
-          review_status: 'request_changes',
-          comments: [{ file: 'worker.test.ts', line: 21, comment: 'Add a regression test for failed review retries.', severity: 'major' }],
-        },
-        { review_status: 'approve', comments: [] },
-      ],
-      'T1: review:requirements': [
-        {
-          review_status: 'request_changes',
-          comments: [{ file: 'requirements.ts', line: 3, comment: 'Preserve the original task acceptance criteria.', severity: 'major' }],
-        },
-        { review_status: 'approve', comments: [] },
-      ],
-    };
+
+    // Set up review result files for cycle 1 (all perspectives request_changes)
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'architecture.ts', line: 12, comment: 'Split orchestration concerns more clearly.', severity: 'minor' }], 'architecture');
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'auth.ts', line: 8, comment: 'Enforce authorization before executing the task.', severity: 'critical' }], 'security');
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'worker.test.ts', line: 21, comment: 'Add a regression test for failed review retries.', severity: 'major' }], 'testing');
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'requirements.ts', line: 3, comment: 'Preserve the original task acceptance criteria.', severity: 'major' }], 'requirements');
+    // Cycle 2: no files → all approve
+
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer' && params.currentTask === 'T1: Task for repo-a') {
         return successResult(['engineer.ts']) as any;
@@ -1384,13 +1375,9 @@ describe('Worker hooks', () => {
       if (params.role !== 'review') {
         throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
       }
-      const responseQueue = reviewResponses[params.currentTask];
-      if (!responseQueue?.length) {
-        throw new Error(`Unexpected review task: ${params.currentTask}`);
-      }
       return {
         agent: { id: params.agentId },
-        result: { output: responseQueue.shift() },
+        result: { output: {} },
       } as any;
     });
 
@@ -1421,14 +1408,11 @@ describe('Worker hooks', () => {
 
     expect(reviewFixPrompts).toHaveLength(1);
     const feedbackPrompt = reviewFixPrompts[0];
-    const securityIndex = feedbackPrompt.indexOf('### Security');
-    const requirementsIndex = feedbackPrompt.indexOf('### Requirements');
-    const architectureIndex = feedbackPrompt.indexOf('### Architecture');
-    const testingIndex = feedbackPrompt.indexOf('### Testing');
-    expect(securityIndex).toBeGreaterThan(-1);
-    expect(requirementsIndex).toBeGreaterThan(securityIndex);
-    expect(architectureIndex).toBeGreaterThan(requirementsIndex);
-    expect(testingIndex).toBeGreaterThan(architectureIndex);
+    expect(feedbackPrompt).toContain('Review result files');
+    expect(feedbackPrompt).toContain('result-architecture.json');
+    expect(feedbackPrompt).toContain('result-security.json');
+    expect(feedbackPrompt).toContain('result-testing.json');
+    expect(feedbackPrompt).toContain('result-requirements.json');
 
     expect(mockCreateReviewFindingsExtractedEvent).toHaveBeenCalled();
     const firstReviewEvent = mockCreateReviewFindingsExtractedEvent.mock.calls[0];
@@ -1563,7 +1547,7 @@ describe('Worker hooks', () => {
     });
   });
 
-  it('should convert a single perspective schema fallback into synthetic findings and continue', async () => {
+  it('should detect request_changes from unparseable review result file and create synthetic findings', async () => {
     mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
     mockGetItemConfig.mockResolvedValue(
       makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
@@ -1584,36 +1568,17 @@ describe('Worker hooks', () => {
       }
       return {
         systemPrompt: `You are ${roleName}.`,
-        allowedTools: ['Read', 'Glob', 'Grep'],
+        allowedTools: ['Read', 'Glob', 'Grep', 'Write'],
         jsonSchema: {},
       };
     });
 
-    const reviewResponses: Record<string, any[]> = {
-      'T1: review:architecture': [
-        reviewResult('approve', [], 'arch-1'),
-        reviewResult('approve', [], 'arch-2'),
-      ],
-      'T1: review:security': [
-        {
-          agent: { id: 'sec-fallback' },
-          result: {
-            usedSchemaFallback: true,
-            schemaValidationErrors: ['review_status is required'],
-            output: { status: 'invalid' },
-          },
-        },
-        reviewResult('approve', [], 'sec-2'),
-      ],
-      'T1: review:requirements': [
-        reviewResult('approve', [], 'req-1'),
-        reviewResult('approve', [], 'req-2'),
-      ],
-      'T1: review:testing': [
-        reviewResult('approve', [], 'test-1'),
-        reviewResult('approve', [], 'test-2'),
-      ],
-    };
+    // Security reviewer writes an unparseable file (not valid ReviewerResponse JSON)
+    const securityFilePath = '/items/ITEM-test/reviews/repo-a/T1/review-round-1/result-security.json';
+    reviewFileStore.set(securityFilePath, 'not valid json');
+    // Other perspectives: no files → approve
+    // Cycle 2: no files → all approve
+
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer' && params.currentTask === 'T1: Task for repo-a') {
         return successResult(['engineer.ts']) as any;
@@ -1624,11 +1589,7 @@ describe('Worker hooks', () => {
       if (params.role !== 'review') {
         throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
       }
-      const responseQueue = reviewResponses[params.currentTask];
-      if (!responseQueue?.length) {
-        throw new Error(`Unexpected review task: ${params.currentTask}`);
-      }
-      return responseQueue.shift();
+      return { agent: { id: params.agentId }, result: { output: {} } } as any;
     });
 
     await expect(startWorkers(ITEM_ID)).resolves.toBeUndefined();
@@ -1643,11 +1604,11 @@ describe('Worker hooks', () => {
       expect.objectContaining({
         perspective: 'security',
         severity: 'major',
-        description: expect.stringContaining('manual confirmation is required'),
+        description: expect.stringContaining('could not be parsed'),
       }),
     ]));
     expect(firstReviewEvent[6]).toEqual(expect.arrayContaining([
-      expect.objectContaining({ perspective: 'security', status: 'schema_fallback' }),
+      expect.objectContaining({ perspective: 'security', status: 'request_changes' }),
     ]));
     expect(taskStateStore.get('repo-a').tasks[0]).toMatchObject({
       id: 'T1',
@@ -1670,7 +1631,11 @@ describe('Worker hooks', () => {
       { exitCode: 1, stderr: 'test failed final attempt' },
     ]);
 
-    let reviewRound = 0;
+    // All 3 review cycles find issues
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix round 1', severity: 'major' }]);
+    setReviewResultFile('repo-a', 'T1', 2, [{ file: 'file.ts', line: 2, comment: 'fix round 2', severity: 'major' }]);
+    setReviewResultFile('repo-a', 'T1', 3, [{ file: 'file.ts', line: 3, comment: 'fix round 3', severity: 'major' }]);
+
     mockExecuteAgent.mockImplementation(async (params: any): Promise<any> => {
       if (params.role === 'engineer' && params.currentTask === 'T1: Task for repo-a') {
         return successResult() as any;
@@ -1679,20 +1644,7 @@ describe('Worker hooks', () => {
         return successResult() as any;
       }
       if (params.role === 'review') {
-        reviewRound += 1;
-        return {
-          result: {
-            output: {
-              review_status: 'request_changes',
-              comments: [{
-                file: 'file.ts',
-                line: reviewRound,
-                comment: `fix round ${reviewRound}`,
-                severity: 'major',
-              }],
-            },
-          },
-        } as any;
+        return { result: { output: {} } } as any;
       }
       throw new Error(`Unexpected role/currentTask: ${params.role}/${params.currentTask}`);
     });
@@ -1774,15 +1726,14 @@ describe('Worker hooks', () => {
       { exitCode: 0, stdout: 'tests pass' }, // Post-feedback hook
     ]);
 
+    // Cycle 1: request_changes via file, Cycle 2: no file → approve
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+
     mockExecuteAgent
       .mockResolvedValueOnce(successResult() as any) // initial engineer
-      .mockResolvedValueOnce({                       // reviewer: request_changes
-        result: { output: { review_status: 'request_changes', comments: [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }] } },
-      } as any)
+      .mockResolvedValueOnce({ result: { output: {} } } as any) // reviewer cycle 1 (file-based)
       .mockResolvedValueOnce(successResult() as any) // feedback engineer
-      .mockResolvedValueOnce({                       // reviewer: approve
-        result: { output: { review_status: 'approve', comments: [] } },
-      } as any);
+      .mockResolvedValueOnce({ result: { output: {} } } as any); // reviewer cycle 2 (file-based)
 
     await startWorkers(ITEM_ID);
 
@@ -1792,5 +1743,61 @@ describe('Worker hooks', () => {
       typeof path === 'string' && path.includes('review-round-2')
     );
     expect(feedbackCycleDirs.length).toBeGreaterThan(0);
+  });
+
+  it('should reset worktree after reviewer completes before running review-fix engineer', async () => {
+    mockGetPlan.mockResolvedValue(makePlan(['repo-a']) as any);
+    mockGetItemConfig.mockResolvedValue(
+      makeItemConfig(['repo-a'], { 'repo-a': ['npm test'] }) as any
+    );
+
+    setupSpawnMock([
+      { exitCode: 0, stdout: 'tests pass' }, // Post-engineer hook
+      { exitCode: 0, stdout: 'tests pass' }, // Post-feedback hook
+    ]);
+
+    // Cycle 1: request_changes, Cycle 2: approve (no file)
+    setReviewResultFile('repo-a', 'T1', 1, [{ file: 'file.ts', line: 1, comment: 'fix this', severity: 'major' }]);
+
+    mockExecuteAgent
+      .mockResolvedValueOnce(successResult() as any) // initial engineer
+      .mockResolvedValueOnce({ result: { output: {} } } as any) // reviewer cycle 1
+      .mockResolvedValueOnce(successResult() as any) // feedback engineer
+      .mockResolvedValueOnce({ result: { output: {} } } as any); // reviewer cycle 2 (approve)
+
+    await startWorkers(ITEM_ID);
+
+    // Extract all git spawn calls in order
+    const gitCalls = mockSpawn.mock.calls
+      .filter((call) => call[0] === 'git')
+      .map((call) => call[1] as string[]);
+
+    // Find the indices of the reset --hard HEAD and clean -fd calls
+    const resetIndex = gitCalls.findIndex(
+      (args) => args[0] === 'reset' && args[1] === '--hard' && args[2] === 'HEAD'
+    );
+    const cleanIndex = gitCalls.findIndex(
+      (args) => args[0] === 'clean' && args[1] === '-fd'
+    );
+
+    expect(resetIndex).toBeGreaterThan(-1);
+    expect(cleanIndex).toBeGreaterThan(-1);
+
+    // Verify the reset happens: there should be a rev-parse (getGitHead) after the reset
+    const postResetRevParse = gitCalls.findIndex(
+      (args, i) => i > resetIndex && args[0] === 'rev-parse'
+    );
+    expect(postResetRevParse).toBeGreaterThan(resetIndex);
+
+    // Verify the feedback engineer uses currentHeadAfterReset for the diff
+    const reviewFixCall = mockExecuteAgent.mock.calls.find(
+      (call) => call[0].currentTask === 'T1: review-fix'
+    );
+    expect(reviewFixCall).toBeDefined();
+    // The diff call after reset should use the head returned after reset
+    const diffCallsAfterReset = gitCalls.filter(
+      (args, i) => i > resetIndex && args[0] === 'diff'
+    );
+    expect(diffCallsAfterReset.length).toBeGreaterThan(0);
   });
 });
