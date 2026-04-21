@@ -59,7 +59,7 @@ export interface TestPlan {
   createdAt: string;
 }
 
-export type TestPlanApprovalStatus = 'missing' | 'stale' | 'pending' | 'approved';
+export type TestPlanApprovalStatus = 'missing' | 'parse_error' | 'stale' | 'pending' | 'approved';
 
 export interface TestPlanApprovalState {
   status: TestPlanApprovalStatus;

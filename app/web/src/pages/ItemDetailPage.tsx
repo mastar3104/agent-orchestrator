@@ -50,6 +50,7 @@ const STEP_STATUS_ICONS: Record<string, string> = {
 
 const TEST_PLAN_APPROVAL_STYLES: Record<string, string> = {
   missing: 'bg-gray-700 text-gray-300',
+  parse_error: 'bg-yellow-500/20 text-yellow-200',
   stale: 'bg-yellow-500/20 text-yellow-200',
   pending: 'bg-blue-500/20 text-blue-200',
   approved: 'bg-emerald-500/20 text-emerald-200',
@@ -368,6 +369,7 @@ export function ItemDetailPage() {
       event.type === 'pr_created' ||
       event.type === 'repo_no_changes' ||
       event.type === 'error' ||
+      event.type === 'test_plan_parse_warning' ||
       event.type === 'task_state_changed'
     ) {
       refresh();
@@ -1160,6 +1162,11 @@ export function ItemDetailPage() {
                   This test plan is stale for the current live plan. Regenerate or edit it before approval.
                 </p>
               )}
+              {item.testPlanApproval.status === 'parse_error' && (
+                <p className="text-xs text-yellow-300 mt-2">
+                  Test planner finished but the generated YAML could not be parsed. You can approve as-is to start workers, or edit the YAML first.
+                </p>
+              )}
             </div>
             <div className="flex items-center gap-2">
               <button
@@ -1168,7 +1175,7 @@ export function ItemDetailPage() {
               >
                 Run Test Planner
               </button>
-              {item.testPlanApproval.status === 'pending' && (
+              {(item.testPlanApproval.status === 'pending' || item.testPlanApproval.status === 'parse_error') && (
                 <button
                   onClick={approveCurrentTestPlan}
                   disabled={testPlanApproveSubmitting}
