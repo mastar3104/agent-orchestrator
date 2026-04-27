@@ -388,7 +388,7 @@ export function RepositoriesPage() {
             onChange={e => updateField('setup', e.target.value)}
             rows={3}
             className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-white text-sm font-mono focus:outline-none focus:border-blue-500"
-            placeholder={"yarn install --frozen-lockfile\nbundle install"}
+            placeholder={"pnpm install --frozen-lockfile\nbundle install"}
           />
           <p className="text-xs text-gray-500 mt-0.5">
             1行1コマンド。clone 完了後、planner 起動前に repository 直下で順次実行します。失敗しても planner は継続します。

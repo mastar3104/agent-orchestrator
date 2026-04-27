@@ -158,18 +158,18 @@ describe('repository routes validation', () => {
         name: 'repo-a',
         type: 'remote',
         url: 'https://github.com/test/repo.git',
-        setup: ['  yarn install --frozen-lockfile  ', '   ', 'npm run build'],
+        setup: ['  pnpm install --frozen-lockfile  ', '   ', 'npm run build'],
       }),
     });
 
     expect(res.statusCode).toBe(201);
-    expect(res.json().data.repository.setup).toEqual(['yarn install --frozen-lockfile', 'npm run build']);
+    expect(res.json().data.repository.setup).toEqual(['pnpm install --frozen-lockfile', 'npm run build']);
     expect(mockWriteYaml).toHaveBeenCalledWith(
       '/repositories.yaml',
       [
         expect.objectContaining({
           name: 'repo-a',
-          setup: ['yarn install --frozen-lockfile', 'npm run build'],
+          setup: ['pnpm install --frozen-lockfile', 'npm run build'],
         }),
       ]
     );
@@ -279,7 +279,7 @@ describe('repository routes validation', () => {
         name: 'repo-a',
         type: 'local',
         localPath: '/tmp/repo-a',
-        setup: ['yarn install --frozen-lockfile'],
+        setup: ['pnpm install --frozen-lockfile'],
       }),
     });
 

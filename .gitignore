@@ -7,11 +7,8 @@ dist/
 # Data directory (cloned repos, agent data, events)
 data/
 
-# Yarn
-.yarn/unplugged/
-.yarn/cache/
-.yarn/install-state.gz
-.pnp.*
+# pnpm
+.pnpm-store/
 
 # Environment files
 .env
@@ -26,8 +23,7 @@ role-tools.local.yaml
 # Logs
 *.log
 npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+pnpm-debug.log*
 
 # OS files
 .DS_Store

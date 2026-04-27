@@ -16,16 +16,16 @@ jobs:
       - uses: ./.github/actions/setup-node
 
       - name: Build shared package
-        run: yarn workspace @agent-orch/shared build
+        run: pnpm --filter @agent-orch/shared build
 
       - name: Typecheck shared
-        run: npx tsc --noEmit -p packages/shared/tsconfig.json
+        run: pnpm exec tsc --noEmit -p packages/shared/tsconfig.json
 
       - name: Typecheck server
-        run: npx tsc --noEmit -p app/server/tsconfig.json
+        run: pnpm exec tsc --noEmit -p app/server/tsconfig.json
 
       - name: Typecheck web
-        run: npx tsc --noEmit -p app/web/tsconfig.json
+        run: pnpm exec tsc --noEmit -p app/web/tsconfig.json
 
   test:
     name: Test
@@ -36,10 +36,10 @@ jobs:
       - uses: ./.github/actions/setup-node
 
       - name: Build shared package
-        run: yarn workspace @agent-orch/shared build
+        run: pnpm --filter @agent-orch/shared build
 
       - name: Run tests
-        run: yarn test
+        run: pnpm test
 
   build:
     name: Build
@@ -50,7 +50,7 @@ jobs:
       - uses: ./.github/actions/setup-node
 
       - name: Build all packages
-        run: yarn build
+        run: pnpm build
 
   test-completed:
     name: Test Completed
