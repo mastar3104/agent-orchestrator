@@ -178,7 +178,7 @@ describe('setupWorkspace repository setup commands', () => {
           type: 'remote',
           url: 'https://github.com/example/repo.git',
           workBranch: 'work/ITEM-1/repo-a',
-          setup: ['yarn install --frozen-lockfile'],
+          setup: ['pnpm install --frozen-lockfile'],
         },
       ],
       createdAt: '2026-01-01T00:00:00Z',
@@ -186,7 +186,7 @@ describe('setupWorkspace repository setup commands', () => {
     } as any);
     mockRunShellCommands.mockResolvedValue([
       {
-        command: 'yarn install --frozen-lockfile',
+        command: 'pnpm install --frozen-lockfile',
         exitCode: 0,
         stdout: 'ok',
         stderr: '',
@@ -210,7 +210,7 @@ describe('setupWorkspace repository setup commands', () => {
       expect.objectContaining({ cwd: '/items/ITEM-1/workspace/repo-a' })
     );
     expect(mockRunShellCommands).toHaveBeenCalledWith(
-      ['yarn install --frozen-lockfile'],
+      ['pnpm install --frozen-lockfile'],
       '/items/ITEM-1/workspace/repo-a',
       expect.objectContaining({
         logDir: '/items/ITEM-1/setup/repo-a',
@@ -238,7 +238,7 @@ describe('setupWorkspace repository setup commands', () => {
           name: 'repo-a',
           type: 'remote',
           url: 'https://github.com/example/repo.git',
-          setup: ['yarn install --frozen-lockfile'],
+          setup: ['pnpm install --frozen-lockfile'],
         },
       ],
       createdAt: '2026-01-01T00:00:00Z',
@@ -246,7 +246,7 @@ describe('setupWorkspace repository setup commands', () => {
     } as any);
     mockRunShellCommands.mockResolvedValue([
       {
-        command: 'yarn install --frozen-lockfile',
+        command: 'pnpm install --frozen-lockfile',
         exitCode: 1,
         stdout: '',
         stderr: 'failed',
@@ -280,7 +280,7 @@ describe('setupWorkspace repository setup commands', () => {
           type: 'local',
           localPath: '/src/local-repo',
           linkMode: 'copy',
-          setup: ['yarn install --frozen-lockfile'],
+          setup: ['pnpm install --frozen-lockfile'],
         },
       ],
       createdAt: '2026-01-01T00:00:00Z',
@@ -347,10 +347,10 @@ describe('updateRepoSetup', () => {
 
   it('writes updated config with new setup array and updated timestamp', async () => {
     mockReadYamlSafe.mockResolvedValue(baseConfig);
-    const result = await updateRepoSetup('ITEM-1', 'repo-a', ['yarn install', 'yarn build']);
+    const result = await updateRepoSetup('ITEM-1', 'repo-a', ['pnpm install', 'pnpm build']);
 
     expect(result).not.toBeNull();
-    expect(result!.repositories[0].setup).toEqual(['yarn install', 'yarn build']);
+    expect(result!.repositories[0].setup).toEqual(['pnpm install', 'pnpm build']);
     // Other repo unchanged
     expect(result!.repositories[1]).toEqual(baseConfig.repositories[1]);
     expect(result!.updatedAt).not.toBe(baseConfig.updatedAt);
@@ -358,7 +358,7 @@ describe('updateRepoSetup', () => {
       '/items/ITEM-1/item.yaml',
       expect.objectContaining({
         repositories: expect.arrayContaining([
-          expect.objectContaining({ name: 'repo-a', setup: ['yarn install', 'yarn build'] }),
+          expect.objectContaining({ name: 'repo-a', setup: ['pnpm install', 'pnpm build'] }),
         ]),
       })
     );

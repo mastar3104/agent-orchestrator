@@ -110,7 +110,7 @@ Planner / Test Planner / Worker / Completed Review の起動は HTTP `202 Accept
 
 ## 前提条件
 
-- **Node.js** >= 18
+- **Node.js** >= 22.17.1
 - **Claude CLI** (`claude`) がインストール済みで PATH に存在すること
 - **GitHub CLI** (`gh`) が認証済みであること（PR 作成機能に必要）
 - **Git** >= 2.x
@@ -119,10 +119,10 @@ Planner / Test Planner / Worker / Completed Review の起動は HTTP `202 Accept
 
 ```bash
 # 依存関係のインストール
-yarn install
+pnpm install --frozen-lockfile
 
 # 開発サーバー起動 (サーバー :3001 + Web :5173)
-yarn dev
+pnpm dev
 ```
 
 ## プロジェクト構成
@@ -349,8 +349,14 @@ Planner が生成した `plan.yaml` に対して、タスク単位でフィー�
   type: remote
   url: https://github.com/example/backend.git
   setup:
-    - "yarn install --frozen-lockfile"
-    - "yarn prisma generate"
+    - "pnpm install --frozen-lockfile"
+    - "pnpm prisma generate"
+```
+
+既存の saved repository / item 設定に `yarn` ベースの setup や hook が残っていないか確認するには、以下を実行する。
+
+```bash
+pnpm audit:setup-commands
 ```
 
 ### Hooks (リポジトリ別コマンド実行)
@@ -419,13 +425,13 @@ repositories:
 
 ```bash
 # 全パッケージビルド (shared → server → web)
-yarn build
+pnpm build
 
 # サーバーのみ型チェック
-npx tsc --noEmit -p app/server/tsconfig.json
+pnpm exec tsc --noEmit -p app/server/tsconfig.json
 
 # テスト
-yarn test
+pnpm test
 ```
 
 ## 技術スタック
@@ -436,4 +442,4 @@ yarn test
 | バックエンド | Fastify, TypeScript |
 | CLI 連携 | Claude CLI (`claude -p`), GitHub CLI (`gh`) |
 | データ永続化 | YAML (設定), JSONL (イベント), ファイルシステム |
-| モノレポ | Yarn workspaces |
+| モノレポ | pnpm workspaces |

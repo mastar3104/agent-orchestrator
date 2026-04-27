@@ -151,7 +151,7 @@ describe('createItem repository config propagation', () => {
       name: 'saved-repo',
       type: 'remote',
       url: 'https://github.com/example/repo.git',
-      setup: ['yarn install --frozen-lockfile'],
+      setup: ['pnpm install --frozen-lockfile'],
       createdAt: '2026-01-01T00:00:00Z',
       updatedAt: '2026-01-01T00:00:00Z',
     } as any);
@@ -169,7 +169,7 @@ describe('createItem repository config propagation', () => {
 
     expect(item.repositories[0]).toMatchObject({
       name: 'repo-a',
-      setup: ['yarn install --frozen-lockfile'],
+      setup: ['pnpm install --frozen-lockfile'],
     });
     expect(mockWriteYaml).toHaveBeenCalledWith(
       '/items/ITEM-testitem/item.yaml',
@@ -177,7 +177,7 @@ describe('createItem repository config propagation', () => {
         repositories: [
           expect.objectContaining({
             name: 'repo-a',
-            setup: ['yarn install --frozen-lockfile'],
+            setup: ['pnpm install --frozen-lockfile'],
           }),
         ],
       })

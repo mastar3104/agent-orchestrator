@@ -249,7 +249,7 @@ describe('deriveItemStatus - error check after running check', () => {
     mockReadJsonl.mockResolvedValue([
       makeEvent('clone_started', { repoName: 'repoA', repositoryUrl: 'https://example.com/repo.git' }),
       makeEvent('clone_completed', { repoName: 'repoA', success: true }),
-      makeEvent('repo_setup_started', { repoName: 'repoA', commands: ['yarn install --frozen-lockfile'] }),
+      makeEvent('repo_setup_started', { repoName: 'repoA', commands: ['pnpm install --frozen-lockfile'] }),
     ]);
 
     expect(await deriveItemStatus('item-1')).toBe('cloning');
@@ -960,11 +960,11 @@ describe('deriveRepoStatuses - status_changed(stopped) recovery', () => {
     mockReadJsonl.mockResolvedValue([
       makeEvent('clone_started', { repoName: 'repoA', repositoryUrl: 'https://example.com/repo.git' }),
       makeEvent('clone_completed', { repoName: 'repoA', success: true }),
-      makeEvent('repo_setup_started', { repoName: 'repoA', commands: ['yarn install --frozen-lockfile'] }),
+      makeEvent('repo_setup_started', { repoName: 'repoA', commands: ['pnpm install --frozen-lockfile'] }),
       makeEvent('repo_setup_completed', {
         repoName: 'repoA',
         allPassed: false,
-        results: [{ command: 'yarn install --frozen-lockfile', exitCode: 1, stderr: 'failed', stdout: '', durationMs: 10, timedOut: false }],
+        results: [{ command: 'pnpm install --frozen-lockfile', exitCode: 1, stderr: 'failed', stdout: '', durationMs: 10, timedOut: false }],
       }),
     ]);
 
